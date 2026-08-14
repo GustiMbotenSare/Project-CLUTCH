@@ -8,19 +8,53 @@
 
 export type Mode = "Duel1v1" | "Full5v5"
 
+export type StatBlock = {
+	Aim: number,
+	Reactions: number,
+	GameSense: number,
+	Aggression: number,
+	UtilityUsage: number,
+	Clutch: number,
+	Consistency: number,
+}
+
 return {
 	Mode = "Duel1v1" :: Mode,
 
-	-- Who fights in Duel1v1. Ace is the high-Aim/high-Aggression Entry and Onyx
-	-- is a defensive Anchor, so their intent scores should diverge hard — if
-	-- both bots behave identically, the scorer is not reading attributes.
+	-- Who fights in Duel1v1.
 	DuelAttacker = "Ace",
 	DuelDefender = "Onyx",
+
+	-- Both duelists carry this. A pistol is the right test weapon: its 40-stud
+	-- optimal band is well inside the distances this map produces, so range
+	-- discipline actually gets exercised.
+	DuelWeapon = "Sidearm",
+
+	-- CONTROLLED EXPERIMENT. With this on, every bot gets identical attributes,
+	-- so any behavioural difference must come from role, side or situation — not
+	-- from a stat roll. Turn it off to watch attributes reassert themselves.
+	UniformStats = true,
+	UniformStatBlock = {
+		Aim = 75,
+		Reactions = 75,
+		GameSense = 75,
+		Aggression = 75,
+		UtilityUsage = 75,
+		Clutch = 75,
+		Consistency = 75,
+	} :: StatBlock,
 
 	-- Brain logging
 	VerboseBrain = true, -- every intent switch, with the score that won
 	LogPerception = true, -- first sighting and loss of contact
 	LogZoneTransitions = true, -- "Ace | A Lobby -> A Door"
+	LogCombat = true, -- engage / hold-fire decisions and every shot
+
+	-- A bot locked into one intent used to print nothing at all, because THINK
+	-- only fired on CHANGE. Ace produced zero reasoning output for 84 seconds
+	-- while visibly doing something wrong. Print the score vector periodically
+	-- even when the winner has not moved.
+	BrainHeartbeatSeconds = 12,
 
 	-- Movement telemetry. Samples are buffered at full rate for analysis but
 	-- only ZONE CHANGES are printed — 4Hz coordinate spam is unreadable and
@@ -29,11 +63,16 @@ return {
 	TelemetryMaxSamples = 20000,
 	TelemetryReportSeconds = 60, -- periodic dwell-time summary
 
-	-- The shooting-range spike is off by default now: bots that maneuver
-	-- without shooting produce a pure decision log. Combat lands next.
+	-- The old shooting-range spike. Superseded by real bot-vs-bot combat.
 	RunShootingRange = false,
 
 	-- Anti-stall. With no round timer yet, decisiveness ramps on time since a
-	-- bot last made progress or saw an enemy, rather than round time left.
+	-- bot last saw an enemy or finished what it set out to do. It deliberately
+	-- does NOT reset on every footstep — that turned the ramp into a metronome
+	-- and produced a 25-second Mid Back / Mid Window ping-pong.
 	StallRampSeconds = 25,
+
+	-- Minimum seconds a bot must stay committed to an intent before switching.
+	-- Engage is exempt: getting shot at is allowed to interrupt anything.
+	MinIntentSeconds = 4,
 }
