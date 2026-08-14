@@ -14,6 +14,10 @@
 -- "an enemy is visible". The planter also FACES the last known threat before
 -- crouching: planting with your back to the angle you were just contacted
 -- from read as dumb, because it was.
+--
+-- Pickup radius is a generous 7 studs (playtest #11): the carrier died in a
+-- door throat and four attackers pathed to the zone but never quite within
+-- the old 4-stud reach of it. Recovery should not require centimeter routing.
 
 local Debris = game:GetService("Debris")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -26,7 +30,7 @@ local MatchState = require(script.Parent.MatchState)
 
 local Objective = {}
 
-local PICKUP_RADIUS = 4
+local PICKUP_RADIUS = 7
 local DEFUSE_RADIUS = 7
 local CHANNEL_MOVE_TOLERANCE = 2.5
 local EXPLOSION_RADIUS = 30
@@ -116,7 +120,7 @@ function Objective.dropSpike(bot: any)
 	))
 end
 
--- An attacker walking over a dropped spike picks it up.
+-- An attacker walking near a dropped spike picks it up.
 function Objective.tryPickup(bot: any): boolean
 	local spike = MatchState.spikePart
 	if not spike or MatchState.spikeCarrier ~= nil or MatchState.planted then
