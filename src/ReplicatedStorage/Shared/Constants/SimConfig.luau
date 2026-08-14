@@ -7,10 +7,15 @@ return {
 	DecisionTickSeconds = 0.25, -- tactical-layer intent re-evaluation
 	PerceptionTickSeconds = 0.15, -- vision/hearing sweep
 
+	-- Movement speeds (Valorant-style: sprint is loud, shift-walk is quiet)
+	SprintSpeed = 16, -- default humanoid speed
+	WalkSpeed = 8, -- half speed, quiet steps, reads as "checking"
+
 	-- Perception (honest senses: vision cone + LOS raycast + sound radius)
 	VisionConeDeg = 120,
 	VisionRangeStuds = 120,
-	FootstepSoundRadiusStuds = 40,
+	FootstepSoundRadiusStuds = 40, -- SPRINTING steps; walking is much quieter
+	WalkFootstepRadiusStuds = 12, -- shift-walk: audible only nearly point-blank
 	GunshotSoundGlobal = true, -- everyone hears shots; GameSense decides what they infer
 	MemoryDecaySeconds = 8, -- last-seen intel fades
 	CalloutDelaySeconds = 0.5, -- team intel share delay (lower with better IGL)
