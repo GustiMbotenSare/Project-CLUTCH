@@ -17,6 +17,13 @@ local DUMMY_POS = Vector3.new(0, 3, 30)
 local ENGAGE_POS = Vector3.new(0, 1, 38)
 local TRACER_LIFETIME = 0.09
 
+-- Aim-height intent. Aim 1 -> ~10% of bursts go for the head, Aim 100 -> ~45%.
+-- Squared so the difference between a 60-Aim and a 90-Aim bot is dramatic,
+-- which is the whole point of a manager game.
+local HEADSHOT_INTENT_FLOOR = 0.10
+local HEADSHOT_INTENT_RANGE = 0.35
+local RECOIL_RESET_SHOTS = 4 -- bursts, not one endless spray
+
 local ShootingRange = {}
 
 local function spawnDummy(position: Vector3): Model
@@ -96,6 +103,7 @@ function ShootingRange.run(shooterBot: any)
 		local dummy = spawnDummy(DUMMY_POS)
 		local dummyHumanoid = dummy:WaitForChild("Humanoid") :: Humanoid
 		local dummyRoot = dummy:WaitForChild("HumanoidRootPart") :: BasePart
+		local dummyHead = dummy:WaitForChild("Head") :: BasePart
 
 		print(("[CLUTCH] %s (%s) moves to the range — Aim %d, Reactions %d"):format(
 			shooterBot.name,
@@ -127,21 +135,37 @@ function ShootingRange.run(shooterBot: any)
 		print(("[CLUTCH] %s spots the dummy, reacts in %.2fs"):format(shooterBot.name, reaction))
 		task.wait(reaction)
 
-		-- Duel loop: flick overshoot on the opener, then spray with growing error
+		-- Playtest #3: aiming at HumanoidRootPart every shot made headshots an
+		-- accident of geometry — 25 straight body shots at one engage distance,
+		-- 7 straight headshots at another. Aim height is now an explicit decision.
+		local headshotIntent = HEADSHOT_INTENT_FLOOR + (attrs.Aim / 100) ^ 2 * HEADSHOT_INTENT_RANGE
+
 		local shotIndex = 0
+		local headshots = 0
+		local bodyshots = 0
+		local misses = 0
+
 		while dummyHumanoid.Health > 0 do
 			shotIndex += 1
 
+			-- Recoil resets between bursts, so spread climbs and falls
+			local sprayIndex = (shotIndex - 1) % RECOIL_RESET_SHOTS
+			local opener = sprayIndex == 0
+
+			-- Commit to a target height on the opener; hold it through the burst
+			local goingForHead = opener and rng:NextNumber() < headshotIntent
+			local aimPart = if goingForHead then dummyHead else dummyRoot
+
 			local overshootChance = SimConfig.FlickOvershootBaseChance * (1 - (attrs.Aim / 100) * 0.8)
-			local whiffed = shotIndex == 1 and rng:NextNumber() < overshootChance
+			local whiffed = opener and rng:NextNumber() < overshootChance
 
 			local spreadDeg = math.min(
-				weapon.FirstBulletSpreadDeg + weapon.SprayErrorGrowthDeg * (shotIndex - 1),
+				weapon.FirstBulletSpreadDeg + weapon.SprayErrorGrowthDeg * sprayIndex,
 				weapon.MaxSprayErrorDeg
 			)
 
-			local aimPoint = dummyRoot.Position
-			local dist = (dummyRoot.Position - head.Position).Magnitude
+			local aimPoint = aimPart.Position
+			local dist = (aimPoint - head.Position).Magnitude
 			if whiffed then
 				aimPoint += Vector3.new(rng:NextNumber(-4, 4), rng:NextNumber(1, 3), 0)
 			else
@@ -161,10 +185,16 @@ function ShootingRange.run(shooterBot: any)
 
 			if result and result.Instance:IsDescendantOf(dummy) then
 				hitSpark(result.Position)
+				-- What we HIT, not what we aimed at
 				local headshot = result.Instance.Name == "Head"
 				local damage = if headshot
 					then weapon.DamageBody * weapon.HeadshotMultiplier
 					else weapon.DamageBody
+				if headshot then
+					headshots += 1
+				else
+					bodyshots += 1
+				end
 				dummyHumanoid:TakeDamage(damage)
 				print(("[CLUTCH] %s hits (%s, %d dmg) — dummy HP %.0f"):format(
 					shooterBot.name,
@@ -173,13 +203,22 @@ function ShootingRange.run(shooterBot: any)
 					math.max(dummyHumanoid.Health, 0)
 				))
 			else
+				misses += 1
 				print(("[CLUTCH] %s misses%s"):format(shooterBot.name, if whiffed then " (flick overshoot)" else ""))
 			end
 
 			task.wait(weapon.FireInterval)
 		end
 
-		print(("[CLUTCH] dummy down in %d shots — spike complete ✅"):format(shotIndex))
+		local landed = headshots + bodyshots
+		print(("[CLUTCH] dummy down in %d shots — %d HS / %d body / %d miss (HS rate %.0f%%, intent %.0f%%) — spike complete ✅"):format(
+			shotIndex,
+			headshots,
+			bodyshots,
+			misses,
+			if landed > 0 then headshots / landed * 100 else 0,
+			headshotIntent * 100
+		))
 	end)
 end
 
