@@ -13,8 +13,12 @@
 --              makes a bot re-check a last-known position instead of tracking
 --              an enemy perfectly through walls.
 --
--- Runs on its own loop (PerceptionTickSeconds) which is faster than the
--- decision loop, so a bot keeps sensing while it walks.
+-- SIGHT IS DEBOUNCED. One raycast at one body part flickers constantly at long
+-- range: a grazed divider edge or a swinging limb reads as "lost". An earlier
+-- run logged twenty SPOT/LOST pairs during a single continuous sighting, some
+-- 0.2s apart, which made the log useless and starved the brain of stable input.
+-- We now try several aim points and require a run of failures before a bot
+-- admits it lost someone.
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Shared = ReplicatedStorage:WaitForChild("Shared")
@@ -22,6 +26,9 @@ local Shared = ReplicatedStorage:WaitForChild("Shared")
 local SimConfig = require(Shared.Constants.SimConfig)
 local Scenario = require(Shared.Constants.Scenario)
 local Zones = require(Shared.MapData.Zones)
+
+local LOS_MISS_TOLERANCE = 4 -- failed sweeps before a sighting counts as lost
+local AIM_PARTS = { "Head", "HumanoidRootPart", "UpperTorso", "Torso" }
 
 export type Source = "sight" | "sound"
 
@@ -32,10 +39,12 @@ export type Contact = {
 	zoneCallout: string,
 	seenAt: number,
 	source: Source,
+	distance: number,
 }
 
 export type State = {
 	visible: { [string]: boolean },
+	missStreak: { [string]: number },
 	memory: { [string]: Contact },
 	lastContactAt: number,
 	running: boolean,
@@ -48,6 +57,7 @@ local COS_HALF_CONE = math.cos(math.rad(SimConfig.VisionConeDeg / 2))
 function Perception.new(): State
 	return {
 		visible = {},
+		missStreak = {},
 		memory = {},
 		lastContactAt = -math.huge,
 		running = true,
@@ -62,12 +72,50 @@ local function aliveRoot(model: Model): BasePart?
 	return model:FindFirstChild("HumanoidRootPart") :: BasePart?
 end
 
-local function clearLineOfSight(fromPos: Vector3, targetModel: Model, selfModel: Model, targetRoot: BasePart): boolean
+local function eyesOf(model: Model, root: BasePart): Vector3
+	local head = model:FindFirstChild("Head") :: BasePart?
+	return if head then head.Position else root.Position
+end
+
+-- Try several body parts. A single ray at one part clips geometry edges and
+-- limbs constantly at range, which is what caused the SPOT/LOST flapping.
+local function hasClearShot(fromPos: Vector3, targetModel: Model, selfModel: Model): boolean
 	local params = RaycastParams.new()
 	params.FilterType = Enum.RaycastFilterType.Exclude
 	params.FilterDescendantsInstances = { selfModel }
-	local result = workspace:Raycast(fromPos, targetRoot.Position - fromPos, params)
-	return result ~= nil and result.Instance:IsDescendantOf(targetModel)
+
+	for _, partName in AIM_PARTS do
+		local part = targetModel:FindFirstChild(partName) :: BasePart?
+		if not part then
+			continue
+		end
+		local result = workspace:Raycast(fromPos, part.Position - fromPos, params)
+		if result and result.Instance:IsDescendantOf(targetModel) then
+			return true
+		end
+	end
+	return false
+end
+
+-- Is `observer` looking at `target` right now? Used for the forced-engagement
+-- case: a bot that has been seen should shoot back even from a bad range.
+function Perception.hasEyesOn(observer: Model, target: Model): boolean
+	local observerRoot = aliveRoot(observer)
+	local targetRoot = aliveRoot(target)
+	if not observerRoot or not targetRoot then
+		return false
+	end
+
+	local eyes = eyesOf(observer, observerRoot)
+	local delta = targetRoot.Position - eyes
+	local distance = delta.Magnitude
+	if distance > SimConfig.VisionRangeStuds or distance < 0.1 then
+		return false
+	end
+	if observerRoot.CFrame.LookVector:Dot(delta.Unit) < COS_HALF_CONE then
+		return false
+	end
+	return hasClearShot(eyes, target, observer)
 end
 
 -- One sweep. Returns the strongest current contact, or nil.
@@ -78,10 +126,8 @@ function Perception.sweep(state: State, bot: any, enemies: { any }, now: number)
 		return nil
 	end
 
-	local head = selfModel:FindFirstChild("Head") :: BasePart?
-	local eyePos = if head then head.Position else selfRoot.Position
+	local eyePos = eyesOf(selfModel, selfRoot)
 	local facing = selfRoot.CFrame.LookVector
-
 	local best: Contact? = nil
 
 	for _, enemy in enemies do
@@ -98,62 +144,66 @@ function Perception.sweep(state: State, bot: any, enemies: { any }, now: number)
 		local delta = enemyRoot.Position - eyePos
 		local distance = delta.Magnitude
 		local wasVisible = state.visible[enemy.name] == true
-		local source: Source? = nil
 
+		local sighted = false
 		if distance <= SimConfig.VisionRangeStuds and distance > 0.1 then
-			local inCone = facing:Dot(delta.Unit) >= COS_HALF_CONE
-			if inCone and clearLineOfSight(eyePos, enemyModel, selfModel, enemyRoot) then
-				source = "sight"
+			if facing:Dot(delta.Unit) >= COS_HALF_CONE then
+				sighted = hasClearShot(eyePos, enemyModel, selfModel)
 			end
 		end
 
 		-- Footsteps leak position regardless of where you are looking
-		if source == nil and distance <= SimConfig.FootstepSoundRadiusStuds then
-			source = "sound"
-		end
+		local heard = not sighted and distance <= SimConfig.FootstepSoundRadiusStuds
 
-		if source then
+		if sighted or heard then
 			local ground = Zones.groundOf(enemyModel)
 			local zone = Zones.at(ground)
-			local contact: Contact = {
+			state.memory[enemy.name] = {
 				name = enemy.name,
 				pos = enemyRoot.Position,
 				zoneKey = if zone then zone.key else Zones.VOID,
 				zoneCallout = if zone then zone.callout else "Off-map",
 				seenAt = now,
-				source = source,
+				source = if sighted then "sight" else "sound",
+				distance = distance,
 			}
-			state.memory[enemy.name] = contact
 			state.lastContactAt = now
 
-			local isSight = source == "sight"
-			state.visible[enemy.name] = isSight
+			local contact = state.memory[enemy.name]
+			if best == nil or (sighted and best.source == "sound") then
+				best = contact
+			end
+		end
 
-			if Scenario.LogPerception and isSight and not wasVisible then
+		if sighted then
+			state.missStreak[enemy.name] = 0
+			state.visible[enemy.name] = true
+			if Scenario.LogPerception and not wasVisible then
+				local contact = state.memory[enemy.name]
 				print(("[CLUTCH] %6.1fs  SPOT %s sees %s in %s (%.0f studs)"):format(
 					now,
 					bot.name,
 					enemy.name,
-					contact.zoneCallout,
+					if contact then contact.zoneCallout else "?",
 					distance
 				))
 			end
-
-			-- Sight beats sound when both are available this tick
-			if best == nil or (isSight and best.source == "sound") then
-				best = contact
+		elseif wasVisible then
+			-- Grace period. Do not drop a sighting on a single clipped ray.
+			local streak = (state.missStreak[enemy.name] or 0) + 1
+			state.missStreak[enemy.name] = streak
+			if streak >= LOS_MISS_TOLERANCE then
+				state.visible[enemy.name] = false
+				if Scenario.LogPerception then
+					local remembered = state.memory[enemy.name]
+					print(("[CLUTCH] %6.1fs  LOST %s loses %s (last seen %s)"):format(
+						now,
+						bot.name,
+						enemy.name,
+						if remembered then remembered.zoneCallout else "nowhere"
+					))
+				end
 			end
-		else
-			if Scenario.LogPerception and wasVisible then
-				local remembered = state.memory[enemy.name]
-				print(("[CLUTCH] %6.1fs  LOST %s loses %s (last seen %s)"):format(
-					now,
-					bot.name,
-					enemy.name,
-					if remembered then remembered.zoneCallout else "nowhere"
-				))
-			end
-			state.visible[enemy.name] = false
 		end
 	end
 
@@ -188,13 +238,23 @@ function Perception.bestContact(state: State, now: number): Contact?
 	return best
 end
 
-function Perception.anyVisible(state: State): boolean
-	for _, isVisible in state.visible do
-		if isVisible then
-			return true
+-- A contact we can see RIGHT NOW. Shooting requires this; remembering does not.
+function Perception.visibleContact(state: State): Contact?
+	local best: Contact? = nil
+	for name, isVisible in state.visible do
+		if not isVisible then
+			continue
+		end
+		local contact = state.memory[name]
+		if contact and (best == nil or contact.distance < best.distance) then
+			best = contact -- nearest visible enemy is the one that matters
 		end
 	end
-	return false
+	return best
+end
+
+function Perception.anyVisible(state: State): boolean
+	return Perception.visibleContact(state) ~= nil
 end
 
 -- Background sense loop, faster than the decision loop.
