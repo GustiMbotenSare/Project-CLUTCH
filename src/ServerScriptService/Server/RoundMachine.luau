@@ -10,22 +10,19 @@
 --
 -- TEAM PLANS: every round opens with a CALL. Attack rolls Rush / Default /
 -- Split against a called site; defense rolls Standard / Stack / Aggro. Plans
--- set each bot's siteChoice/holdChoice before brains wake up, so five
--- individuals stop rolling five unrelated coin flips. Today the coin calls
--- it — this is the seed of the M2 tactics board, where the manager makes the
--- call and the same machinery executes it.
+-- set each bot's siteChoice/holdChoice before brains wake up. Today the coin
+-- calls it — this is the seed of the M2 tactics board, where the manager
+-- makes the call and the same machinery executes it.
 --
--- CORPSES ARE GHOSTS. The dead freeze in place (anchored) and lose ALL
--- collision, so a body in a doorway blocks nobody's path — living bots have
--- no corpse collision anyway (ClutchBots group), but the standable-point
--- clearance check also rejected ground near corpses, quietly shrinking
--- doorways for the rest of the round.
+-- CORPSES ARE GHOSTS: the dead freeze in place (anchored) and lose ALL
+-- collision — a body in a doorway blocks nobody, and standable-point checks
+-- no longer shrink around corpses.
 --
--- Also owns the economy (win/loss ladders, kill rewards, plant bonus), the
--- body swapper (every round starts with pristine rigs at spawn), per-round
--- brain picks (site/anchor choices are cleared here so the plan can reassign
--- them), and each bot's INVENTORY string for the dashboard. The spike carrier
--- is a random attacker each round.
+-- FUSE WATCHDOG: the explosion lives in Objective's fuse thread, and once
+-- upon a time that thread crashed on itself (playtest #12's 130-second
+-- soft-locked round). If the planted phase ever runs 5s past the fuse
+-- without a resolution, the round machine declares the spike itself the
+-- winner rather than letting a match hang forever.
 --
 -- Deliberately NOT here: halftime side swaps (needs team identity), overtime,
 -- armor/shields, weapon drops on death. All tracked in the build doc.
@@ -48,6 +45,7 @@ local DEFAULT_JUMP_POWER = 50
 
 local SITES = { "A_SITE", "B_SITE" }
 local DEF_FORWARD = { "MID", "MID_LEDGE", "MID_WINDOW", "A_SHORT", "B_SHORT" }
+local FUSE_WATCHDOG_GRACE = 5 -- seconds past the fuse before we call it dead
 
 type Ctx = {
 	roster: { any },
@@ -409,6 +407,15 @@ function RoundMachine.start(ctx: Ctx)
 				winner, reason = "Defense", "elimination"
 			elseif not MatchState.planted and clock() > liveEnds then
 				winner, reason = "Defense", "the clock"
+			elseif MatchState.planted
+				and not MatchState.defused
+				and clock() > MatchState.plantedAt + RoundConfig.SpikeFuseSeconds + FUSE_WATCHDOG_GRACE
+			then
+				-- The fuse thread owns the explosion — but if it ever dies silently
+				-- (playtest #12's self-cancel crash), the match must not hang. The
+				-- spike always wins a fuse that outlives itself.
+				warn("[CLUTCH] FUSE WATCHDOG: spike overstayed its fuse — calling it")
+				MatchState.exploded = true
 			else
 				task.wait(0.25)
 			end
