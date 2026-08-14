@@ -50,6 +50,7 @@ local INTENT_COLORS = {
 	Push = Color3.fromRGB(255, 170, 80),
 	Rotate = Color3.fromRGB(180, 130, 255),
 	Lurk = Color3.fromRGB(90, 200, 200),
+	FallBack = Color3.fromRGB(240, 120, 80),
 	Engage = Color3.fromRGB(255, 85, 85),
 	Plant = Color3.fromRGB(255, 210, 90),
 	Defuse = Color3.fromRGB(120, 180, 255),
