@@ -8,12 +8,18 @@
 -- PRIMARY: die and you come back on the free Sidearm, like every tac shooter
 -- ever. Weapon drops on death are the tracked follow-up.
 --
--- TEAM PLANS (playtest #11): every round opens with a CALL. Attack rolls
--- Rush / Default / Split against a called site; defense rolls Standard /
--- Stack / Aggro. Plans set each bot's siteChoice/holdChoice before brains
--- wake up, so five individuals stop rolling five unrelated coin flips.
--- Today the coin calls it — this is the seed of the M2 tactics board, where
--- the manager makes the call and the same machinery executes it.
+-- TEAM PLANS: every round opens with a CALL. Attack rolls Rush / Default /
+-- Split against a called site; defense rolls Standard / Stack / Aggro. Plans
+-- set each bot's siteChoice/holdChoice before brains wake up, so five
+-- individuals stop rolling five unrelated coin flips. Today the coin calls
+-- it — this is the seed of the M2 tactics board, where the manager makes the
+-- call and the same machinery executes it.
+--
+-- CORPSES ARE GHOSTS. The dead freeze in place (anchored) and lose ALL
+-- collision, so a body in a doorway blocks nobody's path — living bots have
+-- no corpse collision anyway (ClutchBots group), but the standable-point
+-- clearance check also rejected ground near corpses, quietly shrinking
+-- doorways for the rest of the round.
 --
 -- Also owns the economy (win/loss ladders, kill rewards, plant bonus), the
 -- body swapper (every round starts with pristine rigs at spawn), per-round
@@ -92,6 +98,19 @@ local function markBot(bot: any, side: string)
 	model:SetAttribute("Side", side)
 	model:SetAttribute("Role", bot.role)
 	model:SetAttribute("Weapon", if bot.weapon then bot.weapon.DisplayName else "?")
+end
+
+-- The dead become scenery: frozen where they fell, zero collision.
+local function ghostCorpse(model: Model)
+	for _, inst in model:GetDescendants() do
+		if inst:IsA("BasePart") then
+			inst.CanCollide = false
+		end
+	end
+	local root = model:FindFirstChild("HumanoidRootPart") :: BasePart?
+	if root then
+		root.Anchored = true -- keeps the no-clip rig from sinking through the floor
+	end
 end
 
 -- v1 buy logic: the best primary you can afford, or the free Sidearm. Snipers
@@ -254,7 +273,8 @@ end
 
 -- One watcher per bot per round. A death is final: kill feed, killer's kill
 -- reward, spike drop if the carrier fell, the victim drops to the free pistol
--- (bought primaries die with the body), and that's it until next round.
+-- (bought primaries die with the body), the corpse turns into a no-clip
+-- ghost, and that's it until next round.
 local function watchDeaths(ctx: Ctx, roundId: number)
 	for _, bot in ctx.roster do
 		task.spawn(function()
@@ -266,6 +286,7 @@ local function watchDeaths(ctx: Ctx, roundId: number)
 				local humanoid = model:FindFirstChildOfClass("Humanoid")
 				if humanoid and humanoid.Health <= 0 then
 					bot.deaths = (bot.deaths or 0) + 1
+					ghostCorpse(model) -- the dead never block a path
 					local killerName = model:GetAttribute("LastKilledBy")
 					if killerName then
 						ctx.killFeed:FireAllClients({
