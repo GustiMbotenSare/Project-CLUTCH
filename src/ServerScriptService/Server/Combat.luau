@@ -21,6 +21,12 @@
 -- Every attribute lands on the same shot: Reactions sets the delay before the
 -- first bullet, Aim sets both spread and how often the head is attempted,
 -- Consistency widens or tightens the cone, Aggression biases willingness.
+--
+-- KILLS are reported two ways: the DOWN log line, and stamps on the victim's
+-- model (LastKilledBy / LastKillHeadshot / LastKillDistance / LastKillWeapon)
+-- which the respawn watcher reads to fire the kill feed before the corpse is
+-- destroyed. Lifetime K/D/HS live on the bot record and ride to the dashboard
+-- as replicated attributes written by Telemetry.
 
 local Debris = game:GetService("Debris")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -339,6 +345,7 @@ function Combat.fireBurst(
 			if isHead then
 				damage *= weapon.HeadshotMultiplier
 				state.headshots += 1
+				bot.headshots = (bot.headshots or 0) + 1 -- lifetime stat, dashboard-bound
 			end
 			state.hits += 1
 			hitSpark(result.Position)
@@ -359,6 +366,13 @@ function Combat.fireBurst(
 			end
 
 			if targetHumanoid.Health <= 0 then
+				bot.kills = (bot.kills or 0) + 1
+				-- Stamp the corpse. The respawn watcher reads these to fire the kill
+				-- feed before the body is destroyed and replaced.
+				targetModel:SetAttribute("LastKilledBy", bot.name)
+				targetModel:SetAttribute("LastKillHeadshot", isHead)
+				targetModel:SetAttribute("LastKillDistance", math.floor(distance))
+				targetModel:SetAttribute("LastKillWeapon", weapon.DisplayName)
 				print(("[CLUTCH] %6.1fs  DOWN %s killed by %s | %d/%d shots hit, %d headshots"):format(
 					clock(),
 					targetModel.Name,
