@@ -11,12 +11,12 @@
 --
 -- A third consumer arrived with the spectator dashboard: the CLIENT. Every
 -- sample also stamps the bot's model with replicated attributes (zone callout,
--- live intent, alive flag, K/D/HS), so the HUD can poll plain attributes and
--- never needs its own remote traffic.
+-- live intent, alive flag, K/D/HS, credits), so the HUD can poll plain
+-- attributes and never needs its own remote traffic.
 --
--- RESPAWN-SAFE: the sample loop re-reads bot.model every tick. The respawn
--- watcher replaces a dead model wholesale (a dead humanoid cannot be revived),
--- and a loop that captured the old model would go blind at the first death.
+-- RESPAWN-SAFE: the sample loop re-reads bot.model every tick. The round
+-- machine replaces bodies wholesale between rounds, and a loop that captured
+-- the old model would go blind at the first reset.
 --
 -- Dwell time is the first honest diagnostic for "are these bots using the map,
 -- or pacing one corner".
@@ -100,12 +100,12 @@ function Telemetry.attach(bot: any, side: string)
 	end
 
 	task.spawn(function()
-		-- bot.model is re-read EVERY TICK: the respawn watcher swaps in a fresh
-		-- rig, and capturing the old one would blind the track at first death.
+		-- bot.model is re-read EVERY TICK: the round machine swaps in a fresh
+		-- rig every round, and capturing one model would blind the track.
 		while true do
 			local model = bot.model :: Model?
 			if not model or not model.Parent then
-				task.wait(0.5) -- between bodies during a respawn swap
+				task.wait(0.5) -- between bodies during a round reset
 				continue
 			end
 
@@ -155,7 +155,7 @@ function Telemetry.attach(bot: any, side: string)
 			end
 
 			-- Replicated state for the spectator dashboard. Attributes ride the
-			-- model, so a fresh respawn body starts blank until the next sample —
+			-- model, so a fresh round body starts blank until the next sample —
 			-- at 4Hz that gap is invisible.
 			model:SetAttribute("Zone", if zone then zone.callout else "Off-map")
 			model:SetAttribute("Intent", track.intent)
@@ -163,6 +163,7 @@ function Telemetry.attach(bot: any, side: string)
 			model:SetAttribute("Kills", bot.kills or 0)
 			model:SetAttribute("Deaths", bot.deaths or 0)
 			model:SetAttribute("Headshots", bot.headshots or 0)
+			model:SetAttribute("Credits", bot.credits or 0)
 
 			task.wait(Scenario.TelemetrySampleSeconds)
 		end
