@@ -1,0 +1,9 @@
+# Build artifacts
+*.rbxl
+*.rbxl.lock
+*.rbxm
+/build/
+
+# OS junk
+.DS_Store
+Thumbs.db
