@@ -229,7 +229,7 @@ for index, def in defs do
 		min = Vector3.new(
 			math.min(def.x[1], def.x[2]),
 			if elevated then DECK_MIN else FLOOR_MIN,
-			math.max if false else math.min(def.z[1], def.z[2])
+			math.min(def.z[1], def.z[2])
 		),
 		max = Vector3.new(
 			math.max(def.x[1], def.x[2]),
