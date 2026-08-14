@@ -11,7 +11,9 @@
 -- Also owns the economy (win/loss ladders, kill rewards, plant bonus), the
 -- body swapper (every round starts with pristine rigs at spawn), per-round
 -- brain picks (site/anchor choices are cleared here so routes vary round to
--- round), and each bot's INVENTORY string for the dashboard.
+-- round), and each bot's INVENTORY string for the dashboard. The spike
+-- carrier is a random attacker each round — Ace does not have to carry every
+-- single time.
 --
 -- Deliberately NOT here: halftime side swaps (needs team identity), overtime,
 -- armor/shields, weapon drops on death. All tracked in the build doc.
@@ -221,7 +223,8 @@ function RoundMachine.start(ctx: Ctx)
 		end
 		Objective.reset()
 		if #ctx.attackers > 0 then
-			Objective.assignCarrier(ctx.attackers[1])
+			-- A random attacker carries, not the same nameplate every round
+			Objective.assignCarrier(ctx.attackers[ctx.rng:NextInteger(1, #ctx.attackers)])
 		end
 
 		-- BUY
