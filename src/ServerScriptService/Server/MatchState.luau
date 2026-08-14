@@ -6,6 +6,12 @@
 -- lastShot is the gunfire bus: Combat stamps it at every burst, Perception
 -- reads it so bots HEAR gunfire (GunshotSoundGlobal). Sound has to come from
 -- somewhere real, not from bots polling each other's triggers.
+--
+-- plan is the TEAM layer, rolled by the round machine each round and read by
+-- every brain: attackKind "Rush"|"Default"|"Split", defenseKind
+-- "Standard"|"Stack"|"Aggro", the called site, and per-bot assignments. This
+-- is the seed of the player-chosen tactics board — today the coin calls it,
+-- later the manager does.
 
 local MatchState = {
 	-- "Buy" | "Live" | "Planted" | "PostRound"
@@ -27,6 +33,10 @@ local MatchState = {
 
 	-- Most recent gunfire: { by = shooter name, pos = Vector3, at = clock() }
 	lastShot = nil :: any,
+
+	-- Team plan for the current round:
+	-- { attackKind: string, defenseKind: string, site: string?, otherSite: string? }
+	plan = nil :: any,
 }
 
 return MatchState
