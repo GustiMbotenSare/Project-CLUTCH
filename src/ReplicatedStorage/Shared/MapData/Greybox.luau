@@ -1,5 +1,14 @@
 --!strict
--- Greybox v2.1 — still data, still no Studio work.
+-- Greybox v2.2 — still data, still no Studio work.
+--
+-- v2.1 → v2.2 (playtest #5 — spawn-to-spawn sightline):
+--   * Both spawn lobbies had a completely open boundary, so the two duelists
+--     saw each other at 87 studs from their own spawn lines 4 seconds in and
+--     traded pistol fire across the whole map. A pistol's optimal band is 40
+--     studs; an 87-stud opener teaches the bots nothing about range discipline.
+--     Added SpawnScreenN/S: 12-tall walls sealing the lobby boundary except
+--     for a 26-wide gap at mid (x -13..13), which is now THE opening contest.
+--     First contact should happen around 30-50 studs instead.
 --
 -- v2 → v2.1 (playtest #2 — nothing climbed):
 --   * Vertical access was broken by construction: staircases sat UNDER their
@@ -66,6 +75,15 @@ local parts: { PartSpec } = {
 	{ name = "WallS", pos = Vector3.new(0, 7, 55), size = Vector3.new(170, 12, 2), color = WALL },
 	{ name = "WallW", pos = Vector3.new(-85, 7, 0), size = Vector3.new(2, 12, 110), color = WALL },
 	{ name = "WallE", pos = Vector3.new(85, 7, 0), size = Vector3.new(2, 12, 110), color = WALL },
+
+	-- SPAWN SCREENS. The lobby boundary used to be wide open, so both duelists
+	-- had line of sight from their own spawn line. These walls seal it except
+	-- for a 26-wide gap at mid (x -13..13): mid is now the only place the
+	-- opening can be contested, which is exactly what mid is for.
+	{ name = "SpawnScreenS1", pos = Vector3.new(-49, 7, 20), size = Vector3.new(72, 12, 2), color = WALL },
+	{ name = "SpawnScreenS2", pos = Vector3.new(49, 7, 20), size = Vector3.new(72, 12, 2), color = WALL },
+	{ name = "SpawnScreenN1", pos = Vector3.new(-49, 7, -40), size = Vector3.new(72, 12, 2), color = WALL },
+	{ name = "SpawnScreenN2", pos = Vector3.new(49, 7, -40), size = Vector3.new(72, 12, 2), color = WALL },
 
 	-- A / B main lanes (14 wide: one smoke chokes a door, never a whole site)
 	{ name = "LaneWestOuter", pos = Vector3.new(-70, 7, 12), size = Vector3.new(2, 12, 64), color = WALL },
