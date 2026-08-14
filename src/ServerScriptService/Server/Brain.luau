@@ -1,45 +1,33 @@
 --!strict
--- Bot brain v2: score every intent, commit to the winner, act on it.
+-- Bot brain v3: score every intent, commit to the winner, act on it — now with
+-- the round in the loop. The brain reads MatchState, so intents can react to
+-- the spike: carriers path to sites and PLANT, defenders collapse on a planted
+-- site and DEFUSE, and a dropped spike is worth walking to.
 --
 -- Utility AI rather than a state machine, because a state machine hides its
 -- reasoning. Here every tick produces a full score vector, and the log prints
 -- it, so a bad decision can be traced to the term that caused it. That is the
 -- entire reason this is readable at all.
 --
--- Bots target ZONES and normally move one hop at a time, so they re-evaluate
--- continuously instead of blindly finishing a long walk. Short trips are walked
--- directly to cut down the stop-start stutter at zone boundaries.
+-- Bots target ZONES and, since walks became interruptible, walk whole routes
+-- instead of stopping at every zone boundary. Combat, a plant opportunity or
+-- a defuse still cut a walk short.
 --
 -- ---------------------------------------------------------------------------
 -- Fixed after the first 1v1 transcript, all four found by reading the log:
---
 --   * MID_BACK was in DEF_HOLDS. A defender treated a mid corridor as a valid
 --     anchor, so Onyx stopped there permanently and never defended a site.
---     16 of 25 zones were never visited by either bot.
---
 --   * Push scored 1.22 for an Entry attacker while nothing else could exceed
---     ~0.5. Ace was mathematically incapable of choosing another intent and
---     therefore never logged a THINK line, because THINK only fired on change.
---     All weights now live in a comparable range.
---
---   * Push had no terminal condition. On reaching A Site, Ace's Push target
---     was the zone he already occupied, so he repositioned inside it forever
---     while staring at a visible enemy. Push now excludes the current zone and
---     is heavily penalised when the bot is already on its objective.
---
---   * The stall ramp reset on every hop, so it behaved as a 25-second
---     metronome: Onyx stepped to Mid Window, reset, stepped back, reset. It now
---     resets only on reaching a FINAL target, or on contact.
---
+--     ~0.5. Ace was mathematically incapable of choosing another intent.
+--   * Push had no terminal condition; the bot repositioned inside its own
+--     objective forever. Push now excludes the current zone and is heavily
+--     penalised when already on it.
+--   * The stall ramp reset on every hop — a 25-second metronome. It now resets
+--     only on a FINISHED goal or on contact.
 -- Fixed after the second transcript:
---
---   * ROUTE COMMITMENT. The pathing arrive radius (4.5 studs) lets a bot stop
---     just short of the sampled point, often still inside the zone it was
---     leaving. Re-deciding from scratch every tick then sampled a DIFFERENT
---     neighbour, which produced boundary churn: A Site -> A Ramp -> A Site ->
---     A Short -> A Site. The brain now commits to ONE intermediate zone and
---     keeps walking it until the zone actually changes, the path fails, or
---     combat interrupts.
+--   * ROUTE COMMITMENT: boundary arrivals re-decided the next hop and churned
+--     between neighbours. The brain commits to one intermediate zone until the
+--     zone actually changes.
 -- ---------------------------------------------------------------------------
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -53,6 +41,8 @@ local Pathing = require(script.Parent.Pathing)
 local Perception = require(script.Parent.Perception)
 local Combat = require(script.Parent.Combat)
 local Telemetry = require(script.Parent.Telemetry)
+local Objective = require(script.Parent.Objective)
+local MatchState = require(script.Parent.MatchState)
 
 local Brain = {}
 
@@ -61,7 +51,10 @@ local CANDIDATES = 6 -- standable-point attempts per destination
 local CLEARANCE_RADIUS = 2.6
 local GROUND_TOLERANCE = 2.5
 local ALLY_CROWD_STUDS = 25
-local DIRECT_WALK_MAX_HOPS = 2 -- walk straight there instead of hop-by-hop
+-- Walk whole routes, not two-hop legs. Interrupts (combat) still poll every
+-- 0.3s inside the walk, so long walks no longer mean slow reactions — and the
+-- full stop at every zone boundary was the worst of the movement jank.
+local DIRECT_WALK_MAX_HOPS = 6
 local INTERRUPT_RECHECK = 0.3 -- seconds between combat interrupt polls
 
 -- Role priors. Kept in the same band as the situational terms on purpose: a
@@ -79,9 +72,10 @@ local ATK_FORWARD = { "MID", "MID_LEDGE", "A_LOBBY", "B_LOBBY", "A_ELBOW", "B_EL
 local DEF_FORWARD = { "MID", "MID_LEDGE", "MID_WINDOW", "A_SHORT", "B_SHORT" }
 local FLANKS = { "A_MAIN", "B_MAIN", "A_ELBOW", "B_ELBOW" }
 
-local INTENTS = { "Hold", "Push", "Rotate", "Lurk", "Engage" }
+local INTENTS = { "Hold", "Push", "Rotate", "Lurk", "Engage", "Plant", "Defuse" }
 
 type Context = {
+	bot: any,
 	side: string,
 	role: string,
 	zoneKey: string,
@@ -145,6 +139,14 @@ local function scorePush(ctx: Context): number
 		-- inside its own objective forever, which is exactly what Ace did.
 		score -= 0.65
 	end
+	-- The carrier's job is the site; a dropped spike is everyone's job.
+	if ctx.side == "Attack" and not MatchState.planted then
+		if MatchState.spikeCarrier == ctx.bot then
+			score += 0.15
+		elseif MatchState.spikeCarrier == nil and MatchState.spikePart then
+			score += 0.20 -- go get it
+		end
+	end
 	return score
 end
 
@@ -182,12 +184,46 @@ local function scoreEngage(ctx: Context): number
 	return ctx.assessment.score
 end
 
+-- The carrier on a live round: get to a site, then put the spike down. Contact
+-- makes planting a gamble — Engage can still outscore it and fight first.
+local function scorePlant(ctx: Context): number
+	if ctx.side ~= "Attack" or MatchState.planted or MatchState.phase ~= "Live" then
+		return -1
+	end
+	if MatchState.spikeCarrier ~= ctx.bot then
+		return -1
+	end
+	local score = 0.45 + ctx.decisiveness * 0.20
+	if Zones.hasTag(ctx.zoneKey, "plant") then
+		score += 0.55
+	end
+	if ctx.contact then
+		score -= 0.25
+	end
+	return score
+end
+
+-- The spike is down: every defender collapses on it. Off site this still has
+-- to beat a comfortable Hold, or nobody retakes.
+local function scoreDefuse(ctx: Context): number
+	if ctx.side ~= "Defense" or not MatchState.planted then
+		return -1
+	end
+	local score = 0.75 + ctx.gameSense * 0.15
+	if ctx.zoneKey == MatchState.plantedZoneKey then
+		score += 0.50
+	end
+	return score
+end
+
 local SCORERS: { [string]: (Context) -> number } = {
 	Hold = scoreHold,
 	Push = scorePush,
 	Rotate = scoreRotate,
 	Lurk = scoreLurk,
 	Engage = scoreEngage,
+	Plant = scorePlant,
+	Defuse = scoreDefuse,
 }
 
 -- Can a humanoid actually stand here? Sampling a zone rectangle blindly puts
@@ -252,10 +288,21 @@ end
 local function resolveTarget(intent: string, ctx: Context, allyZones: { string }): string?
 	if intent == "Engage" then
 		return nil -- stand and fight
+	elseif intent == "Plant" then
+		if Zones.hasTag(ctx.zoneKey, "plant") then
+			return nil -- channel in place
+		end
+		return nearestOf(SITES, ctx.zoneKey)
+	elseif intent == "Defuse" then
+		return MatchState.plantedZoneKey
 	elseif intent == "Rotate" then
 		return if ctx.contact then ctx.contact.zoneKey else nil
 	elseif intent == "Push" then
 		if ctx.side == "Attack" then
+			-- A dropped spike outranks map control: walk to where it fell.
+			if not MatchState.planted and MatchState.spikeCarrier == nil and MatchState.spikePart then
+				return Zones.keyAt(MatchState.spikePart.Position)
+			end
 			-- Excluding the current zone is what lets an attacker who already owns
 			-- A Site go looking on B instead of shuffling in place.
 			return nearestOf(SITES, ctx.zoneKey)
@@ -305,7 +352,7 @@ function Brain.start(bot: any, side: string, enemies: { any }, allies: { any }, 
 
 	local humanoid = model:FindFirstChildOfClass("Humanoid")
 	local combatState = Combat.newState(if humanoid then humanoid.Health else 100)
-	bot.combatState = combatState -- exposed so the respawn watcher can release the corpse
+	bot.combatState = combatState -- exposed so the round machine can inspect it
 
 	task.spawn(function()
 		local intent = if side == "Attack" then "Push" else "Hold"
@@ -362,6 +409,11 @@ function Brain.start(bot: any, side: string, enemies: { any }, allies: { any }, 
 				Combat.disengage(combatState) -- next fight pays reaction cost again
 			end
 
+			-- A dropped spike is picked up by walking over it
+			if side == "Attack" and not MatchState.planted then
+				Objective.tryPickup(bot)
+			end
+
 			local assessment = nil
 			if visible then
 				assessment = Combat.assess(bot, weapon, visible, enemies, currentKey, combatState, now)
@@ -391,6 +443,7 @@ function Brain.start(bot: any, side: string, enemies: { any }, allies: { any }, 
 				else table.find(DEF_FORWARD, currentKey) ~= nil
 
 			local ctx: Context = {
+				bot = bot,
 				side = side,
 				role = bot.role,
 				zoneKey = currentKey,
@@ -419,8 +472,9 @@ function Brain.start(bot: any, side: string, enemies: { any }, allies: { any }, 
 				end
 			end
 
-			-- Commitment stops intent chatter, but being shot at outranks it.
-			if winner ~= intent and winner ~= "Engage" then
+			-- Commitment stops intent chatter, but being shot at — or a live
+			-- objective — outranks it.
+			if winner ~= intent and winner ~= "Engage" and winner ~= "Plant" and winner ~= "Defuse" then
 				if now - committedAt < Scenario.MinIntentSeconds then
 					winner = intent
 				end
@@ -496,7 +550,18 @@ function Brain.start(bot: any, side: string, enemies: { any }, allies: { any }, 
 				))
 			end
 
-			if intent ~= "Engage" then
+			if intent == "Plant" and Zones.hasTag(currentKey, "plant") then
+				-- The channel itself is blocking and honest: damage, movement or
+				-- death cancel it inside Objective.
+				Objective.tryStartPlant(bot, clock)
+				lastProgressAt = clock()
+			elseif intent == "Defuse" and currentKey == MatchState.plantedZoneKey and MatchState.spikePart then
+				local result = Pathing.walkToWithResult(model, MatchState.spikePart.Position, shouldInterrupt)
+				if result == "arrived" then
+					Objective.tryStartDefuse(bot, clock)
+				end
+				lastProgressAt = clock()
+			elseif intent ~= "Engage" then
 				if targetKey == nil or targetKey == currentKey then
 					-- Settle into the zone we already want to be in. Short dwell: the
 					-- old 1.5-3.5s wait read as aimless shuffling.
