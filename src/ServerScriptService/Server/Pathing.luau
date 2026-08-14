@@ -1,7 +1,7 @@
 --!strict
 -- Shared pathing helpers. Every bot movement goes through here.
 --
--- Hard-won lessons from playtests #1 and #2:
+-- Hard-won lessons from playtests #1-#4:
 --   * The navmesh needs a beat to bake after the arena builds at runtime —
 --     ComputeAsync can fail on frame one. Retry with a short wait.
 --   * AgentCanJump must stay FALSE. With jumping enabled the pathfinder
@@ -10,6 +10,9 @@
 --   * Never wait for MoveToFinished per waypoint — that full-stops the bot at
 --     every node and reads as janky. Advance on proximity instead.
 --   * Ten bots crowding one stud body-block each other. Sidestep + repath.
+--   * A walk must be INTERRUPTIBLE. Blocking until arrival meant a bot that
+--     spotted an enemy could not react until it finished walking, which is why
+--     bots looked oblivious even with working line of sight.
 
 local PathfindingService = game:GetService("PathfindingService")
 
@@ -30,6 +33,8 @@ local AGENT_PARAMS = {
 	WaypointSpacing = 4,
 }
 
+export type WalkResult = "arrived" | "aborted" | "failed"
+
 local function compute(fromPos: Vector3, target: Vector3): Path?
 	local path = PathfindingService:CreatePath(AGENT_PARAMS)
 	for attempt = 1, MAX_COMPUTE_RETRIES do
@@ -44,12 +49,24 @@ local function compute(fromPos: Vector3, target: Vector3): Path?
 	return nil
 end
 
--- Walks the bot to `target`. Returns true only if it actually arrived.
-function Pathing.walkTo(bot: Model, target: Vector3): boolean
+-- Walks the bot to `target`.
+--
+-- `shouldAbort` is polled every tick; return true from it to stop the walk
+-- immediately. This is how combat interrupts movement.
+function Pathing.walkToWithResult(bot: Model, target: Vector3, shouldAbort: (() -> boolean)?): WalkResult
 	local humanoid = bot:FindFirstChildOfClass("Humanoid")
 	local root = bot:FindFirstChild("HumanoidRootPart") :: BasePart?
 	if not humanoid or not root or humanoid.Health <= 0 then
-		return false
+		return "failed"
+	end
+
+	local function aborting(): boolean
+		return shouldAbort ~= nil and shouldAbort()
+	end
+
+	-- Check before spending a ComputeAsync on a walk we are about to cancel
+	if aborting() then
+		return "aborted"
 	end
 
 	for attempt = 0, MAX_REPATHS do
@@ -63,7 +80,7 @@ function Pathing.walkTo(bot: Model, target: Vector3): boolean
 					target.Y,
 					target.Z
 				))
-				return false
+				return "failed"
 			end
 		else
 			local waypoints = path:GetWaypoints()
@@ -74,7 +91,12 @@ function Pathing.walkTo(bot: Model, target: Vector3): boolean
 
 			while index <= #waypoints do
 				if humanoid.Health <= 0 or not bot.Parent then
-					return false
+					return "failed"
+				end
+
+				if aborting() then
+					humanoid:MoveTo(root.Position) -- plant feet where they are
+					return "aborted"
 				end
 
 				local waypoint = waypoints[index]
@@ -101,7 +123,7 @@ function Pathing.walkTo(bot: Model, target: Vector3): boolean
 			end
 
 			if not blocked then
-				return true
+				return "arrived"
 			end
 
 			-- Crowding is the usual culprit: sidestep, then try a fresh path
@@ -117,7 +139,13 @@ function Pathing.walkTo(bot: Model, target: Vector3): boolean
 		target.Y,
 		target.Z
 	))
-	return false
+	return "failed"
+end
+
+-- Returns true only if the bot actually arrived. Kept for callers that do not
+-- care why a walk ended (Patrol, ShootingRange).
+function Pathing.walkTo(bot: Model, target: Vector3, shouldAbort: (() -> boolean)?): boolean
+	return Pathing.walkToWithResult(bot, target, shouldAbort) == "arrived"
 end
 
 return Pathing
