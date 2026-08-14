@@ -1,9 +1,11 @@
 --!strict
--- Shared match state. Written by RoundMachine and Objective, read by Brain
--- (so intents can react to the round) and mirrored to the client as attributes
--- on the CLUTCH remotes folder (phase, clock, score, spike).
+-- Shared match state. Written by RoundMachine and Objective, read by Brain and
+-- the client (via attributes on the CLUTCH remotes folder that RoundMachine
+-- maintains). Pure data: requires nothing, so nothing can require-cycle it.
 --
--- Pure data. It requires nothing, so nothing can require-cycle through it.
+-- lastShot is the gunfire bus: Combat stamps it at every burst, Perception
+-- reads it so bots HEAR gunfire (GunshotSoundGlobal). Sound has to come from
+-- somewhere real, not from bots polling each other's triggers.
 
 local MatchState = {
 	-- "Buy" | "Live" | "Planted" | "PostRound"
@@ -22,6 +24,9 @@ local MatchState = {
 	spikeCarrier = nil :: any, -- bot record while carried; nil while dropped
 	defused = false,
 	exploded = false,
+
+	-- Most recent gunfire: { by = shooter name, pos = Vector3, at = clock() }
+	lastShot = nil :: any,
 }
 
 return MatchState
