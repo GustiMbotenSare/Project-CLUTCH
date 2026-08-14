@@ -12,14 +12,15 @@
 --
 -- Zones are semantic labels over space, NOT collision volumes. They overlap
 -- freely; the SMALLEST containing zone wins, so "A Door" beats "A Site".
--- Floor zones occupy y 0..4.2 and decks y 4.2..9, resolved against a bot's
--- GROUND position (feet), never its root part. The bands meet at 4.2 because
--- a ramp's midpoint sits at y ~3.5 (the "A Ramp -> Off-map" flicker fix).
+-- Floor zones occupy y 0..5.5 and decks y 4.2..9, resolved against a bot's
+-- GROUND position (feet). The bands OVERLAP 4.2..5.5: a ramp's top end sits
+-- at y ~5 while still inside the ramp zone's footprint, and the smallest-
+-- zone-wins rule keeps decks correct anyway (heaven is smaller than site).
 --
--- v3: re-derived for the 230x150 5v5 greybox. Same 25 keys, same callouts,
--- same topology — the brain relearns nothing. One real change: sites now
--- adjoin DEF_LOBBY (the defender back route, open north edge), so defenders
--- finally arrive before attackers.
+-- v3: re-derived for the 230x150 5v5 greybox; sites adjoin DEF_LOBBY (the
+-- defender back route).
+-- v3.1 (playtest #11): sites grow 4 studs south (z -50..-18) — the site read
+-- as a corridor next to the lobby. Doors/shorts/lobbies shift to match.
 
 export type ZoneKey = string
 export type Control = "Attack" | "Defense" | "Neutral"
@@ -47,10 +48,10 @@ type ZoneDef = {
 	adjacent: { string },
 }
 
-local FLOOR_MIN, FLOOR_MAX = 0, 4.2 -- meets the deck band mid-ramp, not above it
+local FLOOR_MIN, FLOOR_MAX = 0, 5.5 -- overlaps the deck band; ramps span both
 local DECK_MIN, DECK_MAX = 4.2, 9
 
--- Bounds derived from Greybox v3 geometry. Attackers south (+z), defenders
+-- Bounds derived from Greybox v3.1 geometry. Attackers south (+z), defenders
 -- north (-z), Site A west (-x), Site B east (+x).
 local defs: { ZoneDef } = {
 	{
@@ -81,19 +82,19 @@ local defs: { ZoneDef } = {
 	},
 	{
 		key = "A_LOBBY", callout = "A Lobby",
-		x = { -72, -26 }, z = { -22, 28 },
+		x = { -72, -26 }, z = { -18, 28 },
 		control = "Neutral", tags = { "lobby" },
 		adjacent = { "A_DOOR", "A_SHORT" },
 	},
 	{
 		key = "A_DOOR", callout = "A Door",
-		x = { -66, -54 }, z = { -24, -16 },
+		x = { -66, -54 }, z = { -20, -14 },
 		control = "Neutral", tags = { "choke" },
 		adjacent = { "A_SITE" },
 	},
 	{
 		key = "A_SITE", callout = "A Site",
-		x = { -95, -48 }, z = { -50, -22 },
+		x = { -95, -48 }, z = { -50, -18 }, -- v3.1: four studs deeper south
 		control = "Defense", tags = { "site", "plant" },
 		-- DEF_LOBBY: the back route. Sites open north; defenders arrive first.
 		adjacent = { "A_RAMP", "A_SHORT", "A_HEAVEN", "DEF_LOBBY" },
@@ -112,7 +113,7 @@ local defs: { ZoneDef } = {
 	},
 	{
 		key = "A_SHORT", callout = "A Short",
-		x = { -48, -26 }, z = { -50, -22 },
+		x = { -48, -26 }, z = { -50, -18 },
 		control = "Neutral", tags = { "connector", "choke" },
 		adjacent = { "MID_BACK" },
 	},
@@ -152,13 +153,13 @@ local defs: { ZoneDef } = {
 	-- B side (mirror)
 	{
 		key = "B_SHORT", callout = "B Short",
-		x = { 26, 48 }, z = { -50, -22 },
+		x = { 26, 48 }, z = { -50, -18 },
 		control = "Neutral", tags = { "connector", "choke" },
 		adjacent = { "B_SITE", "B_LOBBY" },
 	},
 	{
 		key = "B_SITE", callout = "B Site",
-		x = { 48, 95 }, z = { -50, -22 },
+		x = { 48, 95 }, z = { -50, -18 }, -- v3.1: four studs deeper south
 		control = "Defense", tags = { "site", "plant" },
 		adjacent = { "B_RAMP", "B_HEAVEN", "B_DOOR", "DEF_LOBBY" },
 	},
@@ -176,13 +177,13 @@ local defs: { ZoneDef } = {
 	},
 	{
 		key = "B_DOOR", callout = "B Door",
-		x = { 54, 66 }, z = { -24, -16 },
+		x = { 54, 66 }, z = { -20, -14 },
 		control = "Neutral", tags = { "choke" },
 		adjacent = { "B_LOBBY" },
 	},
 	{
 		key = "B_LOBBY", callout = "B Lobby",
-		x = { 26, 72 }, z = { -22, 28 },
+		x = { 26, 72 }, z = { -18, 28 },
 		control = "Neutral", tags = { "lobby" },
 		adjacent = { "B_ELBOW" },
 	},
@@ -228,7 +229,7 @@ for index, def in defs do
 		min = Vector3.new(
 			math.min(def.x[1], def.x[2]),
 			if elevated then DECK_MIN else FLOOR_MIN,
-			math.min(def.z[1], def.z[2])
+			math.max if false else math.min(def.z[1], def.z[2])
 		),
 		max = Vector3.new(
 			math.max(def.x[1], def.x[2]),
