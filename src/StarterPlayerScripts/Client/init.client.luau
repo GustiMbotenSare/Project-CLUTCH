@@ -1,4 +1,4 @@
--- Project CLUTCH — spectator dashboard v0.6
+-- Project CLUTCH — spectator dashboard v0.7
 --
 -- The first piece of the M1 broadcast package: what a real esports observer
 -- sees, reduced to what the sim can honestly report right now.
@@ -6,21 +6,21 @@
 --   * Top bar     — team names with alive counts, ROUND number, phase and
 --                   clock, the score, and a SPIKE DOWN callout when planted.
 --   * Player cards — name, role, INVENTORY (every weapon they own), live HP
---                    bar, current zone callout, the bot's CURRENT INTENT (the
---                    thing no real broadcast can show), K / D / HS and
---                    credits. Attackers left, defenders right. Click a card
---                    to put the camera on it.
+--                    bar, current zone callout WITH walk/sprint mode (the
+--                    shift-walk is a decision; show it), the bot's CURRENT
+--                    INTENT, K / D / HS and credits. Attackers left,
+--                    defenders right. Click a card to put the camera on it.
 --   * Kill feed   — killer, victim, headshot flag, distance, weapon.
 --
 -- Controls: click a card to spectate it · C releases the camera ·
 -- Tab or the CLUTCH button toggles the overlay.
 --
 -- Data path: Telemetry stamps every bot model with replicated attributes at
--- 4Hz (Zone, Intent, Alive, Kills, Deaths, Headshots, Credits, Inventory),
--- RoundMachine mirrors match state as attributes on the CLUTCH folder (Phase,
--- TimeLeft, Round, AtkScore, DefScore, Planted), and KillFeed fires per
--- death. The client polls plain attributes — no per-frame remote traffic, no
--- desync.
+-- 4Hz (Zone, Intent, Alive, Kills, Deaths, Headshots, Credits, Inventory,
+-- Speed), RoundMachine mirrors match state as attributes on the CLUTCH folder
+-- (Phase, TimeLeft, Round, AtkScore, DefScore, Planted), and KillFeed fires
+-- per death. The client polls plain attributes — no per-frame remote traffic,
+-- no desync.
 
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -33,7 +33,7 @@ local camera = workspace.CurrentCamera
 local remotes = ReplicatedStorage:WaitForChild("CLUTCH")
 local killFeed = remotes:WaitForChild("KillFeed")
 
-print("[CLUTCH] client online — spectator dashboard v0.6")
+print("[CLUTCH] client online — spectator dashboard v0.7")
 
 local ATK_COLOR = Color3.fromRGB(255, 150, 60)
 local DEF_COLOR = Color3.fromRGB(80, 200, 255)
@@ -348,7 +348,13 @@ local function refresh()
 		-- for any session started before the round machine tracked inventories.
 		local inventory = tostring(model:GetAttribute("Inventory") or model:GetAttribute("Weapon") or "?")
 		card.sub.Text = ("%s · %s"):format(tostring(model:GetAttribute("Role") or "?"), inventory)
-		card.zone.Text = tostring(model:GetAttribute("Zone") or "")
+		-- Zone plus the speed mode: shift-walking is a decision, so show it
+		local speed = tostring(model:GetAttribute("Speed") or "")
+		local zoneText = tostring(model:GetAttribute("Zone") or "")
+		if speed ~= "" then
+			zoneText ..= ("  ·  %s"):format(if speed == "walk" then "walking" else "SPRINTING")
+		end
+		card.zone.Text = zoneText
 		card.kd.Text = ("K %d  D %d  HS %d   ·   %d cr"):format(
 			tonumber(model:GetAttribute("Kills")) or 0,
 			tonumber(model:GetAttribute("Deaths")) or 0,
