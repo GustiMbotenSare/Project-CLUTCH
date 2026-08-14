@@ -1,28 +1,25 @@
 --!strict
--- Greybox v2.4 — still data, still no Studio work.
+-- Greybox v3 — the 5v5 map. Still data, still no Studio work.
 --
--- v2.3 → v2.4 (playtest #8 — the A Short door scrape):
---   * The 6-stud short doors (the site↔short connectors at x ±30) left 0.5
---     studs of margin per side for an AgentRadius-2.5 rig. Paths computed
---     fine, but the humanoid scraped the doorframe until the stuck timer gave
---     up — the repeated BLOCKED lines en route to A Site. Short doors are now
---     10 studs wide (pocket walls shortened to make room). Chokes still choke;
---     they just no longer demand centimeter-perfect threading.
---
--- v2.2 → v2.3 (playtest #7 — spawn rows to opposite corners):
---   * Attackers far east (x 52..68), defenders far west (x -68..-52): ~150
---     studs apart, every spawn-to-spawn sightline crosses a screen wall, and
---     the mid gap remains the intended opening contest.
---
--- v2.1 → v2.2 (playtest #5/#6 — spawn-to-spawn sightline):
---   * SpawnScreenN/S seal the lobby boundary except a 26-wide mid gap
---     (x -13..13); spawn rows moved off the mid axis after the first version
---     left both spawn lines dead centre of that gap.
---
--- v2 → v2.1 (playtest #2 — nothing climbed):
---   * Solid plinths + ~16-degree ramps replaced staircases built under their
---     own platforms; mid ledge aligned to the window crossing; defender
---     half-cover moved off the spawn line; crates out of ramp footprints.
+-- v2.4 → v3 (playtest #10 was clean; time to scale):
+--   * Canvas grows 170×110 → 230×150. Lanes widen 12 → 22, sites grow into
+--     proper pockets, and both lobbies breathe. Ten bots need room to not
+--     body-block each other at chokes (the ElbowB problem).
+--   * REAL COVER, in two flavors, sized against a 5-stud rig:
+--       partial (4.5 tall — shoot over it, head-glitch behind it)
+--       full    (12 tall — breaks line of sight outright)
+--     Every site, both lanes, the shorts and mid get deliberate pieces.
+--   * COVER POINTS: the map now declares where a bot should STAND to use each
+--     piece and which way to FACE. The brain holds these as angles and
+--     jiggle-peeks the partials — peeking and angle holding, as requested.
+--   * DEFENDER BACK ROUTE: sites are open to the Defender Lobby on their
+--     north edge. Defenders finally arrive before attackers (the route audit
+--     has said 4/4 since v2 — real tac shooters are defender-sided on
+--     rotation timing). The shorts are capped so attackers can't free-flank
+--     into the defender lobby in exchange.
+--   * Spawn screens segment: gaps at mid, both lobby mouths, and both lane
+--     mouths — v2's single mid gap silently walled off the lane↔lobby
+--     crossings and bots detoured through mid without knowing why.
 --
 -- Coordinates: y up. Attackers south (+z), defenders north (-z).
 -- Site A west (-x), Site B east (+x). Floor top y = 1.
@@ -47,12 +44,23 @@ export type POI = {
 	pos: Vector3,
 }
 
+-- Where a bot stands to use a piece of cover, which way it watches, and
+-- whether it can shoot over it (partial) or has to peek around (full).
+export type CoverPoint = {
+	name: string,
+	pos: Vector3, -- standing spot, on the PROTECTED side
+	face: Vector3, -- unit-ish direction the angle watches
+	kind: "partial" | "full",
+	zone: string, -- zone key this point belongs to
+}
+
 export type MapSpec = {
 	parts: { PartSpec },
 	attackSpawns: { Vector3 },
 	defenseSpawns: { Vector3 },
 	plantZones: { PlantZone },
 	pois: { POI },
+	coverPoints: { CoverPoint },
 }
 
 local FLOOR = Color3.fromRGB(48, 48, 54)
@@ -62,176 +70,212 @@ local DECK = Color3.fromRGB(90, 90, 100)
 local RAMP = Color3.fromRGB(120, 120, 132)
 local SITE_A = Color3.fromRGB(255, 170, 60) -- orange
 local SITE_B = Color3.fromRGB(60, 200, 200) -- teal
+local COVER_FULL = Color3.fromRGB(70, 78, 92) -- reads as structure
 
 -- Ramp geometry: rise 4 studs over 14 studs of run.
--- atan(4/14) = 15.95deg. Centre y 2.35 aligns the ramp's TOP face with the
--- floor at the low end and the plinth deck at the high end.
 local RAMP_ANGLE = 15.95
 local RAMP_Y = 2.35
 
+local PARTIAL = 4.5 -- chest-high to a 5-stud rig: shoot over, head-glitch behind
+
 local parts: { PartSpec } = {
 	-- Floor
-	{ name = "Floor", pos = Vector3.new(0, 0, 0), size = Vector3.new(170, 2, 110), color = FLOOR },
+	{ name = "Floor", pos = Vector3.new(0, 0, 0), size = Vector3.new(230, 2, 150), color = FLOOR },
 
 	-- Boundary
-	{ name = "WallN", pos = Vector3.new(0, 7, -55), size = Vector3.new(170, 12, 2), color = WALL },
-	{ name = "WallS", pos = Vector3.new(0, 7, 55), size = Vector3.new(170, 12, 2), color = WALL },
-	{ name = "WallW", pos = Vector3.new(-85, 7, 0), size = Vector3.new(2, 12, 110), color = WALL },
-	{ name = "WallE", pos = Vector3.new(85, 7, 0), size = Vector3.new(2, 12, 110), color = WALL },
+	{ name = "WallN", pos = Vector3.new(0, 7, -75), size = Vector3.new(230, 12, 2), color = WALL },
+	{ name = "WallS", pos = Vector3.new(0, 7, 75), size = Vector3.new(230, 12, 2), color = WALL },
+	{ name = "WallW", pos = Vector3.new(-115, 7, 0), size = Vector3.new(2, 12, 150), color = WALL },
+	{ name = "WallE", pos = Vector3.new(115, 7, 0), size = Vector3.new(2, 12, 150), color = WALL },
 
-	-- SPAWN SCREENS. The lobby boundary used to be wide open, so both duelists
-	-- had line of sight from their own spawn line. These walls seal it except
-	-- for a 26-wide gap at mid (x -13..13): mid is now the only place the
-	-- opening can be contested, which is exactly what mid is for.
-	{ name = "SpawnScreenS1", pos = Vector3.new(-49, 7, 20), size = Vector3.new(72, 12, 2), color = WALL },
-	{ name = "SpawnScreenS2", pos = Vector3.new(49, 7, 20), size = Vector3.new(72, 12, 2), color = WALL },
-	{ name = "SpawnScreenN1", pos = Vector3.new(-49, 7, -40), size = Vector3.new(72, 12, 2), color = WALL },
-	{ name = "SpawnScreenN2", pos = Vector3.new(49, 7, -40), size = Vector3.new(72, 12, 2), color = WALL },
+	-- SPAWN SCREEN SOUTH (z=28). Segmented: gaps at the lane mouths
+	-- (x -95..-72, 72..95), the lobby mouths (x -60..-46, 46..60) and mid
+	-- (x -16..16). v2's single-gap screen silently walled the lane crossings.
+	{ name = "ScrS1", pos = Vector3.new(-105, 7, 28), size = Vector3.new(20, 12, 2), color = WALL },
+	{ name = "ScrS2", pos = Vector3.new(-66, 7, 28), size = Vector3.new(12, 12, 2), color = WALL },
+	{ name = "ScrS3", pos = Vector3.new(-31, 7, 28), size = Vector3.new(30, 12, 2), color = WALL },
+	{ name = "ScrS4", pos = Vector3.new(31, 7, 28), size = Vector3.new(30, 12, 2), color = WALL },
+	{ name = "ScrS5", pos = Vector3.new(66, 7, 28), size = Vector3.new(12, 12, 2), color = WALL },
+	{ name = "ScrS6", pos = Vector3.new(105, 7, 28), size = Vector3.new(20, 12, 2), color = WALL },
 
-	-- A / B main lanes (14 wide: one smoke chokes a door, never a whole site)
-	{ name = "LaneWestOuter", pos = Vector3.new(-70, 7, 12), size = Vector3.new(2, 12, 64), color = WALL },
-	{ name = "LaneWestPocket", pos = Vector3.new(-70, 7, -30), size = Vector3.new(2, 12, 20), color = WALL },
-	{ name = "LaneEastOuter", pos = Vector3.new(70, 7, 12), size = Vector3.new(2, 12, 64), color = WALL },
-	{ name = "LaneEastPocket", pos = Vector3.new(70, 7, -30), size = Vector3.new(2, 12, 20), color = WALL },
-	{ name = "LaneAInner", pos = Vector3.new(-56, 7, 17.5), size = Vector3.new(2, 12, 45), color = WALL },
-	{ name = "LaneBInner", pos = Vector3.new(56, 7, 17.5), size = Vector3.new(2, 12, 45), color = WALL },
+	-- SPAWN SCREEN NORTH (z=-45). Only seals Mid Back's north face; the sites
+	-- stay open to the defender lobby (that's the back route).
+	{ name = "ScrN1", pos = Vector3.new(-32, 7, -45), size = Vector3.new(32, 12, 2), color = WALL },
+	{ name = "ScrN2", pos = Vector3.new(32, 7, -45), size = Vector3.new(32, 12, 2), color = WALL },
 
-	-- Elbows: you cannot see a site from the lane entrance
-	{ name = "ElbowWallA", pos = Vector3.new(-63, 7, -20), size = Vector3.new(14, 12, 2), color = WALL },
-	{ name = "ElbowWallB", pos = Vector3.new(63, 7, -20), size = Vector3.new(14, 12, 2), color = WALL },
+	-- A LANE (corridor x -94..-72, 22 wide): outer wall continuous, inner wall
+	-- stops at z=6 so the lane turns east into A Lobby. A full block sits in
+	-- the turn — the elbow info game — and a partial mid-lane.
+	{ name = "LaneWestOuter", pos = Vector3.new(-95, 7, 15.5), size = Vector3.new(2, 12, 83), color = WALL },
+	{ name = "LaneWestPocket", pos = Vector3.new(-95, 7, -38), size = Vector3.new(2, 12, 24), color = WALL },
+	{ name = "LaneAInner", pos = Vector3.new(-72, 7, 31.5), size = Vector3.new(2, 12, 51), color = WALL },
+	{ name = "ALaneFull", pos = Vector3.new(-80, 7, -10), size = Vector3.new(6, 12, 6), color = COVER_FULL },
+	{ name = "ALaneHalf", pos = Vector3.new(-83, 3.25, 20), size = Vector3.new(6, PARTIAL, 3), color = CRATE },
 
-	-- Site pocket north walls
-	{ name = "SiteNorthA", pos = Vector3.new(-50, 7, -40), size = Vector3.new(40, 12, 2), color = WALL },
-	{ name = "SiteNorthB", pos = Vector3.new(50, 7, -40), size = Vector3.new(40, 12, 2), color = WALL },
+	-- B LANE (mirror)
+	{ name = "LaneEastOuter", pos = Vector3.new(95, 7, 15.5), size = Vector3.new(2, 12, 83), color = WALL },
+	{ name = "LaneEastPocket", pos = Vector3.new(95, 7, -38), size = Vector3.new(2, 12, 24), color = WALL },
+	{ name = "LaneBInner", pos = Vector3.new(72, 7, 31.5), size = Vector3.new(2, 12, 51), color = WALL },
+	{ name = "BLaneFull", pos = Vector3.new(80, 7, -10), size = Vector3.new(6, 12, 6), color = COVER_FULL },
+	{ name = "BLaneHalf", pos = Vector3.new(83, 3.25, 20), size = Vector3.new(6, PARTIAL, 3), color = CRATE },
 
-	-- Site pocket south walls, ~11-wide main doors (A: x -55..-44, B: 44..55)
-	{ name = "SiteSouthA1", pos = Vector3.new(-62.5, 7, -16), size = Vector3.new(15, 12, 2), color = WALL },
-	{ name = "SiteSouthA2", pos = Vector3.new(-37, 7, -16), size = Vector3.new(14, 12, 2), color = WALL },
-	{ name = "SiteSouthB1", pos = Vector3.new(62.5, 7, -16), size = Vector3.new(15, 12, 2), color = WALL },
-	{ name = "SiteSouthB2", pos = Vector3.new(37, 7, -16), size = Vector3.new(14, 12, 2), color = WALL },
+	-- A SITE (x -95..-48, z -50..-22). South face has the 12-wide main door
+	-- (x -66..-54). NO north wall — the site opens to the defender lobby.
+	{ name = "SiteSouthA1", pos = Vector3.new(-80.5, 7, -22), size = Vector3.new(29, 12, 2), color = WALL },
+	{ name = "SiteSouthA2", pos = Vector3.new(-51, 7, -22), size = Vector3.new(6, 12, 2), color = WALL },
+	-- Pocket wall (x=-48) with an 8-wide short door (z -44..-36)
+	{ name = "PocketEastA1", pos = Vector3.new(-48, 7, -29), size = Vector3.new(2, 12, 14), color = WALL },
+	{ name = "PocketEastA2", pos = Vector3.new(-48, 7, -47), size = Vector3.new(2, 12, 6), color = WALL },
+	-- Short cap: attackers may not walk A Short straight into the defender lobby
+	{ name = "ShortCapA", pos = Vector3.new(-37, 7, -45), size = Vector3.new(22, 12, 2), color = WALL },
+	-- Site cover: default crate + head-glitch (partial), tower (full)
+	{ name = "ADefaultCrate", pos = Vector3.new(-66, 3.25, -36), size = Vector3.new(6, PARTIAL, 6), color = CRATE },
+	{ name = "AHeadGlitch", pos = Vector3.new(-80, 3.25, -28), size = Vector3.new(5, PARTIAL, 5), color = CRATE },
+	{ name = "ATower", pos = Vector3.new(-54, 7, -41), size = Vector3.new(8, 12, 8), color = COVER_FULL },
+	{ name = "AShortCrate", pos = Vector3.new(-36, 3.25, -40), size = Vector3.new(6, PARTIAL, 4), color = CRATE },
 
-	-- Pocket inner walls, 10-wide short doors (A: x -30, B: x 30).
-	-- Widened from 6 in v2.4: rigs scraped the frame into stuck-loops.
-	{ name = "PocketEastA1", pos = Vector3.new(-30, 7, -19.5), size = Vector3.new(2, 12, 7), color = WALL },
-	{ name = "PocketEastA2", pos = Vector3.new(-30, 7, -36.5), size = Vector3.new(2, 12, 7), color = WALL },
-	{ name = "PocketWestB1", pos = Vector3.new(30, 7, -19.5), size = Vector3.new(2, 12, 7), color = WALL },
-	{ name = "PocketWestB2", pos = Vector3.new(30, 7, -36.5), size = Vector3.new(2, 12, 7), color = WALL },
+	-- B SITE (mirror)
+	{ name = "SiteSouthB1", pos = Vector3.new(80.5, 7, -22), size = Vector3.new(29, 12, 2), color = WALL },
+	{ name = "SiteSouthB2", pos = Vector3.new(51, 7, -22), size = Vector3.new(6, 12, 2), color = WALL },
+	{ name = "PocketWestB1", pos = Vector3.new(48, 7, -29), size = Vector3.new(2, 12, 14), color = WALL },
+	{ name = "PocketWestB2", pos = Vector3.new(48, 7, -47), size = Vector3.new(2, 12, 6), color = WALL },
+	{ name = "ShortCapB", pos = Vector3.new(37, 7, -45), size = Vector3.new(22, 12, 2), color = WALL },
+	{ name = "BDefaultCrate", pos = Vector3.new(66, 3.25, -36), size = Vector3.new(6, PARTIAL, 6), color = CRATE },
+	{ name = "BHeadGlitch", pos = Vector3.new(80, 3.25, -28), size = Vector3.new(5, PARTIAL, 5), color = CRATE },
+	{ name = "BTower", pos = Vector3.new(54, 7, -41), size = Vector3.new(8, 12, 8), color = COVER_FULL },
+	{ name = "BShortCrate", pos = Vector3.new(36, 3.25, -40), size = Vector3.new(6, PARTIAL, 4), color = CRATE },
 
-	-- Mid dividers with 8-wide short-door gaps (z -34..-26)
-	{ name = "DividerW1", pos = Vector3.new(-20, 7, -2.5), size = Vector3.new(2, 12, 35), color = WALL },
-	{ name = "DividerW2", pos = Vector3.new(-20, 7, -23), size = Vector3.new(2, 12, 6), color = WALL },
-	{ name = "DividerW3", pos = Vector3.new(-20, 7, -37), size = Vector3.new(2, 12, 6), color = WALL },
-	{ name = "DividerE1", pos = Vector3.new(20, 7, -2.5), size = Vector3.new(2, 12, 35), color = WALL },
-	{ name = "DividerE2", pos = Vector3.new(20, 7, -23), size = Vector3.new(2, 12, 6), color = WALL },
-	{ name = "DividerE3", pos = Vector3.new(20, 7, -37), size = Vector3.new(2, 12, 6), color = WALL },
-
-	-- Mid window wall (12-wide crossing at x -6..6)
-	{ name = "MidWinL", pos = Vector3.new(-9.5, 7, -20), size = Vector3.new(7, 12, 2), color = WALL },
-	{ name = "MidWinR", pos = Vector3.new(9.5, 7, -20), size = Vector3.new(7, 12, 2), color = WALL },
-
-	-- HEAVEN A: solid plinth (deck y = 5) + ramp up its east face
-	{ name = "HeavenPlinthA", pos = Vector3.new(-62, 3, -34), size = Vector3.new(12, 4, 10), color = DECK },
+	-- HEAVEN A: solid plinth (deck y = 5) + ramp up its east face, rail on the
+	-- site edge (the rail IS the partial cover up there — a head-glitch).
+	{ name = "HeavenPlinthA", pos = Vector3.new(-86, 3, -43), size = Vector3.new(12, 4, 10), color = DECK },
 	{
 		name = "HeavenRampA",
-		pos = Vector3.new(-49, RAMP_Y, -34),
+		pos = Vector3.new(-73, RAMP_Y, -43),
 		size = Vector3.new(14, 1.5, 6),
 		color = RAMP,
 		rot = Vector3.new(0, 0, -RAMP_ANGLE),
 	},
-	{ name = "HeavenRailA", pos = Vector3.new(-62, 6, -38.5), size = Vector3.new(12, 2, 1), color = DECK },
+	{ name = "HeavenRailA", pos = Vector3.new(-86, 6, -37.5), size = Vector3.new(12, 2, 1), color = DECK },
 
 	-- HEAVEN B: mirror
-	{ name = "HeavenPlinthB", pos = Vector3.new(62, 3, -34), size = Vector3.new(12, 4, 10), color = DECK },
+	{ name = "HeavenPlinthB", pos = Vector3.new(86, 3, -43), size = Vector3.new(12, 4, 10), color = DECK },
 	{
 		name = "HeavenRampB",
-		pos = Vector3.new(49, RAMP_Y, -34),
+		pos = Vector3.new(73, RAMP_Y, -43),
 		size = Vector3.new(14, 1.5, 6),
 		color = RAMP,
 		rot = Vector3.new(0, 0, RAMP_ANGLE),
 	},
-	{ name = "HeavenRailB", pos = Vector3.new(62, 6, -38.5), size = Vector3.new(12, 2, 1), color = DECK },
+	{ name = "HeavenRailB", pos = Vector3.new(86, 6, -37.5), size = Vector3.new(12, 2, 1), color = DECK },
 
-	-- MID LEDGE: solid plinth in line with the window crossing + ramp from
-	-- the attacker side. Holding this height controls the mid duel.
-	{ name = "MidLedgePlinth", pos = Vector3.new(0, 3, -12), size = Vector3.new(12, 4, 8), color = DECK },
+	-- MID. Dividers at x ±26 with the short-door gaps (z -34..-26); the window
+	-- wall at z=-32 leaves a 16-wide crossing (x -8..8) watched by the ledge.
+	{ name = "DividerW0", pos = Vector3.new(-26, 7, 20), size = Vector3.new(2, 12, 16), color = WALL },
+	{ name = "DividerW1", pos = Vector3.new(-26, 7, -2.5), size = Vector3.new(2, 12, 35), color = WALL },
+	{ name = "DividerW2", pos = Vector3.new(-26, 7, -23), size = Vector3.new(2, 12, 6), color = WALL },
+	{ name = "DividerW3", pos = Vector3.new(-26, 7, -37), size = Vector3.new(2, 12, 6), color = WALL },
+	{ name = "DividerE0", pos = Vector3.new(26, 7, 20), size = Vector3.new(2, 12, 16), color = WALL },
+	{ name = "DividerE1", pos = Vector3.new(26, 7, -2.5), size = Vector3.new(2, 12, 35), color = WALL },
+	{ name = "DividerE2", pos = Vector3.new(26, 7, -23), size = Vector3.new(2, 12, 6), color = WALL },
+	{ name = "DividerE3", pos = Vector3.new(26, 7, -37), size = Vector3.new(2, 12, 6), color = WALL },
+	{ name = "MidWinL", pos = Vector3.new(-16, 7, -32), size = Vector3.new(16, 12, 2), color = WALL },
+	{ name = "MidWinR", pos = Vector3.new(16, 7, -32), size = Vector3.new(16, 12, 2), color = WALL },
+
+	-- MID LEDGE: plinth + ramp from the attacker side + a rail to head-glitch
+	-- behind while watching the window.
+	{ name = "MidLedgePlinth", pos = Vector3.new(0, 3, -18), size = Vector3.new(12, 4, 8), color = DECK },
 	{
 		name = "MidLedgeRamp",
-		pos = Vector3.new(0, RAMP_Y, -1),
+		pos = Vector3.new(0, RAMP_Y, -7),
 		size = Vector3.new(6, 1.5, 14),
 		color = RAMP,
 		rot = Vector3.new(RAMP_ANGLE, 0, 0),
 	},
+	{ name = "MidLedgeRail", pos = Vector3.new(0, 6, -21), size = Vector3.new(12, 2, 1), color = DECK },
 
-	-- Default-plant cover (on the pads, off the walls, clear of ramps)
-	{ name = "CrateA1", pos = Vector3.new(-46, 3, -27), size = Vector3.new(4, 4, 4), color = CRATE },
-	{ name = "CrateA2", pos = Vector3.new(-62, 3, -24), size = Vector3.new(4, 4, 4), color = CRATE },
-	{ name = "CrateB1", pos = Vector3.new(46, 3, -27), size = Vector3.new(4, 4, 4), color = CRATE },
-	{ name = "CrateB2", pos = Vector3.new(62, 3, -24), size = Vector3.new(4, 4, 4), color = CRATE },
+	-- MID PILLAR (full cover centerpiece — breaks the long sightline) + partials
+	{ name = "MidPillar", pos = Vector3.new(0, 7, 6), size = Vector3.new(6, 12, 6), color = COVER_FULL },
+	{ name = "MidBoxW", pos = Vector3.new(-14, 3.25, 10), size = Vector3.new(6, PARTIAL, 4), color = CRATE },
+	{ name = "MidBoxE", pos = Vector3.new(14, 3.25, 10), size = Vector3.new(6, PARTIAL, 4), color = CRATE },
 
-	-- Mid + lane cover
-	{ name = "MidBox", pos = Vector3.new(0, 3, 14), size = Vector3.new(8, 4, 4), color = CRATE },
-	{ name = "LaneCoverA", pos = Vector3.new(-63, 3, 20), size = Vector3.new(6, 4, 2), color = CRATE },
-	{ name = "LaneCoverB", pos = Vector3.new(63, 3, 20), size = Vector3.new(6, 4, 2), color = CRATE },
-
-	-- 4-tall lineup walls (shoot over, walk around). Kept well clear of spawns.
-	{ name = "HalfCoverDefL", pos = Vector3.new(-10, 3, -44), size = Vector3.new(10, 4, 2), color = CRATE },
-	{ name = "HalfCoverDefR", pos = Vector3.new(10, 3, -44), size = Vector3.new(10, 4, 2), color = CRATE },
-	{ name = "HalfCoverAtkL", pos = Vector3.new(-30, 3, 25), size = Vector3.new(10, 4, 2), color = CRATE },
-	{ name = "HalfCoverAtkR", pos = Vector3.new(30, 3, 25), size = Vector3.new(10, 4, 2), color = CRATE },
+	-- Lobby lineup walls (partial; shoot over, walk around)
+	{ name = "HalfCoverDefL", pos = Vector3.new(-12, 3.25, -50), size = Vector3.new(10, PARTIAL, 2), color = CRATE },
+	{ name = "HalfCoverDefR", pos = Vector3.new(12, 3.25, -50), size = Vector3.new(10, PARTIAL, 2), color = CRATE },
+	{ name = "HalfCoverAtkL", pos = Vector3.new(-34, 3.25, 34), size = Vector3.new(10, PARTIAL, 2), color = CRATE },
+	{ name = "HalfCoverAtkR", pos = Vector3.new(34, 3.25, 34), size = Vector3.new(10, PARTIAL, 2), color = CRATE },
 }
 
 local Greybox: MapSpec = {
 	parts = parts,
 
-	-- FAR EAST row (x 52..68). ~150 studs from the defender row; every
-	-- spawn-to-spawn sightline crosses a screen wall. Stays west of x 70:
-	-- east of the lane wall is sealed dead space (VOID).
+	-- 5v5 rows: attackers east, defenders west, spread across the big lobbies.
 	attackSpawns = {
-		Vector3.new(52, 3, 44),
-		Vector3.new(56, 3, 44),
-		Vector3.new(60, 3, 44),
-		Vector3.new(64, 3, 44),
-		Vector3.new(68, 3, 44),
+		Vector3.new(24, 3, 62),
+		Vector3.new(28, 3, 62),
+		Vector3.new(32, 3, 62),
+		Vector3.new(36, 3, 62),
+		Vector3.new(40, 3, 62),
 	},
-
-	-- FAR WEST row (x -68..-52), opposite corner from the attackers.
-	-- (Pulled back to z -49 in v2.1: v2 spawns sat inside the defender
-	-- half-cover.)
 	defenseSpawns = {
-		Vector3.new(-68, 3, -49),
-		Vector3.new(-64, 3, -49),
-		Vector3.new(-60, 3, -49),
-		Vector3.new(-56, 3, -49),
-		Vector3.new(-52, 3, -49),
+		Vector3.new(-40, 3, -62),
+		Vector3.new(-36, 3, -62),
+		Vector3.new(-32, 3, -62),
+		Vector3.new(-28, 3, -62),
+		Vector3.new(-24, 3, -62),
 	},
 
 	plantZones = {
-		{ name = "SiteA", pos = Vector3.new(-50, 1.15, -30), size = Vector3.new(16, 0.3, 16), color = SITE_A },
-		{ name = "SiteB", pos = Vector3.new(50, 1.15, -30), size = Vector3.new(16, 0.3, 16), color = SITE_B },
+		{ name = "SiteA", pos = Vector3.new(-68, 1.15, -36), size = Vector3.new(18, 0.3, 18), color = SITE_A },
+		{ name = "SiteB", pos = Vector3.new(68, 1.15, -36), size = Vector3.new(18, 0.3, 18), color = SITE_B },
 	},
 
-	-- Named positions the patrol + future intent AI navigate between.
-	-- Plinth POIs sit on the deck surface (y 5.5) so paths resolve on top.
 	pois = {
-		{ name = "SiteA", pos = Vector3.new(-50, 1, -30) },
-		{ name = "HeavenA", pos = Vector3.new(-62, 5.5, -34) },
-		{ name = "RampA", pos = Vector3.new(-44, 1, -34) },
-		{ name = "DoorA", pos = Vector3.new(-49.5, 1, -13) },
-		{ name = "ShortA", pos = Vector3.new(-25, 1, -30) },
-		{ name = "ElbowA", pos = Vector3.new(-63, 1, -8) },
-		{ name = "LobbyA", pos = Vector3.new(-45, 1, -8) },
-		{ name = "SiteB", pos = Vector3.new(50, 1, -30) },
-		{ name = "HeavenB", pos = Vector3.new(62, 5.5, -34) },
-		{ name = "RampB", pos = Vector3.new(44, 1, -34) },
-		{ name = "DoorB", pos = Vector3.new(49.5, 1, -13) },
-		{ name = "ShortB", pos = Vector3.new(25, 1, -30) },
-		{ name = "ElbowB", pos = Vector3.new(63, 1, -8) },
-		{ name = "LobbyB", pos = Vector3.new(45, 1, -8) },
-		{ name = "MidLedge", pos = Vector3.new(0, 5.5, -12) },
-		{ name = "MidWindow", pos = Vector3.new(0, 1, -25) },
-		{ name = "MidBox", pos = Vector3.new(0, 1, 18) },
-		{ name = "AtkLobby", pos = Vector3.new(0, 1, 32) },
-		{ name = "DefLobby", pos = Vector3.new(0, 1, -46) },
+		{ name = "SiteA", pos = Vector3.new(-68, 1, -36) },
+		{ name = "HeavenA", pos = Vector3.new(-86, 5.5, -43) },
+		{ name = "RampA", pos = Vector3.new(-73, 1, -43) },
+		{ name = "DoorA", pos = Vector3.new(-60, 1, -18) },
+		{ name = "ShortA", pos = Vector3.new(-37, 1, -38) },
+		{ name = "ElbowA", pos = Vector3.new(-83, 1, -12) },
+		{ name = "LobbyA", pos = Vector3.new(-50, 1, 0) },
+		{ name = "SiteB", pos = Vector3.new(68, 1, -36) },
+		{ name = "HeavenB", pos = Vector3.new(86, 5.5, -43) },
+		{ name = "RampB", pos = Vector3.new(73, 1, -43) },
+		{ name = "DoorB", pos = Vector3.new(60, 1, -18) },
+		{ name = "ShortB", pos = Vector3.new(37, 1, -38) },
+		{ name = "ElbowB", pos = Vector3.new(83, 1, -12) },
+		{ name = "LobbyB", pos = Vector3.new(50, 1, 0) },
+		{ name = "MidLedge", pos = Vector3.new(0, 5.5, -18) },
+		{ name = "MidWindow", pos = Vector3.new(0, 1, -32) },
+		{ name = "MidPillar", pos = Vector3.new(0, 1, 6) },
+		{ name = "AtkLobby", pos = Vector3.new(0, 1, 42) },
+		{ name = "DefLobby", pos = Vector3.new(0, 1, -50) },
+	},
+
+	-- Where bots stand to HOLD ANGLES. pos = protected side; face = watch
+	-- direction (attackers post-plant flip it). partial = shoot over / jiggle
+	-- peek; full = break LOS, peek around the edge.
+	coverPoints = {
+		-- A Site
+		{ name = "A_Default", pos = Vector3.new(-66, 1, -41), face = Vector3.new(0.3, 0, 0.95), kind = "partial", zone = "A_SITE" },
+		{ name = "A_HeadGlitch", pos = Vector3.new(-80, 1, -32), face = Vector3.new(0.9, 0, 0.45), kind = "partial", zone = "A_SITE" },
+		{ name = "A_TowerCubby", pos = Vector3.new(-54, 1, -48), face = Vector3.new(0.66, 0, 0.75), kind = "full", zone = "A_SITE" },
+		{ name = "A_HeavenRail", pos = Vector3.new(-86, 5.5, -39.5), face = Vector3.new(0.83, 0, 0.56), kind = "partial", zone = "A_HEAVEN" },
+		{ name = "A_ShortWatch", pos = Vector3.new(-38, 1, -43), face = Vector3.new(1, 0, 0.3), kind = "partial", zone = "A_SHORT" },
+		-- B Site (mirror)
+		{ name = "B_Default", pos = Vector3.new(66, 1, -41), face = Vector3.new(-0.3, 0, 0.95), kind = "partial", zone = "B_SITE" },
+		{ name = "B_HeadGlitch", pos = Vector3.new(80, 1, -32), face = Vector3.new(-0.9, 0, 0.45), kind = "partial", zone = "B_SITE" },
+		{ name = "B_TowerCubby", pos = Vector3.new(54, 1, -48), face = Vector3.new(-0.66, 0, 0.75), kind = "full", zone = "B_SITE" },
+		{ name = "B_HeavenRail", pos = Vector3.new(86, 5.5, -39.5), face = Vector3.new(-0.83, 0, 0.56), kind = "partial", zone = "B_HEAVEN" },
+		{ name = "B_ShortWatch", pos = Vector3.new(38, 1, -43), face = Vector3.new(-1, 0, 0.3), kind = "partial", zone = "B_SHORT" },
+		-- Mid
+		{ name = "Mid_PillarAtk", pos = Vector3.new(0, 1, 10), face = Vector3.new(0, 0, -1), kind = "full", zone = "MID" },
+		{ name = "Mid_PillarDef", pos = Vector3.new(0, 1, 2), face = Vector3.new(0, 0, 1), kind = "full", zone = "MID" },
+		{ name = "MidLedgeRail", pos = Vector3.new(0, 5.5, -19), face = Vector3.new(0, 0, -1), kind = "partial", zone = "MID_LEDGE" },
+		-- Lane holds (defenders watch the lane mouths, south)
+		{ name = "A_LaneFull", pos = Vector3.new(-80, 1, -16), face = Vector3.new(0, 0, 1), kind = "full", zone = "A_ELBOW" },
+		{ name = "A_LaneHalf", pos = Vector3.new(-83, 1, 24), face = Vector3.new(0, 0, 1), kind = "partial", zone = "A_MAIN" },
+		{ name = "B_LaneFull", pos = Vector3.new(80, 1, -16), face = Vector3.new(0, 0, 1), kind = "full", zone = "B_ELBOW" },
+		{ name = "B_LaneHalf", pos = Vector3.new(83, 1, 24), face = Vector3.new(0, 0, 1), kind = "partial", zone = "B_MAIN" },
 	},
 }
 
