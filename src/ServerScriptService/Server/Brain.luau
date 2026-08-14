@@ -30,6 +30,16 @@
 --   * The stall ramp reset on every hop, so it behaved as a 25-second
 --     metronome: Onyx stepped to Mid Window, reset, stepped back, reset. It now
 --     resets only on reaching a FINAL target, or on contact.
+--
+-- Fixed after the second transcript:
+--
+--   * ROUTE COMMITMENT. The pathing arrive radius (4.5 studs) lets a bot stop
+--     just short of the sampled point, often still inside the zone it was
+--     leaving. Re-deciding from scratch every tick then sampled a DIFFERENT
+--     neighbour, which produced boundary churn: A Site -> A Ramp -> A Site ->
+--     A Short -> A Site. The brain now commits to ONE intermediate zone and
+--     keeps walking it until the zone actually changes, the path fails, or
+--     combat interrupts.
 -- ---------------------------------------------------------------------------
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -288,19 +298,21 @@ local function describeContact(contact: any, now: number): string
 	)
 end
 
-function Brain.start(bot: any, side: string, enemies: { any }, allies: { any }, rng: Random, clock: () -> number, weapon: any)
+function Brain.start(bot: any, side: string, enemies: { any }, allies: { any }, rng: Random, clock: () -> number, weapon: any, onStop: (() -> ())?)
 	local model = bot.model :: Model
 	local perception = Perception.new()
 	Perception.startLoop(perception, bot, enemies, clock)
 
 	local humanoid = model:FindFirstChildOfClass("Humanoid")
 	local combatState = Combat.newState(if humanoid then humanoid.Health else 100)
+	bot.combatState = combatState -- exposed so the respawn watcher can release the corpse
 
 	task.spawn(function()
 		local intent = if side == "Attack" then "Push" else "Hold"
 		local lastProgressAt = clock()
 		local committedAt = clock()
 		local lastThinkLogAt = -math.huge
+		local routeKey: string? = nil -- committed intermediate zone; see header
 
 		-- Cached interrupt predicate. Polled every pathing tick, so it must be
 		-- cheap; hasEyesOn casts rays, hence the recheck window.
@@ -417,6 +429,7 @@ function Brain.start(bot: any, side: string, enemies: { any }, allies: { any }, 
 			local switched = winner ~= intent
 			if switched then
 				committedAt = now
+				routeKey = nil -- a new intent re-plans its route from scratch
 			end
 			local previous = intent
 			intent = winner
@@ -487,26 +500,43 @@ function Brain.start(bot: any, side: string, enemies: { any }, allies: { any }, 
 				if targetKey == nil or targetKey == currentKey then
 					-- Settle into the zone we already want to be in. Short dwell: the
 					-- old 1.5-3.5s wait read as aimless shuffling.
+					routeKey = nil
 					local spot = standablePointIn(currentKey, rng, model)
 					if spot then
 						Pathing.walkToWithResult(model, spot, shouldInterrupt)
 					end
 					task.wait(rng:NextNumber(0.6, 1.4))
 				else
-					local hops = Zones.hops(currentKey, targetKey)
-					-- Short trips go straight there; long ones re-decide each hop
-					local walkKey = targetKey
-					if hops > DIRECT_WALK_MAX_HOPS then
-						walkKey = Zones.nextHop(currentKey, targetKey) or targetKey
+					-- ROUTE COMMITMENT. The arrive radius lets a walk end just inside
+					-- the OLD zone; re-deciding from scratch then picked a different
+					-- neighbour and produced the A Site -> A Ramp -> A Site churn.
+					-- Commit to ONE intermediate zone until the zone actually changes.
+					if routeKey == nil then
+						local hops = Zones.hops(currentKey, targetKey)
+						routeKey = if hops > DIRECT_WALK_MAX_HOPS
+							then (Zones.nextHop(currentKey, targetKey) or targetKey)
+							else targetKey
 					end
 
-					local spot = standablePointIn(walkKey, rng, model)
-					if spot then
-						local result = Pathing.walkToWithResult(model, spot, shouldInterrupt)
-						if result == "arrived" and walkKey == targetKey then
+					if currentKey == routeKey then
+						-- Crossed into the committed zone: leg complete.
+						if routeKey == targetKey then
 							lastProgressAt = clock() -- only a FINISHED goal resets the ramp
-						elseif result == "failed" then
-							task.wait(SimConfig.DecisionTickSeconds * 2)
+						end
+						routeKey = nil
+					else
+						local spot = standablePointIn(routeKey, rng, model)
+						if spot then
+							local result = Pathing.walkToWithResult(model, spot, shouldInterrupt)
+							if result == "failed" then
+								routeKey = nil -- try a fresh route next tick
+								task.wait(SimConfig.DecisionTickSeconds * 2)
+							end
+							-- "arrived" but still outside routeKey means the walk stopped
+							-- at the boundary: keep routeKey and sample a deeper point.
+							-- "aborted" keeps routeKey too; Engage owns what happens next.
+						else
+							routeKey = nil
 						end
 					end
 				end
@@ -516,6 +546,9 @@ function Brain.start(bot: any, side: string, enemies: { any }, allies: { any }, 
 		end
 
 		perception.running = false
+		if onStop then
+			task.defer(onStop)
+		end
 	end)
 end
 
