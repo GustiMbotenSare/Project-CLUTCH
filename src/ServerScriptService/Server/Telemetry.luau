@@ -9,6 +9,15 @@
 --     compute dwell times, coverage, and eventually compare region occupancy
 --     against real esports data.
 --
+-- A third consumer arrived with the spectator dashboard: the CLIENT. Every
+-- sample also stamps the bot's model with replicated attributes (zone callout,
+-- live intent, alive flag, K/D/HS), so the HUD can poll plain attributes and
+-- never needs its own remote traffic.
+--
+-- RESPAWN-SAFE: the sample loop re-reads bot.model every tick. The respawn
+-- watcher replaces a dead model wholesale (a dead humanoid cannot be revived),
+-- and a loop that captured the old model would go blind at the first death.
+--
 -- Dwell time is the first honest diagnostic for "are these bots using the map,
 -- or pacing one corner".
 
@@ -74,9 +83,6 @@ function Telemetry.note(botName: string, message: string)
 end
 
 function Telemetry.attach(bot: any, side: string)
-	local model = bot.model :: Model
-	local humanoid = model:FindFirstChildOfClass("Humanoid")
-
 	local track: Track = {
 		name = bot.name,
 		side = side,
@@ -89,10 +95,23 @@ function Telemetry.attach(bot: any, side: string)
 		dropped = 0,
 	}
 	tracks[bot.name] = track
-	table.insert(order, bot.name)
+	if not table.find(order, bot.name) then
+		table.insert(order, bot.name)
+	end
 
 	task.spawn(function()
-		while model.Parent and (not humanoid or humanoid.Health > 0) do
+		-- bot.model is re-read EVERY TICK: the respawn watcher swaps in a fresh
+		-- rig, and capturing the old one would blind the track at first death.
+		while true do
+			local model = bot.model :: Model?
+			if not model or not model.Parent then
+				task.wait(0.5) -- between bodies during a respawn swap
+				continue
+			end
+
+			local humanoid = model:FindFirstChildOfClass("Humanoid")
+			local alive = humanoid ~= nil and humanoid.Health > 0
+
 			local ground = Zones.groundOf(model)
 			local zone = Zones.at(ground)
 			local key = if zone then zone.key else Zones.VOID
@@ -134,6 +153,16 @@ function Telemetry.attach(bot: any, side: string)
 					))
 				end
 			end
+
+			-- Replicated state for the spectator dashboard. Attributes ride the
+			-- model, so a fresh respawn body starts blank until the next sample —
+			-- at 4Hz that gap is invisible.
+			model:SetAttribute("Zone", if zone then zone.callout else "Off-map")
+			model:SetAttribute("Intent", track.intent)
+			model:SetAttribute("Alive", alive)
+			model:SetAttribute("Kills", bot.kills or 0)
+			model:SetAttribute("Deaths", bot.deaths or 0)
+			model:SetAttribute("Headshots", bot.headshots or 0)
 
 			task.wait(Scenario.TelemetrySampleSeconds)
 		end
