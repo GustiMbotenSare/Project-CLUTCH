@@ -1,22 +1,24 @@
--- Project CLUTCH — spectator dashboard v0
+-- Project CLUTCH — spectator dashboard v0.5
 --
 -- The first piece of the M1 broadcast package: what a real esports observer
 -- sees, reduced to what the sim can honestly report right now.
 --
---   * Top bar     — team names with alive counts.
+--   * Top bar     — team names with alive counts, ROUND number, phase and
+--                   clock, the score, and a SPIKE DOWN callout when planted.
 --   * Player cards — name, role, weapon, live HP bar, current zone callout,
 --                    the bot's CURRENT INTENT (the thing no real broadcast
---                    can show), and K / D / HS. Attackers left, defenders
---                    right. Click a card to put the camera on that bot.
+--                    can show), K / D / HS and credits. Attackers left,
+--                    defenders right. Click a card to put the camera on it.
 --   * Kill feed   — killer, victim, headshot flag, distance, weapon.
 --
 -- Controls: click a card to spectate it · C releases the camera ·
 -- Tab or the CLUTCH button toggles the overlay.
 --
 -- Data path: Telemetry stamps every bot model with replicated attributes at
--- 4Hz (Zone, Intent, Alive, Kills, Deaths, Headshots) and the server fires
--- CLUTCH.KillFeed per death. The client polls plain attributes — no per-frame
--- remote traffic, no state to desync. Humanoid health reads off the model.
+-- 4Hz (Zone, Intent, Alive, Kills, Deaths, Headshots, Credits), RoundMachine
+-- mirrors match state as attributes on the CLUTCH folder (Phase, TimeLeft,
+-- Round, AtkScore, DefScore, Planted), and KillFeed fires per death. The
+-- client polls plain attributes — no per-frame remote traffic, no desync.
 
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -29,7 +31,7 @@ local camera = workspace.CurrentCamera
 local remotes = ReplicatedStorage:WaitForChild("CLUTCH")
 local killFeed = remotes:WaitForChild("KillFeed")
 
-print("[CLUTCH] client online — spectator dashboard v0")
+print("[CLUTCH] client online — spectator dashboard v0.5")
 
 local ATK_COLOR = Color3.fromRGB(255, 150, 60)
 local DEF_COLOR = Color3.fromRGB(80, 200, 255)
@@ -39,6 +41,7 @@ local TEXT = Color3.fromRGB(232, 232, 238)
 local SUBTEXT = Color3.fromRGB(150, 152, 162)
 local HP_GREEN = Color3.fromRGB(90, 210, 110)
 local HP_RED = Color3.fromRGB(235, 70, 70)
+local SPIKE_COLOR = Color3.fromRGB(255, 85, 85)
 
 local INTENT_COLORS = {
 	Hold = Color3.fromRGB(120, 130, 150),
@@ -46,6 +49,8 @@ local INTENT_COLORS = {
 	Rotate = Color3.fromRGB(180, 130, 255),
 	Lurk = Color3.fromRGB(90, 200, 200),
 	Engage = Color3.fromRGB(255, 85, 85),
+	Plant = Color3.fromRGB(255, 210, 90),
+	Defuse = Color3.fromRGB(120, 180, 255),
 }
 
 local gui = Instance.new("ScreenGui")
@@ -92,12 +97,12 @@ atkAlive.Size = UDim2.fromOffset(120, 16)
 atkAlive.Position = UDim2.fromOffset(16, 24)
 
 local title = makeText(topBar, "Title", "PROJECT CLUTCH", 14, true, TEXT)
-title.Size = UDim2.fromOffset(200, 20)
-title.Position = UDim2.new(0.5, -100, 0, 5)
+title.Size = UDim2.fromOffset(240, 20)
+title.Position = UDim2.new(0.5, -120, 0, 5)
 title.TextXAlignment = Enum.TextXAlignment.Center
-local subtitle = makeText(topBar, "Subtitle", "LIVE", 11, false, SUBTEXT)
-subtitle.Size = UDim2.fromOffset(200, 16)
-subtitle.Position = UDim2.new(0.5, -100, 0, 24)
+local subtitle = makeText(topBar, "Subtitle", "", 11, false, SUBTEXT)
+subtitle.Size = UDim2.fromOffset(240, 16)
+subtitle.Position = UDim2.new(0.5, -120, 0, 24)
 subtitle.TextXAlignment = Enum.TextXAlignment.Center
 
 local defTitle = makeText(topBar, "DefTitle", "DEFENSE", 16, true, DEF_COLOR)
@@ -305,6 +310,11 @@ local function ensureCard(name: string, side: string)
 end
 
 -- -------------------------------------------------------------- MAIN LOOP
+local function formatClock(seconds: number): string
+	local s = math.max(0, math.floor(seconds + 0.5))
+	return ("%d:%02d"):format(s // 60, s % 60)
+end
+
 local function refresh()
 	local bots: { [string]: Model } = {}
 	for _, inst in workspace:GetDescendants() do
@@ -334,10 +344,11 @@ local function refresh()
 		card.hpText.Text = tostring(math.floor(hp + 0.5))
 		card.sub.Text = ("%s · %s"):format(tostring(model:GetAttribute("Role") or "?"), tostring(model:GetAttribute("Weapon") or "?"))
 		card.zone.Text = tostring(model:GetAttribute("Zone") or "")
-		card.kd.Text = ("K %d   D %d   HS %d"):format(
+		card.kd.Text = ("K %d  D %d  HS %d   ·   %d cr"):format(
 			tonumber(model:GetAttribute("Kills")) or 0,
 			tonumber(model:GetAttribute("Deaths")) or 0,
-			tonumber(model:GetAttribute("Headshots")) or 0
+			tonumber(model:GetAttribute("Headshots")) or 0,
+			tonumber(model:GetAttribute("Credits")) or 0
 		)
 
 		local intent = tostring(model:GetAttribute("Intent") or "-")
@@ -359,6 +370,22 @@ local function refresh()
 
 	atkAlive.Text = ("alive %d/%d"):format(atkAliveCount, atkTotal)
 	defAlive.Text = ("alive %d/%d"):format(defAliveCount, defTotal)
+
+	-- Match state from the round machine
+	local phase = tostring(remotes:GetAttribute("Phase") or "")
+	local timeLeft = tonumber(remotes:GetAttribute("TimeLeft")) or 0
+	local roundNumber = tonumber(remotes:GetAttribute("Round")) or 0
+	local atkScore = tonumber(remotes:GetAttribute("AtkScore")) or 0
+	local defScore = tonumber(remotes:GetAttribute("DefScore")) or 0
+	local planted = remotes:GetAttribute("Planted") == true
+
+	if phase ~= "" then
+		title.Text = ("ROUND %d · %s %s"):format(roundNumber, string.upper(phase), formatClock(timeLeft))
+	else
+		title.Text = "PROJECT CLUTCH"
+	end
+	subtitle.Text = ("ATK %d — %d DEF%s"):format(atkScore, defScore, if planted then "   ·   SPIKE DOWN" else "")
+	subtitle.TextColor3 = if planted then SPIKE_COLOR else SUBTEXT
 
 	-- Spectate cam: follow the chosen bot; release if it is gone or dead
 	if spectating then
