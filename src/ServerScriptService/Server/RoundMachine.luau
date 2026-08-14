@@ -8,9 +8,10 @@
 -- win condition; defenders win by defusing, by wiping the attack before the
 -- plant, or by the clock.
 --
--- Also owns the economy (win/loss ladders, kill rewards, plant bonus) and the
--- body swapper: every round starts with pristine rigs at spawn, which retires
--- the old revive-a-corpse stopgap for good.
+-- Also owns the economy (win/loss ladders, kill rewards, plant bonus), the
+-- body swapper (every round starts with pristine rigs at spawn), per-round
+-- brain picks (site/anchor choices are cleared here so routes vary round to
+-- round), and each bot's INVENTORY string for the dashboard.
 --
 -- Deliberately NOT here: halftime side swaps (needs team identity), overtime,
 -- armor/shields, weapon drops on death. All tracked in the build doc.
@@ -93,6 +94,7 @@ local function autoBuy(bot: any)
 	if bot.credits >= desired.Price then
 		bot.credits -= desired.Price
 		bot.weapon = desired
+		bot.inventory = (bot.inventory or bot.weapon.DisplayName) .. " + " .. desired.DisplayName
 		print(("[CLUTCH] BUY %s buys %s (-%d, %d cr left)"):format(
 			bot.name,
 			desired.DisplayName,
@@ -110,9 +112,12 @@ end
 
 -- Every round starts with pristine rigs at spawn. Old bodies (and the brains,
 -- perception loops and death watchers riding them) are destroyed; Telemetry
--- tracks survive because they re-read bot.model every tick.
+-- tracks survive because they re-read bot.model every tick. Per-round brain
+-- picks (siteChoice/holdChoice) are cleared so routes vary round to round.
 local function resetBodies(ctx: Ctx)
 	for _, bot in ctx.roster do
+		bot.siteChoice = nil
+		bot.holdChoice = nil
 		local old = bot.model :: Model?
 		local fresh = (bot.template :: Model):Clone()
 		if old then
@@ -181,6 +186,7 @@ function RoundMachine.start(ctx: Ctx)
 	for _, bot in ctx.roster do
 		bot.credits = RoundConfig.StartCredits
 		bot.weapon = Weapons[Scenario.DuelWeapon] or Weapons.Sidearm
+		bot.inventory = bot.weapon.DisplayName
 	end
 
 	local atkLossStreak = 0
