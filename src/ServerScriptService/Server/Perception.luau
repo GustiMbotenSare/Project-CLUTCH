@@ -8,7 +8,12 @@
 --
 -- Three senses, ranked by reliability:
 --   * SIGHT   — inside the vision cone, within range, clear raycast. Exact.
---   * SOUND   — footsteps inside a short radius. Position known, no LOS needed.
+--   * SOUND   — footsteps and gunfire. Footsteps only exist if the target is
+--               MOVING, and their radius follows the target's own speed:
+--               sprinting is loud (40 studs), shift-walking is nearly silent
+--               (12). Gunfire is global (GunshotSoundGlobal): Combat stamps
+--               MatchState.lastShot per burst and this module turns it into a
+--               sound contact. Sound gives position, never LOS.
 --   * MEMORY  — a stale contact, decaying over MemoryDecaySeconds. This is what
 --              makes a bot re-check a last-known position instead of tracking
 --              an enemy perfectly through walls.
@@ -26,6 +31,8 @@ local Shared = ReplicatedStorage:WaitForChild("Shared")
 local SimConfig = require(Shared.Constants.SimConfig)
 local Scenario = require(Shared.Constants.Scenario)
 local Zones = require(Shared.MapData.Zones)
+
+local MatchState = require(script.Parent.MatchState)
 
 local LOS_MISS_TOLERANCE = 4 -- failed sweeps before a sighting counts as lost
 local AIM_PARTS = { "Head", "HumanoidRootPart", "UpperTorso", "Torso" }
@@ -152,8 +159,15 @@ function Perception.sweep(state: State, bot: any, enemies: { any }, now: number)
 			end
 		end
 
-		-- Footsteps leak position regardless of where you are looking
-		local heard = not sighted and distance <= SimConfig.FootstepSoundRadiusStuds
+		-- Footsteps: only a MOVING enemy makes them, and the radius follows
+		-- THEIR speed — sprinting carries 40 studs, shift-walking barely 12.
+		local enemyHumanoid = enemyModel:FindFirstChildOfClass("Humanoid")
+		local enemySpeed = if enemyHumanoid then enemyHumanoid.WalkSpeed else 16
+		local moving = enemyRoot.AssemblyLinearVelocity.Magnitude > 2
+		local stepRadius = if enemySpeed > 10
+			then SimConfig.FootstepSoundRadiusStuds
+			else SimConfig.WalkFootstepRadiusStuds
+		local heard = not sighted and moving and distance <= stepRadius
 
 		if sighted or heard then
 			local ground = Zones.groundOf(enemyModel)
@@ -203,6 +217,34 @@ function Perception.sweep(state: State, bot: any, enemies: { any }, now: number)
 						if remembered then remembered.zoneCallout else "nowhere"
 					))
 				end
+			end
+		end
+	end
+
+	-- GUNFIRE. Combat stamps MatchState.lastShot every burst; any enemy shooter
+	-- becomes a fresh SOUND contact. Never overrides fresher eyes.
+	local lastShot = MatchState.lastShot
+	if SimConfig.GunshotSoundGlobal and lastShot and now - lastShot.at <= 1.0 then
+		for _, enemy in enemies do
+			if enemy.name == lastShot.by then
+				local existing = state.memory[enemy.name]
+				local sightFresher = existing ~= nil
+					and existing.source == "sight"
+					and existing.seenAt >= lastShot.at
+				if not sightFresher then
+					local zone = Zones.at(lastShot.pos)
+					state.memory[enemy.name] = {
+						name = enemy.name,
+						pos = lastShot.pos,
+						zoneKey = if zone then zone.key else Zones.VOID,
+						zoneCallout = if zone then zone.callout else "Off-map",
+						seenAt = now,
+						source = "sound",
+						distance = (lastShot.pos - eyePos).Magnitude,
+					}
+					state.lastContactAt = now
+				end
+				break
 			end
 		end
 	end
