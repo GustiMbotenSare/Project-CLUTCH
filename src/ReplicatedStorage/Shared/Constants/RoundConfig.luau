@@ -7,10 +7,10 @@ return {
 	TeamSize = 5,
 	WinsNeeded = 13, -- TBD: 13 = full length, 7 = snappy league nights
 	MaxRoundsRegulation = 24,
-	HalftimeAfterRound = 12, -- sides swap
+	HalftimeAfterRound = 12, -- sides swap (v1: credits reset only — see tracker)
 
 	-- Timers (seconds)
-	BuyPhaseSeconds = 30,
+	BuyPhaseSeconds = 8, -- esports standard is 30; shortened while the testbed is the audience
 	RoundSeconds = 100,
 	SpikeFuseSeconds = 45,
 	PlantSeconds = 4,
