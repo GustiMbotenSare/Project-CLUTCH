@@ -7,9 +7,13 @@
 -- stood. Bots reason about its position through zones; spectators see an
 -- actual object. No hidden state pretending to be a bomb.
 --
--- Channels (plant 4s, defuse 7s) cancel on death, on moving off the spot, or
--- on taking damage — the three honest interruptions. The fuse is real: once
--- planted, somebody defuses or the site explodes.
+-- Channels (plant 4s, defuse 7s) cancel on death, on moving off the spot, on
+-- taking damage, and — since playtest #8 — on SPOTTING AN ENEMY. Planting
+-- while someone is visibly swinging you is how bots die doing nothing; the
+-- channel now takes an abort callback from the brain, and the brain passes
+-- "an enemy is visible". The planter also FACES the last known threat before
+-- crouching: planting with your back to the angle you were just contacted
+-- from read as dumb, because it was.
 
 local Debris = game:GetService("Debris")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -57,6 +61,7 @@ function Objective.reset()
 	MatchState.spikeCarrier = nil
 	MatchState.planted = false
 	MatchState.plantedZoneKey = nil
+	MatchState.plantedAt = 0
 	MatchState.defused = false
 	MatchState.exploded = false
 end
@@ -132,8 +137,10 @@ function Objective.tryPickup(bot: any): boolean
 	return true
 end
 
--- The honest channel: standing still, alive, unhurt. Anything else cancels.
-local function channel(bot: any, seconds: number, label: string, clock: () -> number): boolean
+-- The honest channel: standing still, alive, unhurt, and — when the caller
+-- passes shouldAbort — not currently looking at an enemy. Anything else
+-- cancels.
+local function channel(bot: any, seconds: number, label: string, clock: () -> number, shouldAbort: (() -> boolean)?): boolean
 	local humanoid = bot.model:FindFirstChildOfClass("Humanoid")
 	local root = rootOf(bot.model)
 	if not humanoid or not root then
@@ -152,6 +159,10 @@ local function channel(bot: any, seconds: number, label: string, clock: () -> nu
 		end
 		if (root.Position - startPos).Magnitude > CHANNEL_MOVE_TOLERANCE then
 			print(("[CLUTCH] %s %s cancelled — moved off the spot"):format(bot.name, label))
+			return false
+		end
+		if shouldAbort and shouldAbort() then
+			print(("[CLUTCH] %s %s cancelled — enemy in sight, fight first"):format(bot.name, label))
 			return false
 		end
 		task.wait(0.1)
@@ -196,8 +207,25 @@ local function explode(clock: () -> number)
 	print(("[CLUTCH] %6.1fs  EXPLODED — the spike takes the site"):format(clock()))
 end
 
--- Carrier standing on a plant zone commits to the full 4 seconds.
-function Objective.tryStartPlant(bot: any, clock: () -> number): boolean
+-- Face the last known threat before crouching. Planting with your back to the
+-- angle you were contacted from is how you die doing nothing.
+local function faceThreat(bot: any, threatPos: Vector3?)
+	if not threatPos then
+		return
+	end
+	local root = rootOf(bot.model)
+	if not root then
+		return
+	end
+	local flat = Vector3.new(threatPos.X, root.Position.Y, threatPos.Z)
+	if (flat - root.Position).Magnitude > 0.1 then
+		root.CFrame = CFrame.lookAt(root.Position, flat)
+	end
+end
+
+-- Carrier standing on a plant zone commits to the full 4 seconds — unless an
+-- enemy becomes visible, it takes damage, or it moves.
+function Objective.tryStartPlant(bot: any, clock: () -> number, shouldAbort: (() -> boolean)?, threatPos: Vector3?): boolean
 	if MatchState.phase ~= "Live" or MatchState.planted then
 		return false
 	end
@@ -210,6 +238,8 @@ function Objective.tryStartPlant(bot: any, clock: () -> number): boolean
 		return false
 	end
 
+	faceThreat(bot, threatPos)
+
 	local zone = Zones.byKey[zoneKey]
 	print(("[CLUTCH] %6.1fs  PLANT %s is planting at %s…"):format(
 		clock(),
@@ -217,7 +247,7 @@ function Objective.tryStartPlant(bot: any, clock: () -> number): boolean
 		if zone then zone.callout else zoneKey
 	))
 
-	if not channel(bot, RoundConfig.PlantSeconds, "plant", clock) then
+	if not channel(bot, RoundConfig.PlantSeconds, "plant", clock, shouldAbort) then
 		return false
 	end
 
@@ -252,7 +282,7 @@ function Objective.tryStartPlant(bot: any, clock: () -> number): boolean
 end
 
 -- Defender next to a planted spike commits to the full 7 seconds.
-function Objective.tryStartDefuse(bot: any, clock: () -> number): boolean
+function Objective.tryStartDefuse(bot: any, clock: () -> number, shouldAbort: (() -> boolean)?): boolean
 	if not MatchState.planted then
 		return false
 	end
@@ -264,7 +294,7 @@ function Objective.tryStartDefuse(bot: any, clock: () -> number): boolean
 
 	print(("[CLUTCH] %6.1fs  DEFUSE %s is defusing…"):format(clock(), bot.name))
 
-	if not channel(bot, RoundConfig.DefuseSeconds, "defuse", clock) then
+	if not channel(bot, RoundConfig.DefuseSeconds, "defuse", clock, shouldAbort) then
 		return false
 	end
 	if not MatchState.planted then
