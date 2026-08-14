@@ -1,11 +1,12 @@
 --!strict
 -- Project CLUTCH — server bootstrap.
 --
--- Brain v2 + spectator dashboard. The map is greyboxed, every area has a name,
--- bots decide where to go by scoring intents against what they can actually
--- perceive, and they shoot each other with a weapon that has an opinion about
--- range. The client shows a live match dashboard fed by replicated attributes
--- (Telemetry) and a kill-feed RemoteEvent (here).
+-- Round machine era. The map is greyboxed, every area has a name, bots decide
+-- where to go by scoring intents against what they can actually perceive,
+-- they shoot each other with weapons that have opinions about range, and the
+-- whole thing now runs in ROUNDS: buy, live, plant/defuse, post-round, score,
+-- credits. The client shows a live match dashboard fed by replicated
+-- attributes (Telemetry + RoundMachine) and a kill-feed RemoteEvent.
 --
 -- Boots into Duel1v1 by default (see Shared/Constants/Scenario). Ten bots at
 -- once produced a log nobody could read; two produce an auditable transcript.
@@ -16,9 +17,10 @@
 -- two duelists must come from role, side or situation, not from a stat roll.
 -- Turn it off to watch attributes reassert themselves.
 --
--- Retired from the default path: Patrol (random POI wandering, scaffolding for
--- proving the navmesh worked) and ShootingRange (proved the duel maths against a
--- dummy). Both still exist; the range can be re-enabled via Scenario.
+-- Retired: Patrol (random POI wandering, scaffolding for proving the navmesh
+-- worked), ShootingRange (proved the duel maths against a dummy), and the
+-- watchForDeath respawn stopgap — deaths are final inside a round now, and
+-- RoundMachine owns resets between rounds.
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Shared = ReplicatedStorage:WaitForChild("Shared")
@@ -31,13 +33,10 @@ local Weapons = require(Shared.Constants.Weapons)
 local MapBuilder = require(script.MapBuilder)
 local BotSpawner = require(script.BotSpawner)
 local Telemetry = require(script.Telemetry)
-local Brain = require(script.Brain)
-local Combat = require(script.Combat)
+local RoundMachine = require(script.RoundMachine)
 local ShootingRange = require(script.ShootingRange)
 
-local RESPAWN_DELAY = 3
-
-print(("[CLUTCH] server online — brain v2 + spectator HUD (%s)"):format(Scenario.Mode))
+print(("[CLUTCH] server online — round machine + spectator HUD (%s)"):format(Scenario.Mode))
 
 MapBuilder.build(Greybox)
 print(("[CLUTCH] %d named zones loaded"):format(#Zones.list))
@@ -68,20 +67,12 @@ end
 hopAudit("ATK_SPAWN")
 hopAudit("DEF_SPAWN")
 
--- Which weapon everyone is holding, and the thresholds its carrier reasons
--- about. Printing this means the log explains its own engagement decisions.
-local weapon = Weapons[Scenario.DuelWeapon]
-if not weapon then
-	warn(("[CLUTCH] unknown weapon %q, falling back to Sidearm"):format(tostring(Scenario.DuelWeapon)))
-	weapon = Weapons.Sidearm
-end
-print(("[CLUTCH] weapon: %s (%s) — %d body / %d head, optimal to %d studs, effective to %d studs"):format(
-	weapon.DisplayName,
-	weapon.Class,
-	weapon.DamageBody,
-	math.floor(weapon.DamageBody * weapon.HeadshotMultiplier),
-	weapon.OptimalRangeStuds,
-	weapon.MaxEffectiveRangeStuds
+-- Everyone starts on the same pistol with the same wallet; the economy decides
+-- what they carry two rounds from now. Printing it keeps the log honest.
+local startWeapon = Weapons[Scenario.DuelWeapon] or Weapons.Sidearm
+print(("[CLUTCH] starting weapon: %s (%s) — everyone opens with it"):format(
+	startWeapon.DisplayName,
+	startWeapon.Class
 ))
 
 -- Let the navmesh bake before anyone asks it for a path
@@ -145,10 +136,9 @@ if Scenario.UniformStats then
 	))
 end
 
--- Survive death with the rig intact long enough to CLONE it. A dead humanoid
--- cannot be revived — setting Health on a dead rig never sticks (playtest #6:
--- one kill produced an endless RESET metronome because the "revived" bot was
--- still dead). Respawn replaces the body wholesale from this pristine copy.
+-- Pristine template + spawn pivot per bot. The round machine clones a fresh
+-- body from this every round; a dead humanoid cannot be revived, and the
+-- template never sees combat.
 for _, bot in roster do
 	local humanoid = (bot.model :: Model):FindFirstChildOfClass("Humanoid")
 	if humanoid then
@@ -156,18 +146,6 @@ for _, bot in roster do
 	end
 	bot.spawnPivot = (bot.model :: Model):GetPivot()
 	bot.template = (bot.model :: Model):Clone()
-	bot.weapon = weapon
-end
-
--- Static dashboard identity. Telemetry adds the live state (zone, intent,
--- alive, K/D/HS) as attributes on the same model at 4Hz.
-local function markBot(bot: any, side: string)
-	local model = bot.model :: Model
-	model:SetAttribute("ClutchBot", true)
-	model:SetAttribute("BotName", bot.name)
-	model:SetAttribute("Side", side)
-	model:SetAttribute("Role", bot.role)
-	model:SetAttribute("Weapon", weapon.DisplayName)
 end
 
 -- Both rosters, with every attribute that feeds a shot.
@@ -182,15 +160,15 @@ local function printRoster(label: string, side: { any })
 			bot.attributes.GameSense,
 			bot.attributes.Aggression,
 			bot.attributes.Consistency,
-			weapon.DisplayName
+			startWeapon.DisplayName
 		))
 	end
 end
 printRoster("ATK", attackers)
 printRoster("DEF", defenders)
 
--- Telemetry first, so the brain's opening decisions already have a track to
--- write their intent into.
+-- Telemetry first, so every round already has tracks to write into. Tracks
+-- survive body swaps because they re-read bot.model every tick.
 for _, bot in attackers do
 	Telemetry.attach(bot, "Attack")
 end
@@ -198,81 +176,21 @@ for _, bot in defenders do
 	Telemetry.attach(bot, "Defense")
 end
 
--- A dead bot is replaced from its pristine template, returns to spawn and gets
--- a fresh brain, so a single Studio session produces repeated engagements
--- instead of one kill and silence. Deliberately crude: real respawn logic
--- belongs to the round state machine, along with buy phases and the score.
---
--- handledModel gates the corpse, not a boolean: the watcher re-reads bot.model
--- every poll because respawn swaps it.
-local function watchForDeath(bot: any, side: string, enemies: { any }, allies: { any })
-	task.spawn(function()
-		local handledModel: Model? = nil
-		while true do
-			local model = bot.model :: Model?
-			if model and model.Parent then
-				local humanoid = model:FindFirstChildOfClass("Humanoid")
-				if humanoid and humanoid.Health <= 0 and handledModel ~= model then
-					handledModel = model
-					bot.deaths = (bot.deaths or 0) + 1
-
-					-- Combat stamped the corpse with who did it; read before destroying.
-					local killerName = model:GetAttribute("LastKilledBy")
-					if killerName then
-						killFeed:FireAllClients({
-							killer = killerName,
-							victim = bot.name,
-							headshot = model:GetAttribute("LastKillHeadshot") == true,
-							distance = model:GetAttribute("LastKillDistance") or 0,
-							weapon = model:GetAttribute("LastKillWeapon") or "?",
-						})
-					end
-
-					print(("[CLUTCH] %6.1fs  RESET %s respawning in %ds"):format(
-						Telemetry.clock(),
-						bot.name,
-						RESPAWN_DELAY
-					))
-					task.wait(RESPAWN_DELAY)
-
-					local fresh = (bot.template :: Model):Clone()
-					model:Destroy() -- ends the old brain/perception loops too
-					fresh:PivotTo(bot.spawnPivot)
-					local freshHumanoid = fresh:FindFirstChildOfClass("Humanoid")
-					if freshHumanoid then
-						freshHumanoid.BreakJointsOnDeath = false
-					end
-					fresh.Parent = workspace
-					bot.model = fresh
-					markBot(bot, side)
-					task.wait(0.5)
-					Brain.start(bot, side, enemies, allies, rng, Telemetry.clock, weapon)
-					print(("[CLUTCH] %6.1fs  RESET %s back at spawn with a fresh brain"):format(
-						Telemetry.clock(),
-						bot.name
-					))
-				end
-			end
-			task.wait(0.25)
-		end
-	end)
-end
-
-for _, bot in attackers do
-	markBot(bot, "Attack")
-	Brain.start(bot, "Attack", defenders, attackers, rng, Telemetry.clock, weapon)
-	watchForDeath(bot, "Attack", defenders, attackers)
-end
-for _, bot in defenders do
-	markBot(bot, "Defense")
-	Brain.start(bot, "Defense", attackers, defenders, rng, Telemetry.clock, weapon)
-	watchForDeath(bot, "Defense", attackers, defenders)
-end
-
-Telemetry.startReporting()
-print("[CLUTCH] brains online — watch for THINK / ENGAGE / SHOT / MOVE lines")
-
 if Scenario.RunShootingRange and #attackers > 0 then
 	task.wait(2)
 	ShootingRange.run(attackers[1])
 end
+
+Telemetry.startReporting()
+print("[CLUTCH] handing off to the round machine — watch for ROUND / BUY / PLANT / DEFUSE lines")
+
+-- Blocks forever: Buy -> Live -> resolution -> PostRound, on loop.
+RoundMachine.start({
+	roster = roster,
+	attackers = attackers,
+	defenders = defenders,
+	rng = rng,
+	clock = Telemetry.clock,
+	remotes = remotes,
+	killFeed = killFeed,
+})
