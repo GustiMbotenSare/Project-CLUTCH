@@ -1,10 +1,16 @@
 --!strict
--- Bot brain v3.1: score every intent, commit to the winner, act on it — now
--- with the round in the loop and survival instincts that actually fire.
+-- Bot brain v3.2: score every intent, commit to the winner, act on it — with
+-- the round in the loop, survival instincts that fire, and two feet.
 --
 -- Utility AI rather than a state machine, because a state machine hides its
 -- reasoning. Every tick produces a full score vector and the log prints it,
 -- so a bad decision can be traced to the term that caused it.
+--
+-- WALK OR SPRINT (playtest #9): bots were permanently at full tilt, which is
+-- both loud and reads as reckless. Now: sprint when the coast is clear,
+-- shift-walk when contact is fresh, when lurking, when post-plant, and when
+-- in or entering a choke — "checking the door" is a speed, and the footstep
+-- radius follows it (Perception). The dashboard shows the current mode.
 --
 -- ---------------------------------------------------------------------------
 -- Fixed after the first 1v1 transcript: MID_BACK is not an anchor; intent
@@ -13,19 +19,20 @@
 -- Fixed after the second: ROUTE COMMITMENT — one intermediate zone until the
 -- zone actually changes, no boundary churn.
 -- Fixed after playtest #8:
---   * ENGAGE BYPASSES HYSTERESIS. Push-with-carrier-bonus scored 0.94 while a
---     forced Engage sat at 0.88 — under the 0.08 hysteresis margin Ace kept
---     walking toward A Site while Onyx shot him five times. Being shot at now
---     outranks momentum, exactly like it outranks the commitment gate.
---   * STICKY SITE/ANCHOR PICKS. Both sites are 4 hops from both spawns, so
---     "nearest" always resolved to A. Every round each bot rolls a site (ATK)
---     or anchor (DEF) once and commits; RoundMachine clears the pick between
---     rounds. Routes now vary.
---   * PLANT RESPECTS A HOT SITE. A contact within 2 hops of the plant zone
---     costs Plant 0.45 instead of 0.25 — clear first, plant after. And the
---     channel itself aborts when an enemy becomes visible (see Objective).
---   * Brains sleep during Buy/PostRound. Frozen bodies trying to path was the
---     source of the between-round BLOCKED spam.
+--   * ENGAGE BYPASSES HYSTERESIS — a forced Engage lost to Push momentum and
+--     Ace walked into five bullets without returning fire.
+--   * STICKY SITE/ANCHOR PICKS — both sites tie at 4 hops, so "nearest" was
+--     always A. Each bot rolls a site/anchor per round; RoundMachine clears it.
+--   * PLANT RESPECTS A HOT SITE (contact within 2 hops costs Plant 0.45), and
+--     channels abort when an enemy becomes visible (see Objective).
+--   * Brains sleep while frozen between phases (the between-round BLOCKED spam).
+-- Fixed after playtest #9:
+--   * OBJECTIVES INTERRUPT WALKS. The defuse-collapse only fired after the
+--     current walk finished, so a defender kept walking to the wrong site for
+--     seconds after the plant. shouldInterrupt now also trips on a planted
+--     spike (defenders) and on a carrier standing on a plant zone.
+--   * Rotate gets +0.10 when the contact is ON a site — "they're hitting B"
+--     is a stronger pull than a random footstep.
 -- ---------------------------------------------------------------------------
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -49,11 +56,12 @@ local CANDIDATES = 6 -- standable-point attempts per destination
 local CLEARANCE_RADIUS = 2.6
 local GROUND_TOLERANCE = 2.5
 local ALLY_CROWD_STUDS = 25
--- Walk whole routes, not two-hop legs. Interrupts (combat) still poll every
--- 0.3s inside the walk, so long walks no longer mean slow reactions — and the
--- full stop at every zone boundary was the worst of the movement jank.
+-- Walk whole routes, not two-hop legs. Interrupts (combat, and now the spike)
+-- still poll every 0.3s inside the walk, so long walks no longer mean slow
+-- reactions — and the full stop at every zone boundary was pure jank.
 local DIRECT_WALK_MAX_HOPS = 6
-local INTERRUPT_RECHECK = 0.3 -- seconds between combat interrupt polls
+local INTERRUPT_RECHECK = 0.3 -- seconds between interrupt polls mid-walk
+local FRESH_CONTACT_SECONDS = 6 -- contact newer than this means quiet feet
 
 -- Role priors. Kept in the same band as the situational terms on purpose: a
 -- role should bias a decision, never decide it outright.
@@ -109,6 +117,29 @@ local function nearestOf(keys: { string }, from: string): string?
 	return best
 end
 
+-- WALK OR SPRINT. The shift-walk rules, checked in order:
+local function wantsWalk(intent: string, side: string, currentKey: string, routeKey: string?, contact: any, now: number): boolean
+	if intent == "Engage" or intent == "Plant" or intent == "Defuse" then
+		return true -- fights and channels are careful by definition
+	end
+	if intent == "Lurk" then
+		return true -- quiet is the entire point
+	end
+	if contact and now - contact.seenAt < FRESH_CONTACT_SECONDS then
+		return true -- danger is fresh: go quiet
+	end
+	if side == "Attack" and MatchState.planted then
+		return true -- post-plant: hold the site quietly
+	end
+	if Zones.hasTag(currentKey, "choke") then
+		return true -- inside a door/short/window: check it, don't sprint through
+	end
+	if routeKey and Zones.hasTag(routeKey, "choke") then
+		return true -- about to enter one
+	end
+	return false
+end
+
 local function scoreHold(ctx: Context): number
 	local score = 0.30 + (HOLD_ROLE[ctx.role] or 0.10)
 	if ctx.side == "Defense" then
@@ -160,6 +191,9 @@ local function scoreRotate(ctx: Context): number
 	score += clamp01(hops / 6) * 0.15
 	if ctx.contact.source == "sound" then
 		score -= 0.10 -- footsteps are worth less than eyes
+	end
+	if Zones.hasTag(ctx.contact.zoneKey, "site") then
+		score += 0.10 -- they're hitting a site — go
 	end
 	return score
 end
@@ -375,11 +409,26 @@ function Brain.start(bot: any, side: string, enemies: { any }, allies: { any }, 
 			end
 			interruptCheckedAt = now
 			interruptAnswer = false
+			local here = Zones.keyAt(Zones.groundOf(model))
 			local visible = Perception.visibleContact(perception)
 			if visible then
-				local here = Zones.keyAt(Zones.groundOf(model))
 				local assessment = Combat.assess(bot, weapon, visible, enemies, here, combatState, now)
 				interruptAnswer = assessment.engage
+			end
+			-- OBJECTIVES INTERRUPT WALKS. Until playtest #9 only combat could cut a
+			-- walk, so a defender kept strolling to the wrong site for seconds
+			-- after the spike went down, and a carrier walked PAST the plant zone.
+			if not interruptAnswer then
+				if MatchState.planted and side == "Defense" and intent ~= "Defuse" then
+					interruptAnswer = true
+				elseif side == "Attack"
+					and not MatchState.planted
+					and MatchState.spikeCarrier == bot
+					and intent ~= "Plant"
+					and Zones.hasTag(here, "plant")
+				then
+					interruptAnswer = true
+				end
 			end
 			return interruptAnswer
 		end
@@ -532,12 +581,19 @@ function Brain.start(bot: any, side: string, enemies: { any }, allies: { any }, 
 
 			local targetKey = resolveTarget(intent, ctx, allyZones, rng)
 
+			-- WALK OR SPRINT, decided per tick and applied to the humanoid. The
+			-- footstep radius follows the speed (Perception), so walking is both
+			-- the careful LOOK and the quiet CHOICE.
+			local walking = wantsWalk(intent, side, currentKey, routeKey, contact, now)
+			bot.speedMode = if walking then "walk" else "sprint"
+			alive.WalkSpeed = if walking then SimConfig.WalkSpeed else SimConfig.SprintSpeed
+
 			-- Print on change, and periodically even without one. A bot locked to a
 			-- single intent used to produce no reasoning output whatsoever.
 			if Scenario.VerboseBrain and (switched or now - lastThinkLogAt >= Scenario.BrainHeartbeatSeconds) then
 				lastThinkLogAt = now
 				local transition = if switched then ("%s -> %s"):format(previous, intent) else ("%s (steady)"):format(intent)
-				print(("[CLUTCH] %6.1fs  THINK %s (%s) %s | %s | in %s | target %s | %s | ramp %.2f"):format(
+				print(("[CLUTCH] %6.1fs  THINK %s (%s) %s | %s | in %s | target %s | %s | ramp %.2f | %s"):format(
 					now,
 					bot.name,
 					if side == "Attack" then "ATK" else "DEF",
@@ -546,7 +602,8 @@ function Brain.start(bot: any, side: string, enemies: { any }, allies: { any }, 
 					Zones.byKey[currentKey] and Zones.byKey[currentKey].callout or currentKey,
 					if targetKey and Zones.byKey[targetKey] then Zones.byKey[targetKey].callout else "hold position",
 					describeContact(contact, now),
-					decisiveness
+					decisiveness,
+					bot.speedMode
 				))
 			end
 
