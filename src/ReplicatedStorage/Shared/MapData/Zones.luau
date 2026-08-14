@@ -12,9 +12,15 @@
 --
 -- Zones are semantic labels over space, NOT collision volumes. They overlap
 -- freely; the SMALLEST containing zone wins, so "A Door" beats "A Site".
--- Floor zones occupy y 0..3 and decks y 4..9, resolved against a bot's GROUND
--- position (feet), never its root part — a standing humanoid's root sits ~3
--- studs up, which would otherwise land every floor bot in the wrong band.
+-- Floor zones occupy y 0..4.2 and decks y 4.2..9, resolved against a bot's
+-- GROUND position (feet), never its root part. The bands meet at 4.2 — not
+-- 3 — because a ramp's midpoint sits at y ~3.5: with a 3/4 split every ramp
+-- crossing flickered VOID (playtest #9's "A Ramp -> Off-map" lines).
+--
+-- v2: MID now runs z -27..10. The window-approach strips between MID's old
+-- north edge (z -19) and MID_WINDOW's x range were unzoned — bots fighting
+-- around the window wall corners read VOID and dropped the spike onto
+-- "unknown ground".
 
 export type ZoneKey = string
 export type Control = "Attack" | "Defense" | "Neutral"
@@ -42,10 +48,10 @@ type ZoneDef = {
 	adjacent: { string },
 }
 
-local FLOOR_MIN, FLOOR_MAX = 0, 3
-local DECK_MIN, DECK_MAX = 4, 9
+local FLOOR_MIN, FLOOR_MAX = 0, 4.2 -- meets the deck band mid-ramp, not above it
+local DECK_MIN, DECK_MAX = 4.2, 9
 
--- Bounds derived from Greybox v2.1 geometry. Attackers south (+z), defenders
+-- Bounds derived from Greybox v2.4 geometry. Attackers south (+z), defenders
 -- north (-z), Site A west (-x), Site B east (+x).
 local defs: { ZoneDef } = {
 	{
@@ -119,8 +125,10 @@ local defs: { ZoneDef } = {
 		adjacent = { "MID" },
 	},
 	{
+		-- Widened north to z -27: the window-approach strips beside MID_WINDOW
+		-- were unzoned, and fights around the window wall corners read VOID.
 		key = "MID", callout = "Mid",
-		x = { -20, 20 }, z = { -19, 10 },
+		x = { -20, 20 }, z = { -27, 10 },
 		control = "Neutral", tags = { "mid" },
 		adjacent = { "MID_LEDGE", "MID_WINDOW" },
 	},
