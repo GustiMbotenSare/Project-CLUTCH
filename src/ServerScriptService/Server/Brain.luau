@@ -1,59 +1,75 @@
 --!strict
--- Bot brain v1 — the tactical layer.
+-- Bot brain v2: score every intent, commit to the winner, act on it.
 --
--- Every decision tick a bot scores its available intents and commits to the
--- winner. Two design rules matter more than the numbers:
+-- Utility AI rather than a state machine, because a state machine hides its
+-- reasoning. Here every tick produces a full score vector, and the log prints
+-- it, so a bad decision can be traced to the term that caused it. That is the
+-- entire reason this is readable at all.
 --
---  1. ATTRIBUTES ARE CAUSAL. Aggression moves Push. Game Sense moves Rotate.
---     Role templates bias the whole vector. This is why we author the brain
---     instead of cloning a neural policy from footage: a manager game needs
---     Aim 94 / Aggression 90 to visibly behave differently from Aim 63 /
---     Aggression 55, and needs a designer to be able to turn that dial.
+-- Bots target ZONES and normally move one hop at a time, so they re-evaluate
+-- continuously instead of blindly finishing a long walk. Short trips are walked
+-- directly to cut down the stop-start stutter at zone boundaries.
 --
---  2. BOTS TARGET ZONES, NOT COORDINATES. "Rotate to B Site" is a decision a
---     caster can narrate. Movement is ONE ZONE HOP per decision, so a bot
---     re-evaluates continuously rather than blindly finishing a long path.
+-- ---------------------------------------------------------------------------
+-- Fixed after the first 1v1 transcript, all four found by reading the log:
 --
--- Not here yet: Plant / Defuse / Retake / Save need a round state machine, and
--- shooting needs the duel model lifted out of the range spike. Bots currently
--- maneuver and observe without firing, which is deliberate — it makes the
--- decision log pure.
+--   * MID_BACK was in DEF_HOLDS. A defender treated a mid corridor as a valid
+--     anchor, so Onyx stopped there permanently and never defended a site.
+--     16 of 25 zones were never visited by either bot.
+--
+--   * Push scored 1.22 for an Entry attacker while nothing else could exceed
+--     ~0.5. Ace was mathematically incapable of choosing another intent and
+--     therefore never logged a THINK line, because THINK only fired on change.
+--     All weights now live in a comparable range.
+--
+--   * Push had no terminal condition. On reaching A Site, Ace's Push target
+--     was the zone he already occupied, so he repositioned inside it forever
+--     while staring at a visible enemy. Push now excludes the current zone and
+--     is heavily penalised when the bot is already on its objective.
+--
+--   * The stall ramp reset on every hop, so it behaved as a 25-second
+--     metronome: Onyx stepped to Mid Window, reset, stepped back, reset. It now
+--     resets only on reaching a FINAL target, or on contact.
+-- ---------------------------------------------------------------------------
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Shared = ReplicatedStorage:WaitForChild("Shared")
 
-local Zones = require(Shared.MapData.Zones)
-local Scenario = require(Shared.Constants.Scenario)
 local SimConfig = require(Shared.Constants.SimConfig)
+local Scenario = require(Shared.Constants.Scenario)
+local Zones = require(Shared.MapData.Zones)
 
 local Pathing = require(script.Parent.Pathing)
 local Perception = require(script.Parent.Perception)
+local Combat = require(script.Parent.Combat)
 local Telemetry = require(script.Parent.Telemetry)
 
-local HYSTERESIS = 0.08 -- switching cost, stops intent flip-flop
-local CANDIDATES = 6
+local Brain = {}
+
+local HYSTERESIS = 0.08 -- how much better a rival intent must be to win
+local CANDIDATES = 6 -- standable-point attempts per destination
 local CLEARANCE_RADIUS = 2.6
 local GROUND_TOLERANCE = 2.5
 local ALLY_CROWD_STUDS = 25
+local DIRECT_WALK_MAX_HOPS = 2 -- walk straight there instead of hop-by-hop
+local INTERRUPT_RECHECK = 0.3 -- seconds between combat interrupt polls
 
--- Role templates. These are the ~40 numbers self-play tuning will eventually
--- optimise; hand-set for now so the behaviour is legible while we watch it.
-local HOLD_ROLE: { [string]: number } =
-	{ Anchor = 0.45, Sniper = 0.35, Support = 0.15, IGL = 0.10, Lurker = 0.05, Entry = 0.00 }
-local PUSH_ROLE: { [string]: number } =
-	{ Entry = 0.45, Support = 0.20, IGL = 0.15, Lurker = 0.10, Sniper = 0.05, Anchor = 0.00 }
-local LURK_ROLE: { [string]: number } =
-	{ Lurker = 0.50, Sniper = 0.15, Drift = 0.00, Entry = 0.00, Support = 0.05, IGL = 0.05, Anchor = 0.00 }
+-- Role priors. Kept in the same band as the situational terms on purpose: a
+-- role should bias a decision, never decide it outright.
+local HOLD_ROLE = { Anchor = 0.30, Sniper = 0.23, Support = 0.10, IGL = 0.07, Lurker = 0.03, Entry = 0.00 }
+local PUSH_ROLE = { Entry = 0.25, Support = 0.11, IGL = 0.08, Lurker = 0.06, Sniper = 0.03, Anchor = 0.00 }
+local LURK_ROLE = { Lurker = 0.30, Sniper = 0.09, Support = 0.03, IGL = 0.03, Entry = 0.00, Anchor = 0.00 }
 
 local SITES = { "A_SITE", "B_SITE" }
-local DEF_HOLDS = { "A_SITE", "A_HEAVEN", "B_SITE", "B_HEAVEN", "MID_BACK" }
+
+-- MID_BACK deliberately absent. Including it made a corridor an acceptable
+-- anchor, which is how a defender ended up holding nothing for 84 seconds.
+local DEF_HOLDS = { "A_SITE", "A_HEAVEN", "B_SITE", "B_HEAVEN" }
 local ATK_FORWARD = { "MID", "MID_LEDGE", "A_LOBBY", "B_LOBBY", "A_ELBOW", "B_ELBOW" }
 local DEF_FORWARD = { "MID", "MID_LEDGE", "MID_WINDOW", "A_SHORT", "B_SHORT" }
 local FLANKS = { "A_MAIN", "B_MAIN", "A_ELBOW", "B_ELBOW" }
 
-export type Intent = "Hold" | "Push" | "Rotate" | "Lurk"
-
-local INTENTS: { Intent } = { "Hold", "Push", "Rotate", "Lurk" }
+local INTENTS = { "Hold", "Push", "Rotate", "Lurk", "Engage" }
 
 type Context = {
 	side: string,
@@ -62,35 +78,127 @@ type Context = {
 	aggression: number,
 	gameSense: number,
 	decisiveness: number,
-	contact: Perception.Contact?,
-	visible: boolean,
-	allyZones: { string },
+	contact: any,
+	visible: any,
+	assessment: any,
+	atObjective: boolean,
+	onAnchor: boolean,
 	alliesNear: number,
 }
 
-local Brain = {}
+local function clamp01(n: number): number
+	return math.clamp(n, 0, 1)
+end
 
--- ---------------------------------------------------------------- geometry --
+-- Nearest zone from a list, never the one we are standing in.
+local function nearestOf(keys: { string }, from: string): string?
+	local best: string? = nil
+	local bestHops = math.huge
+	for _, key in keys do
+		if key == from then
+			continue
+		end
+		local hops = Zones.hops(from, key)
+		if hops < bestHops then
+			best = key
+			bestHops = hops
+		end
+	end
+	return best
+end
 
+local function scoreHold(ctx: Context): number
+	local score = 0.30 + (HOLD_ROLE[ctx.role] or 0.10)
+	if ctx.side == "Defense" then
+		score += 0.18
+	end
+	score -= ctx.aggression * 0.22
+	score -= ctx.decisiveness * 0.30
+	if not ctx.contact then
+		score += 0.10
+	end
+	if Zones.hasTag(ctx.zoneKey, "site") or Zones.hasTag(ctx.zoneKey, "heaven") then
+		score += 0.14 -- ground worth standing on
+	end
+	return score
+end
+
+local function scorePush(ctx: Context): number
+	local score = 0.20 + (PUSH_ROLE[ctx.role] or 0.08)
+	score += ctx.aggression * 0.25
+	if ctx.side == "Attack" then
+		score += 0.15
+	end
+	score += ctx.decisiveness * 0.30
+	if ctx.atObjective then
+		-- There is nothing left to push toward. Without this the bot repositions
+		-- inside its own objective forever, which is exactly what Ace did.
+		score -= 0.65
+	end
+	return score
+end
+
+local function scoreRotate(ctx: Context): number
+	if not ctx.contact then
+		return -1
+	end
+	local hops = Zones.hops(ctx.zoneKey, ctx.contact.zoneKey)
+	if hops == 0 or hops == math.huge then
+		return -1
+	end
+	local score = 0.25 + ctx.gameSense * 0.30
+	score += clamp01(hops / 6) * 0.15
+	if ctx.contact.source == "sound" then
+		score -= 0.10 -- footsteps are worth less than eyes
+	end
+	return score
+end
+
+local function scoreLurk(ctx: Context): number
+	local score = 0.10 + (LURK_ROLE[ctx.role] or 0.02)
+	score += (1 - ctx.aggression) * 0.18
+	score -= ctx.decisiveness * 0.20
+	if ctx.alliesNear >= 1 then
+		score -= 0.12 -- lurking in a group is not lurking
+	end
+	return score
+end
+
+-- Engage is scored entirely by Combat, so range discipline lives in one place.
+local function scoreEngage(ctx: Context): number
+	if not ctx.assessment then
+		return -1
+	end
+	return ctx.assessment.score
+end
+
+local SCORERS: { [string]: (Context) -> number } = {
+	Hold = scoreHold,
+	Push = scorePush,
+	Rotate = scoreRotate,
+	Lurk = scoreLurk,
+	Engage = scoreEngage,
+}
+
+-- Can a humanoid actually stand here? Sampling a zone rectangle blindly puts
+-- destinations inside crates and off deck edges; every PATH FAILED in an earlier
+-- playtest traced back to skipping this check.
 local function isStandable(point: Vector3, ignore: Model): boolean
-	local rayParams = RaycastParams.new()
-	rayParams.FilterType = Enum.RaycastFilterType.Exclude
-	rayParams.FilterDescendantsInstances = { ignore }
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	params.FilterDescendantsInstances = { ignore }
 
-	local hit = workspace:Raycast(point + Vector3.new(0, 6, 0), Vector3.new(0, -12, 0), rayParams)
+	local hit = workspace:Raycast(point + Vector3.new(0, 6, 0), Vector3.new(0, -12, 0), params)
 	if not hit then
 		return false
 	end
-	if math.abs((hit.Position.Y + 0.5) - point.Y) > GROUND_TOLERANCE then
-		return false
+	if math.abs(hit.Position.Y + 0.5 - point.Y) > GROUND_TOLERANCE then
+		return false -- floating in the air or buried in geometry
 	end
 
-	local overlapParams = OverlapParams.new()
-	overlapParams.FilterType = Enum.RaycastFilterType.Exclude
-	overlapParams.FilterDescendantsInstances = { ignore }
-	local blockers = workspace:GetPartBoundsInRadius(hit.Position + Vector3.new(0, 2.5, 0), CLEARANCE_RADIUS, overlapParams)
-	for _, part in blockers do
-		if part.CanCollide then
+	local parts = workspace:GetPartBoundsInRadius(hit.Position + Vector3.new(0, 2.5, 0), CLEARANCE_RADIUS)
+	for _, part in parts do
+		if part.CanCollide and not part:IsDescendantOf(ignore) then
 			return false
 		end
 	end
@@ -107,138 +215,60 @@ local function standablePointIn(key: string, rng: Random, ignore: Model): Vector
 	return Zones.center(key)
 end
 
-local function nearestOf(keys: { string }, from: string): string
-	local best = keys[1]
-	local bestHops = math.huge
-	for _, key in keys do
-		local hops = Zones.hops(from, key)
-		if hops < bestHops then
-			best = key
-			bestHops = hops
-		end
-	end
-	return best
-end
-
--- ----------------------------------------------------------------- scoring --
-
-local function scoreHold(ctx: Context): number
-	local score = 0.30
-	score += HOLD_ROLE[ctx.role] or 0.10
-	score += if ctx.side == "Defense" then 0.22 else 0.00
-	score -= ctx.aggression * 0.28
-	score -= ctx.decisiveness * 0.35 -- the anti-stall ramp pushes bots off angles
-	if ctx.contact == nil then
-		score += 0.08 -- nothing to react to, so setting up is fine
-	end
-	if Zones.hasTag(ctx.zoneKey, "site") or Zones.hasTag(ctx.zoneKey, "heaven") then
-		score += 0.12 -- already on a real anchor
-	end
-	return score
-end
-
-local function scorePush(ctx: Context): number
-	local score = 0.22
-	score += PUSH_ROLE[ctx.role] or 0.10
-	score += ctx.aggression * 0.32
-	score += if ctx.side == "Attack" then 0.20 else 0.00
-	score += ctx.decisiveness * 0.40
-	if ctx.visible then
-		score += ctx.gameSense * 0.12 -- committing onto a known target
-	end
-	return score
-end
-
-local function scoreRotate(ctx: Context): number
-	local contact = ctx.contact
-	if not contact then
-		return -1
-	end
-	local hops = Zones.hops(ctx.zoneKey, contact.zoneKey)
-	if hops == 0 or hops == math.huge then
-		return -1 -- already there, or unreachable
-	end
-	local score = 0.28
-	score += ctx.gameSense * 0.35 -- reading the map is a Game Sense skill
-	score += math.clamp(hops / 6, 0, 1) * 0.20
-	if contact.source == "sound" then
-		score -= 0.10 -- footsteps are softer evidence than a sighting
-	end
-	return score
-end
-
-local function scoreLurk(ctx: Context): number
-	local score = 0.10
-	score += LURK_ROLE[ctx.role] or 0.00
-	score += (1 - ctx.aggression) * 0.18
-	score -= ctx.decisiveness * 0.20
-	if ctx.alliesNear >= 1 then
-		score -= 0.12 -- lurking next to a teammate is not lurking
-	end
-	return score
-end
-
-local SCORERS: { [Intent]: (Context) -> number } = {
-	Hold = scoreHold,
-	Push = scorePush,
-	Rotate = scoreRotate,
-	Lurk = scoreLurk,
-}
-
--- --------------------------------------------------------- target selection --
-
-local function pickLurkZone(ctx: Context): string
-	-- The flank furthest from where teammates already are
-	local best = FLANKS[1]
-	local bestDistance = -1
+-- The flank that maximises distance from every teammate.
+local function pickLurkZone(ctx: Context, allyZones: { string }): string?
+	local best: string? = nil
+	local bestScore = -math.huge
 	for _, key in FLANKS do
-		local nearestAlly = math.huge
-		for _, allyZone in ctx.allyZones do
-			local hops = Zones.hops(key, allyZone)
-			if hops < nearestAlly then
-				nearestAlly = hops
+		if key == ctx.zoneKey then
+			continue
+		end
+		local minHops = math.huge
+		for _, allyKey in allyZones do
+			local hops = Zones.hops(key, allyKey)
+			if hops ~= math.huge then
+				minHops = math.min(minHops, hops)
 			end
 		end
-		if nearestAlly == math.huge then
-			nearestAlly = 99
-		end
-		if nearestAlly > bestDistance then
+		local score = if minHops == math.huge then 99 else minHops
+		if score > bestScore then
 			best = key
-			bestDistance = nearestAlly
+			bestScore = score
 		end
 	end
 	return best
 end
 
-local function resolveTarget(intent: Intent, ctx: Context): string
-	if intent == "Rotate" then
-		local contact = ctx.contact
-		return if contact then contact.zoneKey else ctx.zoneKey
+local function resolveTarget(intent: string, ctx: Context, allyZones: { string }): string?
+	if intent == "Engage" then
+		return nil -- stand and fight
+	elseif intent == "Rotate" then
+		return if ctx.contact then ctx.contact.zoneKey else nil
 	elseif intent == "Push" then
 		if ctx.side == "Attack" then
+			-- Excluding the current zone is what lets an attacker who already owns
+			-- A Site go looking on B instead of shuffling in place.
 			return nearestOf(SITES, ctx.zoneKey)
 		end
 		return nearestOf(DEF_FORWARD, ctx.zoneKey)
 	elseif intent == "Lurk" then
-		return pickLurkZone(ctx)
+		return pickLurkZone(ctx, allyZones)
 	end
 
 	-- Hold
 	if ctx.side == "Defense" then
-		if table.find(DEF_HOLDS, ctx.zoneKey) then
-			return ctx.zoneKey
+		if ctx.onAnchor then
+			return nil -- already somewhere worth holding
 		end
 		return nearestOf(DEF_HOLDS, ctx.zoneKey)
 	end
-	if Zones.hasTag(ctx.zoneKey, "choke") or Zones.hasTag(ctx.zoneKey, "heaven") then
-		return ctx.zoneKey
+	if Zones.hasTag(ctx.zoneKey, "site") or Zones.hasTag(ctx.zoneKey, "choke") or Zones.hasTag(ctx.zoneKey, "heaven") then
+		return nil
 	end
 	return nearestOf(ATK_FORWARD, ctx.zoneKey)
 end
 
--- ------------------------------------------------------------------ logging --
-
-local function formatScores(scores: { [Intent]: number }): string
+local function formatScores(scores: { [string]: number }): string
 	local parts = {}
 	for _, intent in INTENTS do
 		table.insert(parts, ("%s %.2f"):format(intent, scores[intent]))
@@ -246,7 +276,7 @@ local function formatScores(scores: { [Intent]: number }): string
 	return table.concat(parts, "  ")
 end
 
-local function describeContact(contact: Perception.Contact?, now: number): string
+local function describeContact(contact: any, now: number): string
 	if not contact then
 		return "no contact"
 	end
@@ -258,44 +288,55 @@ local function describeContact(contact: Perception.Contact?, now: number): strin
 	)
 end
 
-local function calloutOf(key: string): string
-	local zone = Zones.byKey[key]
-	return if zone then zone.callout else key
-end
-
--- -------------------------------------------------------------------- brain --
-
-function Brain.start(bot: any, side: string, enemies: { any }, allies: { any }, rng: Random, clock: () -> number)
+function Brain.start(bot: any, side: string, enemies: { any }, allies: { any }, rng: Random, clock: () -> number, weapon: any)
 	local model = bot.model :: Model
-	local attrs = bot.attributes
-
 	local perception = Perception.new()
 	Perception.startLoop(perception, bot, enemies, clock)
 
-	local intent: Intent = if side == "Defense" then "Hold" else "Push"
-	local lastProgressAt = clock()
-
-	Telemetry.setIntent(bot.name, intent)
+	local humanoid = model:FindFirstChildOfClass("Humanoid")
+	local combatState = Combat.newState(if humanoid then humanoid.Health else 100)
 
 	task.spawn(function()
-		-- Stagger so ten brains do not all raycast on the same frame
-		task.wait(rng:NextNumber(0, SimConfig.DecisionTickSeconds * 4))
+		local intent = if side == "Attack" then "Push" else "Hold"
+		local lastProgressAt = clock()
+		local committedAt = clock()
+		local lastThinkLogAt = -math.huge
+
+		-- Cached interrupt predicate. Polled every pathing tick, so it must be
+		-- cheap; hasEyesOn casts rays, hence the recheck window.
+		local interruptCheckedAt = -math.huge
+		local interruptAnswer = false
+		local function shouldInterrupt(): boolean
+			local now = clock()
+			if now - interruptCheckedAt < INTERRUPT_RECHECK then
+				return interruptAnswer
+			end
+			interruptCheckedAt = now
+			interruptAnswer = false
+			local visible = Perception.visibleContact(perception)
+			if visible then
+				local here = Zones.keyAt(Zones.groundOf(model))
+				local assessment = Combat.assess(bot, weapon, visible, enemies, here, combatState, now)
+				interruptAnswer = assessment.engage
+			end
+			return interruptAnswer
+		end
+
+		task.wait(rng:NextNumber(0, SimConfig.DecisionTickSeconds * 4)) -- stagger
 
 		while model.Parent do
-			local humanoid = model:FindFirstChildOfClass("Humanoid")
-			if humanoid and humanoid.Health <= 0 then
+			local alive = model:FindFirstChildOfClass("Humanoid")
+			if not alive or alive.Health <= 0 then
 				break
 			end
 
 			local now = clock()
-			local ground = Zones.groundOf(model)
-			local zone = Zones.at(ground)
-			local currentKey = if zone then zone.key else Zones.VOID
+			Combat.pollHealth(bot, combatState, now)
 
+			local ground = Zones.groundOf(model)
+			local currentKey = Zones.keyAt(ground)
 			if currentKey == Zones.VOID then
-				-- Off the labelled map: either a zone bound is wrong or the bot is
-				-- somewhere it should not be. Worth shouting about.
-				warn(("[CLUTCH] %s is outside every zone at %.0f, %.0f, %.0f"):format(
+				warn(("[CLUTCH] %s is in VOID at %.0f, %.0f, %.0f — zone bounds are wrong"):format(
 					bot.name,
 					ground.X,
 					ground.Y,
@@ -303,99 +344,171 @@ function Brain.start(bot: any, side: string, enemies: { any }, allies: { any }, 
 				))
 			end
 
-			-- Ally positions, for crowding and lurk spacing
-			local allyZones: { string } = {}
+			local visible = Perception.visibleContact(perception)
+			local contact = Perception.bestContact(perception, now)
+			if not visible then
+				Combat.disengage(combatState) -- next fight pays reaction cost again
+			end
+
+			local assessment = nil
+			if visible then
+				assessment = Combat.assess(bot, weapon, visible, enemies, currentKey, combatState, now)
+			end
+
+			local allyZones = {}
 			local alliesNear = 0
 			for _, ally in allies do
-				if ally.name == bot.name then
+				if ally == bot or not ally.model.Parent then
 					continue
 				end
-				local allyModel = ally.model :: Model
-				if not allyModel.Parent then
-					continue
-				end
-				local allyGround = Zones.groundOf(allyModel)
+				local allyGround = Zones.groundOf(ally.model)
 				table.insert(allyZones, Zones.keyAt(allyGround))
 				if (allyGround - ground).Magnitude <= ALLY_CROWD_STUDS then
 					alliesNear += 1
 				end
 			end
 
-			-- Decisiveness ramp. With no round clock yet, it grows on time since
-			-- the bot last made progress or last knew anything — boring standoffs
-			-- are the silent killer of a spectator game.
+			-- Anti-stall. Deliberately NOT reset by ordinary walking: resetting on
+			-- every hop turned this into a metronome and produced a two-zone
+			-- ping-pong every 25 seconds.
 			local reference = math.max(lastProgressAt, perception.lastContactAt)
-			local decisiveness = math.clamp((now - reference) / Scenario.StallRampSeconds, 0, 1)
+			local decisiveness = clamp01((now - reference) / Scenario.StallRampSeconds)
 
-			local contact = Perception.bestContact(perception, now)
+			local atObjective = if side == "Attack"
+				then Zones.hasTag(currentKey, "site")
+				else table.find(DEF_FORWARD, currentKey) ~= nil
+
 			local ctx: Context = {
 				side = side,
 				role = bot.role,
 				zoneKey = currentKey,
-				aggression = attrs.Aggression / 100,
-				gameSense = attrs.GameSense / 100,
+				aggression = bot.attributes.Aggression / 100,
+				gameSense = bot.attributes.GameSense / 100,
 				decisiveness = decisiveness,
 				contact = contact,
-				visible = Perception.anyVisible(perception),
-				allyZones = allyZones,
+				visible = visible,
+				assessment = assessment,
+				atObjective = atObjective,
+				onAnchor = table.find(DEF_HOLDS, currentKey) ~= nil,
 				alliesNear = alliesNear,
 			}
 
-			local scores: { [Intent]: number } = {}
-			local bestIntent: Intent = intent
-			local bestScore = -math.huge
-			for _, candidate in INTENTS do
-				local score = SCORERS[candidate](ctx)
-				scores[candidate] = score
-				if score > bestScore then
-					bestIntent = candidate
-					bestScore = score
+			local scores: { [string]: number } = {}
+			for _, name in INTENTS do
+				scores[name] = SCORERS[name](ctx)
+			end
+
+			local winner = intent
+			local winnerScore = scores[intent]
+			for _, name in INTENTS do
+				if name ~= intent and scores[name] > winnerScore + HYSTERESIS then
+					winner = name
+					winnerScore = scores[name]
 				end
 			end
 
-			-- Switching costs something, or bots dither on the boundary
-			local previous = intent
-			if bestIntent ~= intent and bestScore < scores[intent] + HYSTERESIS then
-				bestIntent = intent
+			-- Commitment stops intent chatter, but being shot at outranks it.
+			if winner ~= intent and winner ~= "Engage" then
+				if now - committedAt < Scenario.MinIntentSeconds then
+					winner = intent
+				end
 			end
 
-			local targetKey = resolveTarget(bestIntent, ctx)
-			local hopKey = Zones.nextHop(currentKey, targetKey) or targetKey
+			local switched = winner ~= intent
+			if switched then
+				committedAt = now
+			end
+			local previous = intent
+			intent = winner
+			Telemetry.setIntent(bot.name, intent)
 
-			if bestIntent ~= previous then
-				intent = bestIntent
-				Telemetry.setIntent(bot.name, intent)
-				if Scenario.VerboseBrain then
-					print(("[CLUTCH] %6.1fs  THINK %s (%s) %s -> %s | %s | target %s via %s | %s | ramp %.2f"):format(
+			local targetKey = resolveTarget(intent, ctx, allyZones)
+
+			-- Print on change, and periodically even without one. A bot locked to a
+			-- single intent used to produce no reasoning output whatsoever.
+			if Scenario.VerboseBrain and (switched or now - lastThinkLogAt >= Scenario.BrainHeartbeatSeconds) then
+				lastThinkLogAt = now
+				local transition = if switched then ("%s -> %s"):format(previous, intent) else ("%s (steady)"):format(intent)
+				print(("[CLUTCH] %6.1fs  THINK %s (%s) %s | %s | in %s | target %s | %s | ramp %.2f"):format(
+					now,
+					bot.name,
+					if side == "Attack" then "ATK" else "DEF",
+					transition,
+					formatScores(scores),
+					Zones.byKey[currentKey] and Zones.byKey[currentKey].callout or currentKey,
+					if targetKey and Zones.byKey[targetKey] then Zones.byKey[targetKey].callout else "hold position",
+					describeContact(contact, now),
+					decisiveness
+				))
+			end
+
+			if intent == "Engage" and visible and assessment then
+				if Scenario.LogCombat and switched then
+					print(("[CLUTCH] %6.1fs  ENGAGE %s -> %s | %.0f studs %s | dmg x%.2f | %s%s"):format(
 						now,
 						bot.name,
-						if side == "Attack" then "ATK" else "DEF",
-						previous,
-						intent,
-						formatScores(scores),
-						calloutOf(targetKey),
-						calloutOf(hopKey),
-						describeContact(contact, now),
-						decisiveness
+						assessment.targetName,
+						assessment.distance,
+						assessment.band,
+						assessment.multiplier,
+						if assessment.forced then "FORCED: " else "",
+						assessment.reason
 					))
 				end
+
+				local targetModel = nil
+				for _, enemy in enemies do
+					if enemy.name == assessment.targetName then
+						targetModel = enemy.model
+						break
+					end
+				end
+
+				if targetModel then
+					local root = model:FindFirstChild("HumanoidRootPart") :: BasePart?
+					if root and alive then
+						alive:MoveTo(root.Position) -- plant feet, then shoot
+					end
+					Combat.fireBurst(bot, weapon, targetModel, combatState, rng, clock)
+					lastProgressAt = clock()
+				end
+			elseif visible and assessment and not assessment.engage and Scenario.LogCombat and switched then
+				print(("[CLUTCH] %6.1fs  HOLD FIRE %s | %s at %.0f studs %s | %s"):format(
+					now,
+					bot.name,
+					assessment.targetName,
+					assessment.distance,
+					assessment.band,
+					assessment.reason
+				))
 			end
 
-			if currentKey == targetKey then
-				-- Already where we want to be. Reposition inside the zone rather
-				-- than standing in one spot like a lamp post.
-				local spot = standablePointIn(currentKey, rng, model)
-				if spot then
-					Pathing.walkTo(model, spot)
-				end
-				task.wait(rng:NextNumber(1.5, 3.5))
-			else
-				local spot = standablePointIn(hopKey, rng, model)
-				if spot and Pathing.walkTo(model, spot) then
-					lastProgressAt = clock()
+			if intent ~= "Engage" then
+				if targetKey == nil or targetKey == currentKey then
+					-- Settle into the zone we already want to be in. Short dwell: the
+					-- old 1.5-3.5s wait read as aimless shuffling.
+					local spot = standablePointIn(currentKey, rng, model)
+					if spot then
+						Pathing.walkToWithResult(model, spot, shouldInterrupt)
+					end
+					task.wait(rng:NextNumber(0.6, 1.4))
 				else
-					-- Hop refused. Wait a tick so a blocked bot does not spin.
-					task.wait(SimConfig.DecisionTickSeconds * 2)
+					local hops = Zones.hops(currentKey, targetKey)
+					-- Short trips go straight there; long ones re-decide each hop
+					local walkKey = targetKey
+					if hops > DIRECT_WALK_MAX_HOPS then
+						walkKey = Zones.nextHop(currentKey, targetKey) or targetKey
+					end
+
+					local spot = standablePointIn(walkKey, rng, model)
+					if spot then
+						local result = Pathing.walkToWithResult(model, spot, shouldInterrupt)
+						if result == "arrived" and walkKey == targetKey then
+							lastProgressAt = clock() -- only a FINISHED goal resets the ramp
+						elseif result == "failed" then
+							task.wait(SimConfig.DecisionTickSeconds * 2)
+						end
+					end
 				end
 			end
 
