@@ -1,7 +1,7 @@
 -- Project CLUTCH — server bootstrap
--- M0 spike: builds the greybox arena from data, spawns 5v5 bots with
--- role-rolled attributes, then runs the shooting-range spike — the entry bot
--- paths out and duels a target dummy using the v0 duel model.
+-- M0 spike v2: builds the greybox arena from data, spawns 5v5 bots, puts
+-- everyone on patrol orders (navmesh stress test across stairs, door chokes,
+-- and the window ledge), then runs the shooting-range duel with Ace.
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Shared = ReplicatedStorage:WaitForChild("Shared")
@@ -10,10 +10,15 @@ local Greybox = require(Shared.MapData.Greybox)
 local MapBuilder = require(script.MapBuilder)
 local BotSpawner = require(script.BotSpawner)
 local ShootingRange = require(script.ShootingRange)
+local Patrol = require(script.Patrol)
 
-print("[CLUTCH] server online — M0 spike")
+print("[CLUTCH] server online — M0 spike v2")
 
 MapBuilder.build(Greybox)
+
+-- The navmesh needs a beat to bake after runtime geometry spawns —
+-- pathing before this can silently fail (playtest bug C).
+task.wait(1.5)
 
 local rng = Random.new()
 local teams = BotSpawner.spawnTeams(Greybox, rng)
@@ -27,6 +32,14 @@ for _, bot in ipairs(teams.attack) do
 		bot.attributes.GameSense,
 		bot.attributes.Aggression
 	))
+end
+
+-- Everyone patrols except Ace — he's on range duty.
+for _, bot in ipairs(teams.defense) do
+	Patrol.start(bot, rng)
+end
+for i = 2, #teams.attack do
+	Patrol.start(teams.attack[i], rng)
 end
 
 task.wait(2)
