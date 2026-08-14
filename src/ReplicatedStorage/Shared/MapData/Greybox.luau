@@ -1,25 +1,23 @@
 --!strict
--- Greybox v3 — the 5v5 map. Still data, still no Studio work.
+-- Greybox v3.1 — the 5v5 map. Still data, still no Studio work.
 --
--- v2.4 → v3 (playtest #10 was clean; time to scale):
---   * Canvas grows 170×110 → 230×150. Lanes widen 12 → 22, sites grow into
---     proper pockets, and both lobbies breathe. Ten bots need room to not
---     body-block each other at chokes (the ElbowB problem).
---   * REAL COVER, in two flavors, sized against a 5-stud rig:
+-- v3 → v3.1 (playtest #11 — the map-read pass):
+--   * Sites deepen four studs south (z -50..-18): at 47×28 they read as
+--     corridors next to their lobbies. Site south walls, pocket walls and
+--     door zones shift to match.
+--   * WestCap walls seal the lane corridor straight into the site's NW corner
+--     — an open bleed that wasn't in the zone graph and read as a weird gap.
+--
+-- v2.4 → v3 (the 5v5 scale-up):
+--   * Canvas 170×110 → 230×150; lanes 12 → 22 wide; proper site pockets.
+--   * REAL COVER in two flavors sized against a 5-stud rig:
 --       partial (4.5 tall — shoot over it, head-glitch behind it)
 --       full    (12 tall — breaks line of sight outright)
---     Every site, both lanes, the shorts and mid get deliberate pieces.
---   * COVER POINTS: the map now declares where a bot should STAND to use each
---     piece and which way to FACE. The brain holds these as angles and
---     jiggle-peeks the partials — peeking and angle holding, as requested.
---   * DEFENDER BACK ROUTE: sites are open to the Defender Lobby on their
---     north edge. Defenders finally arrive before attackers (the route audit
---     has said 4/4 since v2 — real tac shooters are defender-sided on
---     rotation timing). The shorts are capped so attackers can't free-flank
---     into the defender lobby in exchange.
---   * Spawn screens segment: gaps at mid, both lobby mouths, and both lane
---     mouths — v2's single mid gap silently walled off the lane↔lobby
---     crossings and bots detoured through mid without knowing why.
+--   * COVER POINTS: where a bot STANDS to use each piece and which way to
+--     FACE. The brain holds these as angles and jiggle-peeks the partials.
+--   * Sites open to the Defender Lobby on their north edge (defenders arrive
+--     first); the shorts are capped so attackers can't free-flank in exchange.
+--   * Spawn screens segment into gaps at mid, both lobby mouths, both lanes.
 --
 -- Coordinates: y up. Attackers south (+z), defenders north (-z).
 -- Site A west (-x), Site B east (+x). Floor top y = 1.
@@ -119,12 +117,14 @@ local parts: { PartSpec } = {
 	{ name = "BLaneFull", pos = Vector3.new(80, 7, -10), size = Vector3.new(6, 12, 6), color = COVER_FULL },
 	{ name = "BLaneHalf", pos = Vector3.new(83, 3.25, 20), size = Vector3.new(6, PARTIAL, 3), color = CRATE },
 
-	-- A SITE (x -95..-48, z -50..-22). South face has the 12-wide main door
-	-- (x -66..-54). NO north wall — the site opens to the defender lobby.
-	{ name = "SiteSouthA1", pos = Vector3.new(-80.5, 7, -22), size = Vector3.new(29, 12, 2), color = WALL },
-	{ name = "SiteSouthA2", pos = Vector3.new(-51, 7, -22), size = Vector3.new(6, 12, 2), color = WALL },
+	-- A SITE (x -95..-48, z -50..-18). South face has the 12-wide main door
+	-- (x -66..-54) at z=-18. NO north wall — the site opens to the defender
+	-- lobby. WestCap seals the lane corridor out of the NW corner.
+	{ name = "SiteSouthA1", pos = Vector3.new(-80.5, 7, -18), size = Vector3.new(29, 12, 2), color = WALL },
+	{ name = "SiteSouthA2", pos = Vector3.new(-51, 7, -18), size = Vector3.new(6, 12, 2), color = WALL },
+	{ name = "WestCapA", pos = Vector3.new(-83.5, 7, -24), size = Vector3.new(23, 12, 2), color = WALL },
 	-- Pocket wall (x=-48) with an 8-wide short door (z -44..-36)
-	{ name = "PocketEastA1", pos = Vector3.new(-48, 7, -29), size = Vector3.new(2, 12, 14), color = WALL },
+	{ name = "PocketEastA1", pos = Vector3.new(-48, 7, -27), size = Vector3.new(2, 12, 18), color = WALL },
 	{ name = "PocketEastA2", pos = Vector3.new(-48, 7, -47), size = Vector3.new(2, 12, 6), color = WALL },
 	-- Short cap: attackers may not walk A Short straight into the defender lobby
 	{ name = "ShortCapA", pos = Vector3.new(-37, 7, -45), size = Vector3.new(22, 12, 2), color = WALL },
@@ -135,9 +135,10 @@ local parts: { PartSpec } = {
 	{ name = "AShortCrate", pos = Vector3.new(-36, 3.25, -40), size = Vector3.new(6, PARTIAL, 4), color = CRATE },
 
 	-- B SITE (mirror)
-	{ name = "SiteSouthB1", pos = Vector3.new(80.5, 7, -22), size = Vector3.new(29, 12, 2), color = WALL },
-	{ name = "SiteSouthB2", pos = Vector3.new(51, 7, -22), size = Vector3.new(6, 12, 2), color = WALL },
-	{ name = "PocketWestB1", pos = Vector3.new(48, 7, -29), size = Vector3.new(2, 12, 14), color = WALL },
+	{ name = "SiteSouthB1", pos = Vector3.new(80.5, 7, -18), size = Vector3.new(29, 12, 2), color = WALL },
+	{ name = "SiteSouthB2", pos = Vector3.new(51, 7, -18), size = Vector3.new(6, 12, 2), color = WALL },
+	{ name = "WestCapB", pos = Vector3.new(83.5, 7, -24), size = Vector3.new(23, 12, 2), color = WALL },
+	{ name = "PocketWestB1", pos = Vector3.new(48, 7, -27), size = Vector3.new(2, 12, 18), color = WALL },
 	{ name = "PocketWestB2", pos = Vector3.new(48, 7, -47), size = Vector3.new(2, 12, 6), color = WALL },
 	{ name = "ShortCapB", pos = Vector3.new(37, 7, -45), size = Vector3.new(22, 12, 2), color = WALL },
 	{ name = "BDefaultCrate", pos = Vector3.new(66, 3.25, -36), size = Vector3.new(6, PARTIAL, 6), color = CRATE },
@@ -233,14 +234,14 @@ local Greybox: MapSpec = {
 		{ name = "SiteA", pos = Vector3.new(-68, 1, -36) },
 		{ name = "HeavenA", pos = Vector3.new(-86, 5.5, -43) },
 		{ name = "RampA", pos = Vector3.new(-73, 1, -43) },
-		{ name = "DoorA", pos = Vector3.new(-60, 1, -18) },
+		{ name = "DoorA", pos = Vector3.new(-60, 1, -16) },
 		{ name = "ShortA", pos = Vector3.new(-37, 1, -38) },
 		{ name = "ElbowA", pos = Vector3.new(-83, 1, -12) },
 		{ name = "LobbyA", pos = Vector3.new(-50, 1, 0) },
 		{ name = "SiteB", pos = Vector3.new(68, 1, -36) },
 		{ name = "HeavenB", pos = Vector3.new(86, 5.5, -43) },
 		{ name = "RampB", pos = Vector3.new(73, 1, -43) },
-		{ name = "DoorB", pos = Vector3.new(60, 1, -18) },
+		{ name = "DoorB", pos = Vector3.new(60, 1, -16) },
 		{ name = "ShortB", pos = Vector3.new(37, 1, -38) },
 		{ name = "ElbowB", pos = Vector3.new(83, 1, -12) },
 		{ name = "LobbyB", pos = Vector3.new(50, 1, 0) },
