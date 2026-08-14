@@ -1,14 +1,18 @@
 --!strict
 -- Greybox v2.2 — still data, still no Studio work.
 --
--- v2.1 → v2.2 (playtest #5 — spawn-to-spawn sightline):
+-- v2.1 → v2.2 (playtest #5/#6 — spawn-to-spawn sightline):
 --   * Both spawn lobbies had a completely open boundary, so the two duelists
 --     saw each other at 87 studs from their own spawn lines 4 seconds in and
 --     traded pistol fire across the whole map. A pistol's optimal band is 40
---     studs; an 87-stud opener teaches the bots nothing about range discipline.
---     Added SpawnScreenN/S: 12-tall walls sealing the lobby boundary except
---     for a 26-wide gap at mid (x -13..13), which is now THE opening contest.
---     First contact should happen around 30-50 studs instead.
+--     studs; an 88-stud opener teaches the bots nothing about range discipline.
+--   * v2.2 added SpawnScreenN/S: 12-tall walls sealing the lobby boundary
+--     except a 26-wide gap at mid (x -13..13).
+--   * v2.2 ALSO moved both spawn rows off the mid axis in OPPOSITE directions
+--     (attackers east, defenders west). The first version of the screens left
+--     the spawn lines at x -8..8 — dead centre of the mid gap — so playtest
+--     #6 opened with the exact same 88-stud sightline the walls were built
+--     to remove. Own your gap geometry, folks.
 --
 -- v2 → v2.1 (playtest #2 — nothing climbed):
 --   * Vertical access was broken by construction: staircases sat UNDER their
@@ -179,21 +183,25 @@ local parts: { PartSpec } = {
 local Greybox: MapSpec = {
 	parts = parts,
 
+	-- Offset EAST, away from the mid gap. The first screens left both spawn
+	-- lines at x -8..8 — dead centre of the gap — so nothing actually changed.
 	attackSpawns = {
-		Vector3.new(-8, 3, 44),
-		Vector3.new(-4, 3, 44),
-		Vector3.new(0, 3, 44),
-		Vector3.new(4, 3, 44),
-		Vector3.new(8, 3, 44),
+		Vector3.new(40, 3, 44),
+		Vector3.new(36, 3, 44),
+		Vector3.new(32, 3, 44),
+		Vector3.new(28, 3, 44),
+		Vector3.new(24, 3, 44),
 	},
 
-	-- Pulled back to z -49: v2 spawns sat inside the defender half-cover
+	-- Offset WEST, opposite the attackers. Any spawn-to-spawn line now crosses
+	-- a screen wall, not the mid gap. (Pulled back to z -49 in v2.1: v2 spawns
+	-- sat inside the defender half-cover.)
 	defenseSpawns = {
-		Vector3.new(-8, 3, -49),
-		Vector3.new(-4, 3, -49),
-		Vector3.new(0, 3, -49),
-		Vector3.new(4, 3, -49),
-		Vector3.new(8, 3, -49),
+		Vector3.new(-40, 3, -49),
+		Vector3.new(-36, 3, -49),
+		Vector3.new(-32, 3, -49),
+		Vector3.new(-28, 3, -49),
+		Vector3.new(-24, 3, -49),
 	},
 
 	plantZones = {
