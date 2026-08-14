@@ -4,16 +4,22 @@
 -- Buy (frozen, bots auto-spend) → Live (100s, brains on) → resolution by
 -- elimination, explosion, defuse or clock → PostRound (score, credits) →
 -- again. Deaths are FINAL inside a round: no respawns, so a kill costs the
--- victim the round, not three seconds. And per playtest #9, death also costs
--- the victim its PRIMARY: die and you come back on the free Sidearm, like
--- every tac shooter ever. Weapon drops on death are the tracked follow-up.
+-- victim the round, not three seconds. Death also costs the victim its
+-- PRIMARY: die and you come back on the free Sidearm, like every tac shooter
+-- ever. Weapon drops on death are the tracked follow-up.
+--
+-- TEAM PLANS (playtest #11): every round opens with a CALL. Attack rolls
+-- Rush / Default / Split against a called site; defense rolls Standard /
+-- Stack / Aggro. Plans set each bot's siteChoice/holdChoice before brains
+-- wake up, so five individuals stop rolling five unrelated coin flips.
+-- Today the coin calls it — this is the seed of the M2 tactics board, where
+-- the manager makes the call and the same machinery executes it.
 --
 -- Also owns the economy (win/loss ladders, kill rewards, plant bonus), the
 -- body swapper (every round starts with pristine rigs at spawn), per-round
--- brain picks (site/anchor choices are cleared here so routes vary round to
--- round), and each bot's INVENTORY string for the dashboard. The spike
--- carrier is a random attacker each round — Ace does not have to carry every
--- single time.
+-- brain picks (site/anchor choices are cleared here so the plan can reassign
+-- them), and each bot's INVENTORY string for the dashboard. The spike carrier
+-- is a random attacker each round.
 --
 -- Deliberately NOT here: halftime side swaps (needs team identity), overtime,
 -- armor/shields, weapon drops on death. All tracked in the build doc.
@@ -33,6 +39,9 @@ local RoundMachine = {}
 
 local DEFAULT_WALK_SPEED = 16
 local DEFAULT_JUMP_POWER = 50
+
+local SITES = { "A_SITE", "B_SITE" }
+local DEF_FORWARD = { "MID", "MID_LEDGE", "MID_WINDOW", "A_SHORT", "B_SHORT" }
 
 type Ctx = {
 	roster: { any },
@@ -115,7 +124,7 @@ end
 -- Every round starts with pristine rigs at spawn. Old bodies (and the brains,
 -- perception loops and death watchers riding them) are destroyed; Telemetry
 -- tracks survive because they re-read bot.model every tick. Per-round brain
--- picks (siteChoice/holdChoice) are cleared so routes vary round to round.
+-- picks (siteChoice/holdChoice) are cleared so the plan can reassign them.
 local function resetBodies(ctx: Ctx)
 	for _, bot in ctx.roster do
 		bot.siteChoice = nil
@@ -142,6 +151,105 @@ local function publish(ctx: Ctx)
 	ctx.remotes:SetAttribute("AtkScore", MatchState.atkScore)
 	ctx.remotes:SetAttribute("DefScore", MatchState.defScore)
 	ctx.remotes:SetAttribute("Planted", MatchState.planted)
+end
+
+-- ---------------------------------------------------------------------------
+-- TEAM PLANS. One coin per team per round, not five. Assignments land in
+-- bot.siteChoice / bot.holdChoice before brains start, so the brain's own
+-- roll only fires for the freelancers a plan deliberately leaves open.
+-- ---------------------------------------------------------------------------
+local function otherSite(site: string): string
+	return if site == "A_SITE" then "B_SITE" else "A_SITE"
+end
+
+local function heavenOf(site: string): string
+	return if site == "A_SITE" then "A_HEAVEN" else "B_HEAVEN"
+end
+
+local function siteLetter(site: string): string
+	return if site == "A_SITE" then "A" else "B"
+end
+
+local function rollTeamPlans(ctx: Ctx)
+	local rng = ctx.rng
+	local site = SITES[rng:NextInteger(1, 2)]
+
+	local atkRoll = rng:NextNumber()
+	local attackKind = if atkRoll < 0.30 then "Rush" elseif atkRoll < 0.80 then "Default" else "Split"
+	local defRoll = rng:NextNumber()
+	local defenseKind = if defRoll < 0.50 then "Standard" elseif defRoll < 0.75 then "Stack" else "Aggro"
+
+	MatchState.plan = {
+		attackKind = attackKind,
+		defenseKind = defenseKind,
+		site = site,
+		otherSite = otherSite(site),
+	}
+
+	-- ATTACK assignments
+	for _, bot in ctx.attackers do
+		if attackKind == "Rush" then
+			bot.siteChoice = site -- everyone, same door, right now
+		elseif attackKind == "Default" then
+			-- The core hits the called site; sniper holds mid angles and the
+			-- lurker freelances (their own rolls are the point of those roles).
+			if bot.role ~= "Sniper" and bot.role ~= "Lurker" then
+				bot.siteChoice = site
+			end
+		else -- Split
+			-- Carrier's group takes the called site; the rest pressure the other.
+			local withCarrier = MatchState.spikeCarrier == bot or bot.role == "Entry" or bot.role == "Support"
+			bot.siteChoice = if withCarrier then site else otherSite(site)
+		end
+	end
+
+	-- DEFENSE assignments
+	if defenseKind == "Standard" then
+		-- 2-1-2: anchors split A/B, IGL holds the window, sniper + support take
+		-- the two heavens.
+		local anchorIndex = 0
+		local sniperHeaven: string? = nil
+		for _, bot in ctx.defenders do
+			if bot.role == "Anchor" then
+				anchorIndex += 1
+				bot.holdChoice = if anchorIndex == 1 then "A_SITE" else "B_SITE"
+			elseif bot.role == "IGL" then
+				bot.holdChoice = "MID_WINDOW"
+			elseif bot.role == "Sniper" then
+				sniperHeaven = heavenOf(SITES[rng:NextInteger(1, 2)])
+				bot.holdChoice = sniperHeaven
+			end
+		end
+		for _, bot in ctx.defenders do
+			if bot.role == "Support" then
+				bot.holdChoice = if sniperHeaven == "A_HEAVEN" then "B_HEAVEN" else "A_HEAVEN"
+			end
+		end
+	elseif defenseKind == "Stack" then
+		for _, bot in ctx.defenders do
+			bot.holdChoice = if bot.role == "Sniper" then heavenOf(site) else site
+		end
+	else -- Aggro
+		for _, bot in ctx.defenders do
+			bot.holdChoice = DEF_FORWARD[rng:NextInteger(1, #DEF_FORWARD)]
+		end
+	end
+
+	-- The CALL lines: the broadcast-readable version of the plan
+	if attackKind == "Rush" then
+		print(("[CLUTCH] CALL ATK: RUSH %s — everyone, same door, right now"):format(siteLetter(site)))
+	elseif attackKind == "Default" then
+		print(("[CLUTCH] CALL ATK: default — core hits %s, sniper holds mid, lurker freelances"):format(siteLetter(site)))
+	else
+		print(("[CLUTCH] CALL ATK: split — carrier group %s, pressure %s"):format(siteLetter(site), siteLetter(otherSite(site))))
+	end
+	if defenseKind == "Standard" then
+		print("[CLUTCH] CALL DEF: standard 2-1-2 — anchors split, IGL on the window")
+	elseif defenseKind == "Stack" then
+		print(("[CLUTCH] CALL DEF: STACK %s — four bodies on one site"):format(siteLetter(site)))
+	else
+		print("[CLUTCH] CALL DEF: aggressive — forward holds, contest mid")
+	end
 end
 
 -- One watcher per bot per round. A death is final: kill feed, killer's kill
@@ -226,6 +334,7 @@ function RoundMachine.start(ctx: Ctx)
 			-- A random attacker carries, not the same nameplate every round
 			Objective.assignCarrier(ctx.attackers[ctx.rng:NextInteger(1, #ctx.attackers)])
 		end
+		rollTeamPlans(ctx) -- writes bot.siteChoice / bot.holdChoice before brains wake
 
 		-- BUY
 		MatchState.phase = "Buy"
