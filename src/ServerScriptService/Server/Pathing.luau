@@ -1,7 +1,7 @@
 --!strict
 -- Shared pathing helpers. Every bot movement goes through here.
 --
--- Hard-won lessons from playtests #1-#7:
+-- Hard-won lessons from playtests #1-#8:
 --   * The navmesh needs a beat to bake after the arena builds at runtime —
 --     ComputeAsync can fail on frame one. Retry with a short wait.
 --   * AgentCanJump must stay FALSE. With jumping enabled the pathfinder
@@ -15,6 +15,10 @@
 --     after proximity advance landed. MoveTo fires when the target CHANGES.
 --   * Measure progress on the horizontal plane. Ramps move bots vertically,
 --     and 3D distance to a waypoint on a deck above reads as "no progress".
+--   * AgentRadius 2.5 was too fat for the 6-stud short doors: the path
+--     computed fine, but the rig scraped the doorframe until the stuck timer
+--     gave up (the playtest #8 BLOCKED spam at the A Short door). 2.2 still
+--     keeps paths off corners without demanding centimeter-perfect threading.
 --   * Ten bots crowding one stud body-block each other. Sidestep + repath.
 --   * A walk must be INTERRUPTIBLE. Blocking until arrival meant a bot that
 --     spotted an enemy could not react until it finished walking, which is why
@@ -34,7 +38,7 @@ local TICK = 0.05
 
 local AGENT_PARAMS = {
 	AgentHeight = 5,
-	AgentRadius = 2.5, -- a touch wider than the rig: keeps paths off corners
+	AgentRadius = 2.2, -- 2.5 scraped the 6-stud short doors into stuck-loops
 	AgentCanJump = false, -- walk around cover, never hop it
 	WaypointSpacing = 4,
 }
