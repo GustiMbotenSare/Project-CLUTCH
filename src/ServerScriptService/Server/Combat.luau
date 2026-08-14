@@ -24,9 +24,13 @@
 --
 -- KILLS are reported two ways: the DOWN log line, and stamps on the victim's
 -- model (LastKilledBy / LastKillHeadshot / LastKillDistance / LastKillWeapon)
--- which the respawn watcher reads to fire the kill feed before the corpse is
--- destroyed. Lifetime K/D/HS live on the bot record and ride to the dashboard
--- as replicated attributes written by Telemetry.
+-- which the round machine's death watcher reads for the kill feed before the
+-- corpse is retired. Lifetime K/D/HS live on the bot record and ride to the
+-- dashboard as replicated attributes written by Telemetry.
+--
+-- GUNFIRE IS HEARD. Every burst stamps MatchState.lastShot; Perception turns
+-- that stamp into a SOUND contact for every enemy, so bots react to fire they
+-- cannot see — the rotate-toward-the-shots behavior playtest #9 was missing.
 
 local Debris = game:GetService("Debris")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -36,6 +40,7 @@ local SimConfig = require(Shared.Constants.SimConfig)
 local Scenario = require(Shared.Constants.Scenario)
 local Zones = require(Shared.MapData.Zones)
 local Perception = require(script.Parent.Perception)
+local MatchState = require(script.Parent.MatchState)
 
 local Combat = {}
 
@@ -279,6 +284,9 @@ function Combat.fireBurst(
 
 	local attributes = bot.attributes
 
+	-- Gunfire is a sound event: every enemy in the match hears this burst
+	MatchState.lastShot = { by = bot.name, pos = selfRoot.Position, at = clock() }
+
 	-- Reaction delay, paid once per fresh engagement rather than per shot
 	if state.engagedSince == nil then
 		state.engagedSince = clock()
@@ -367,8 +375,8 @@ function Combat.fireBurst(
 
 			if targetHumanoid.Health <= 0 then
 				bot.kills = (bot.kills or 0) + 1
-				-- Stamp the corpse. The respawn watcher reads these to fire the kill
-				-- feed before the body is destroyed and replaced.
+				-- Stamp the corpse. The round machine's death watcher reads these for
+				-- the kill feed before the body is retired at round's end.
 				targetModel:SetAttribute("LastKilledBy", bot.name)
 				targetModel:SetAttribute("LastKillHeadshot", isHead)
 				targetModel:SetAttribute("LastKillDistance", math.floor(distance))
