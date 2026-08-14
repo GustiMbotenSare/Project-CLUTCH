@@ -1,33 +1,31 @@
 --!strict
--- Bot brain v3: score every intent, commit to the winner, act on it — now with
--- the round in the loop. The brain reads MatchState, so intents can react to
--- the spike: carriers path to sites and PLANT, defenders collapse on a planted
--- site and DEFUSE, and a dropped spike is worth walking to.
+-- Bot brain v3.1: score every intent, commit to the winner, act on it — now
+-- with the round in the loop and survival instincts that actually fire.
 --
 -- Utility AI rather than a state machine, because a state machine hides its
--- reasoning. Here every tick produces a full score vector, and the log prints
--- it, so a bad decision can be traced to the term that caused it. That is the
--- entire reason this is readable at all.
---
--- Bots target ZONES and, since walks became interruptible, walk whole routes
--- instead of stopping at every zone boundary. Combat, a plant opportunity or
--- a defuse still cut a walk short.
+-- reasoning. Every tick produces a full score vector and the log prints it,
+-- so a bad decision can be traced to the term that caused it.
 --
 -- ---------------------------------------------------------------------------
--- Fixed after the first 1v1 transcript, all four found by reading the log:
---   * MID_BACK was in DEF_HOLDS. A defender treated a mid corridor as a valid
---     anchor, so Onyx stopped there permanently and never defended a site.
---   * Push scored 1.22 for an Entry attacker while nothing else could exceed
---     ~0.5. Ace was mathematically incapable of choosing another intent.
---   * Push had no terminal condition; the bot repositioned inside its own
---     objective forever. Push now excludes the current zone and is heavily
---     penalised when already on it.
---   * The stall ramp reset on every hop — a 25-second metronome. It now resets
---     only on a FINISHED goal or on contact.
--- Fixed after the second transcript:
---   * ROUTE COMMITMENT: boundary arrivals re-decided the next hop and churned
---     between neighbours. The brain commits to one intermediate zone until the
---     zone actually changes.
+-- Fixed after the first 1v1 transcript: MID_BACK is not an anchor; intent
+-- scores live in a comparable band; Push has a terminal condition; the stall
+-- ramp resets only on a finished goal or contact.
+-- Fixed after the second: ROUTE COMMITMENT — one intermediate zone until the
+-- zone actually changes, no boundary churn.
+-- Fixed after playtest #8:
+--   * ENGAGE BYPASSES HYSTERESIS. Push-with-carrier-bonus scored 0.94 while a
+--     forced Engage sat at 0.88 — under the 0.08 hysteresis margin Ace kept
+--     walking toward A Site while Onyx shot him five times. Being shot at now
+--     outranks momentum, exactly like it outranks the commitment gate.
+--   * STICKY SITE/ANCHOR PICKS. Both sites are 4 hops from both spawns, so
+--     "nearest" always resolved to A. Every round each bot rolls a site (ATK)
+--     or anchor (DEF) once and commits; RoundMachine clears the pick between
+--     rounds. Routes now vary.
+--   * PLANT RESPECTS A HOT SITE. A contact within 2 hops of the plant zone
+--     costs Plant 0.45 instead of 0.25 — clear first, plant after. And the
+--     channel itself aborts when an enemy becomes visible (see Objective).
+--   * Brains sleep during Buy/PostRound. Frozen bodies trying to path was the
+--     source of the between-round BLOCKED spam.
 -- ---------------------------------------------------------------------------
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -184,8 +182,8 @@ local function scoreEngage(ctx: Context): number
 	return ctx.assessment.score
 end
 
--- The carrier on a live round: get to a site, then put the spike down. Contact
--- makes planting a gamble — Engage can still outscore it and fight first.
+-- The carrier on a live round: get to a site, then put the spike down. A
+-- contact close to the site taxes the plant hard — clear first, plant after.
 local function scorePlant(ctx: Context): number
 	if ctx.side ~= "Attack" or MatchState.planted or MatchState.phase ~= "Live" then
 		return -1
@@ -198,7 +196,12 @@ local function scorePlant(ctx: Context): number
 		score += 0.55
 	end
 	if ctx.contact then
-		score -= 0.25
+		local hops = Zones.hops(ctx.zoneKey, ctx.contact.zoneKey)
+		if hops <= 2 then
+			score -= 0.45 -- the site is hot
+		else
+			score -= 0.15
+		end
 	end
 	return score
 end
@@ -285,14 +288,14 @@ local function pickLurkZone(ctx: Context, allyZones: { string }): string?
 	return best
 end
 
-local function resolveTarget(intent: string, ctx: Context, allyZones: { string }): string?
+local function resolveTarget(intent: string, ctx: Context, allyZones: { string }, rng: Random): string?
 	if intent == "Engage" then
 		return nil -- stand and fight
 	elseif intent == "Plant" then
 		if Zones.hasTag(ctx.zoneKey, "plant") then
 			return nil -- channel in place
 		end
-		return nearestOf(SITES, ctx.zoneKey)
+		return ctx.bot.siteChoice or nearestOf(SITES, ctx.zoneKey)
 	elseif intent == "Defuse" then
 		return MatchState.plantedZoneKey
 	elseif intent == "Rotate" then
@@ -303,9 +306,9 @@ local function resolveTarget(intent: string, ctx: Context, allyZones: { string }
 			if not MatchState.planted and MatchState.spikeCarrier == nil and MatchState.spikePart then
 				return Zones.keyAt(MatchState.spikePart.Position)
 			end
-			-- Excluding the current zone is what lets an attacker who already owns
-			-- A Site go looking on B instead of shuffling in place.
-			return nearestOf(SITES, ctx.zoneKey)
+			-- Both sites are 4 hops from spawn, so "nearest" always resolved to A.
+			-- The per-round sticky pick is what makes routes vary.
+			return ctx.bot.siteChoice or nearestOf(SITES, ctx.zoneKey)
 		end
 		return nearestOf(DEF_FORWARD, ctx.zoneKey)
 	elseif intent == "Lurk" then
@@ -317,7 +320,7 @@ local function resolveTarget(intent: string, ctx: Context, allyZones: { string }
 		if ctx.onAnchor then
 			return nil -- already somewhere worth holding
 		end
-		return nearestOf(DEF_HOLDS, ctx.zoneKey)
+		return ctx.bot.holdChoice or nearestOf(DEF_HOLDS, ctx.zoneKey)
 	end
 	if Zones.hasTag(ctx.zoneKey, "site") or Zones.hasTag(ctx.zoneKey, "choke") or Zones.hasTag(ctx.zoneKey, "heaven") then
 		return nil
@@ -381,12 +384,24 @@ function Brain.start(bot: any, side: string, enemies: { any }, allies: { any }, 
 			return interruptAnswer
 		end
 
+		-- A visible enemy also breaks plant/defuse channels (Objective polls this)
+		local function channelAbort(): boolean
+			return Perception.visibleContact(perception) ~= nil
+		end
+
 		task.wait(rng:NextNumber(0, SimConfig.DecisionTickSeconds * 4)) -- stagger
 
 		while model.Parent do
 			local alive = model:FindFirstChildOfClass("Humanoid")
 			if not alive or alive.Health <= 0 then
 				break
+			end
+
+			-- Frozen between phases: a body that cannot move must not path.
+			-- (Frozen-walk stalls were the between-round BLOCKED spam.)
+			if MatchState.phase ~= "Live" and MatchState.phase ~= "Planted" then
+				task.wait(0.5)
+				continue
 			end
 
 			local now = clock()
@@ -463,10 +478,14 @@ function Brain.start(bot: any, side: string, enemies: { any }, allies: { any }, 
 				scores[name] = SCORERS[name](ctx)
 			end
 
+			-- ENGAGE BYPASSES HYSTERESIS. A forced engage at 0.88 lost to a
+			-- 0.94 Push in playtest #8 and the bot walked into five bullets.
+			-- Getting shot at outranks momentum.
 			local winner = intent
 			local winnerScore = scores[intent]
 			for _, name in INTENTS do
-				if name ~= intent and scores[name] > winnerScore + HYSTERESIS then
+				local margin = if name == "Engage" then 0 else HYSTERESIS
+				if name ~= intent and scores[name] > winnerScore + margin then
 					winner = name
 					winnerScore = scores[name]
 				end
@@ -489,7 +508,29 @@ function Brain.start(bot: any, side: string, enemies: { any }, allies: { any }, 
 			intent = winner
 			Telemetry.setIntent(bot.name, intent)
 
-			local targetKey = resolveTarget(intent, ctx, allyZones)
+			-- Sticky per-round picks: same-site-every-round was a tie-break
+			-- accident, not a personality. RoundMachine clears these between rounds.
+			if side == "Attack" and bot.siteChoice == nil then
+				bot.siteChoice = SITES[rng:NextInteger(1, #SITES)]
+				if Scenario.VerboseBrain then
+					print(("[CLUTCH] %6.1fs  PLAN %s calls %s this round"):format(
+						clock(),
+						bot.name,
+						if Zones.byKey[bot.siteChoice] then Zones.byKey[bot.siteChoice].callout else bot.siteChoice
+					))
+				end
+			elseif side == "Defense" and bot.holdChoice == nil then
+				bot.holdChoice = DEF_HOLDS[rng:NextInteger(1, #DEF_HOLDS)]
+				if Scenario.VerboseBrain then
+					print(("[CLUTCH] %6.1fs  PLAN %s anchors %s this round"):format(
+						clock(),
+						bot.name,
+						if Zones.byKey[bot.holdChoice] then Zones.byKey[bot.holdChoice].callout else bot.holdChoice
+					))
+				end
+			end
+
+			local targetKey = resolveTarget(intent, ctx, allyZones, rng)
 
 			-- Print on change, and periodically even without one. A bot locked to a
 			-- single intent used to produce no reasoning output whatsoever.
@@ -551,14 +592,14 @@ function Brain.start(bot: any, side: string, enemies: { any }, allies: { any }, 
 			end
 
 			if intent == "Plant" and Zones.hasTag(currentKey, "plant") then
-				-- The channel itself is blocking and honest: damage, movement or
-				-- death cancel it inside Objective.
-				Objective.tryStartPlant(bot, clock)
+				-- Blocking channel; aborts on damage, movement, death — or a
+				-- visible enemy. Face the last known threat before crouching.
+				Objective.tryStartPlant(bot, clock, channelAbort, if contact then contact.pos else nil)
 				lastProgressAt = clock()
 			elseif intent == "Defuse" and currentKey == MatchState.plantedZoneKey and MatchState.spikePart then
 				local result = Pathing.walkToWithResult(model, MatchState.spikePart.Position, shouldInterrupt)
 				if result == "arrived" then
-					Objective.tryStartDefuse(bot, clock)
+					Objective.tryStartDefuse(bot, clock, channelAbort)
 				end
 				lastProgressAt = clock()
 			elseif intent ~= "Engage" then
