@@ -1,10 +1,10 @@
 --!strict
 -- Which scenario the server boots into, and how loudly it reports itself.
 --
--- Ten bots patrolling at once produced a log nobody could read. Two bots
--- produce a transcript. Duel1v1 exists so the brain can be AUDITED: every
--- perception event and every intent switch for exactly two actors, in order.
--- Switch to Full5v5 once the decisions look sane.
+-- Full5v5 is the default as of map v3: the duel produced a clean, auditable
+-- transcript (plants, defuses, economy, walk/sprint, angle holding) and the
+-- map is now built for ten. Duel1v1 remains the audit rig — flip Mode back
+-- whenever a change needs a two-actor transcript.
 
 export type Mode = "Duel1v1" | "Full5v5"
 
@@ -19,9 +19,9 @@ export type StatBlock = {
 }
 
 return {
-	Mode = "Duel1v1" :: Mode,
+	Mode = "Full5v5" :: Mode,
 
-	-- Who fights in Duel1v1.
+	-- Who fights in Duel1v1 (unused in Full5v5).
 	DuelAttacker = "Ace",
 	DuelDefender = "Onyx",
 
