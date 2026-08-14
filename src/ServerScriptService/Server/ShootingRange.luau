@@ -1,9 +1,9 @@
 --!strict
--- M0 spike (from the GDD): one bot paths to a target dummy and shoots it.
--- Exercises the full pipeline: navmesh pathing, line-of-sight perception,
--- attribute-driven reaction delay, flick overshoot + spray error, hitscan damage.
+-- M0 spike: one bot paths out and duels a target dummy.
+-- Exercises: navmesh pathing, LOS perception, attribute-driven reaction delay,
+-- flick overshoot + spray error, hitscan damage — with VISIBLE tracers.
 
-local PathfindingService = game:GetService("PathfindingService")
+local Debris = game:GetService("Debris")
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
@@ -11,12 +11,11 @@ local Shared = ReplicatedStorage:WaitForChild("Shared")
 local Weapons = require(Shared.Constants.Weapons)
 local SimConfig = require(Shared.Constants.SimConfig)
 
-local BotSpawner = require(script.Parent.BotSpawner)
-
-type BotRecord = BotSpawner.BotRecord
+local Pathing = require(script.Parent.Pathing)
 
 local DUMMY_POS = Vector3.new(0, 3, 30)
 local ENGAGE_POS = Vector3.new(0, 1, 38)
+local TRACER_LIFETIME = 0.09
 
 local ShootingRange = {}
 
@@ -38,24 +37,42 @@ local function spawnDummy(position: Vector3): Model
 	return model
 end
 
-local function pathTo(bot: Model, target: Vector3): boolean
-	local humanoid = bot:WaitForChild("Humanoid") :: Humanoid
-	local root = bot:WaitForChild("HumanoidRootPart") :: BasePart
+-- A gunshot you can SEE. Spectate-first means zero invisible damage, even in spikes.
+local function tracer(from: Vector3, to: Vector3)
+	local dist = (to - from).Magnitude
+	if dist < 0.1 then
+		return
+	end
+	local beam = Instance.new("Part")
+	beam.Name = "Tracer"
+	beam.Anchored = true
+	beam.CanCollide = false
+	beam.CanQuery = false
+	beam.CanTouch = false
+	beam.CastShadow = false
+	beam.Material = Enum.Material.Neon
+	beam.Color = Color3.fromRGB(255, 220, 120)
+	beam.Size = Vector3.new(0.08, 0.08, dist)
+	beam.CFrame = CFrame.lookAt((from + to) / 2, to)
+	beam.Parent = workspace
+	Debris:AddItem(beam, TRACER_LIFETIME)
+end
 
-	local path = PathfindingService:CreatePath({
-		AgentHeight = 5,
-		AgentRadius = 2,
-		AgentCanJump = true,
-	})
-	path:ComputeAsync(root.Position, target)
-	if path.Status ~= Enum.PathStatus.Success then
-		return false
-	end
-	for _, waypoint in ipairs(path:GetWaypoints()) do
-		humanoid:MoveTo(waypoint.Position)
-		humanoid.MoveToFinished:Wait()
-	end
-	return true
+local function hitSpark(at: Vector3)
+	local spark = Instance.new("Part")
+	spark.Name = "HitSpark"
+	spark.Shape = Enum.PartType.Ball
+	spark.Anchored = true
+	spark.CanCollide = false
+	spark.CanQuery = false
+	spark.CanTouch = false
+	spark.CastShadow = false
+	spark.Material = Enum.Material.Neon
+	spark.Color = Color3.fromRGB(255, 120, 60)
+	spark.Size = Vector3.new(0.4, 0.4, 0.4)
+	spark.CFrame = CFrame.new(at)
+	spark.Parent = workspace
+	Debris:AddItem(spark, 0.12)
 end
 
 local function hasLineOfSight(fromPos: Vector3, targetModel: Model, shooter: Model): boolean
@@ -70,7 +87,7 @@ local function hasLineOfSight(fromPos: Vector3, targetModel: Model, shooter: Mod
 	return result ~= nil and result.Instance:IsDescendantOf(targetModel)
 end
 
-function ShootingRange.run(shooterBot: BotRecord)
+function ShootingRange.run(shooterBot: any)
 	task.spawn(function()
 		local rng = Random.new()
 		local weapon = Weapons.FalconAR
@@ -87,7 +104,9 @@ function ShootingRange.run(shooterBot: BotRecord)
 			attrs.Reactions
 		))
 
-		pathTo(shooterBot.model, ENGAGE_POS)
+		if not Pathing.walkTo(shooterBot.model, ENGAGE_POS) then
+			warn(("[CLUTCH] %s never reached the range — check navmesh!"):format(shooterBot.name))
+		end
 
 		local head = shooterBot.model:WaitForChild("Head") :: BasePart
 
@@ -98,7 +117,7 @@ function ShootingRange.run(shooterBot: BotRecord)
 			end
 			local root = shooterBot.model:WaitForChild("HumanoidRootPart") :: BasePart
 			local closer = root.Position + (DUMMY_POS - root.Position).Unit * 4
-			pathTo(shooterBot.model, closer)
+			Pathing.walkTo(shooterBot.model, closer)
 		end
 
 		-- Reaction delay: Reactions=100 -> min delay, Reactions=1 -> base delay
@@ -137,7 +156,11 @@ function ShootingRange.run(shooterBot: BotRecord)
 			params.FilterDescendantsInstances = { shooterBot.model }
 			local result = workspace:Raycast(head.Position, aimPoint - head.Position, params)
 
+			-- Every shot is visible, hit or miss
+			tracer(head.Position, if result then result.Position else aimPoint)
+
 			if result and result.Instance:IsDescendantOf(dummy) then
+				hitSpark(result.Position)
 				local headshot = result.Instance.Name == "Head"
 				local damage = if headshot
 					then weapon.DamageBody * weapon.HeadshotMultiplier
