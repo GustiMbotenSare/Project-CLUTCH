@@ -4,9 +4,9 @@
 -- Buy (frozen, bots auto-spend) → Live (100s, brains on) → resolution by
 -- elimination, explosion, defuse or clock → PostRound (score, credits) →
 -- again. Deaths are FINAL inside a round: no respawns, so a kill costs the
--- victim the round, not three seconds. The spike is the attackers' second
--- win condition; defenders win by defusing, by wiping the attack before the
--- plant, or by the clock.
+-- victim the round, not three seconds. And per playtest #9, death also costs
+-- the victim its PRIMARY: die and you come back on the free Sidearm, like
+-- every tac shooter ever. Weapon drops on death are the tracked follow-up.
 --
 -- Also owns the economy (win/loss ladders, kill rewards, plant bonus), the
 -- body swapper (every round starts with pristine rigs at spawn), per-round
@@ -94,7 +94,7 @@ local function autoBuy(bot: any)
 	if bot.credits >= desired.Price then
 		bot.credits -= desired.Price
 		bot.weapon = desired
-		bot.inventory = (bot.inventory or bot.weapon.DisplayName) .. " + " .. desired.DisplayName
+		bot.inventory = (bot.inventory or Weapons.Sidearm.DisplayName) .. " + " .. desired.DisplayName
 		print(("[CLUTCH] BUY %s buys %s (-%d, %d cr left)"):format(
 			bot.name,
 			desired.DisplayName,
@@ -143,7 +143,8 @@ local function publish(ctx: Ctx)
 end
 
 -- One watcher per bot per round. A death is final: kill feed, killer's kill
--- reward, spike drop if the carrier fell, and that's it until next round.
+-- reward, spike drop if the carrier fell, the victim drops to the free pistol
+-- (bought primaries die with the body), and that's it until next round.
 local function watchDeaths(ctx: Ctx, roundId: number)
 	for _, bot in ctx.roster do
 		task.spawn(function()
@@ -168,6 +169,13 @@ local function watchDeaths(ctx: Ctx, roundId: number)
 						if killer then
 							killer.credits = clampCredits((killer.credits or 0) + RoundConfig.KillReward)
 						end
+					end
+					-- Death costs the primary. The corpse keeps nothing; the next
+					-- round starts on the standard pistol like every tac shooter.
+					if bot.weapon and bot.weapon.Class ~= "Pistol" then
+						print(("[CLUTCH] %s loses the %s"):format(bot.name, bot.weapon.DisplayName))
+						bot.weapon = Weapons.Sidearm
+						bot.inventory = Weapons.Sidearm.DisplayName
 					end
 					if MatchState.spikeCarrier == bot then
 						Objective.dropSpike(bot)
