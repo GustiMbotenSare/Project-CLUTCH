@@ -2,12 +2,25 @@
 -- Spawns bot players as real humanoid rigs (no rig assets needed —
 -- CreateHumanoidModelFromDescription gives us a clean R6 dummy per bot).
 -- Each bot gets attributes rolled from its role's weight template.
+--
+-- Bots never body-block EACH OTHER: they live in a collision group that
+-- doesn't self-collide. Five bots funneling one door otherwise jam exactly
+-- like players in a doorway, except bots can't negotiate it — that jam was
+-- the playtest #11 BLOCKED cluster at the B door throat. Bots still collide
+-- with the map, the spike, and the player.
 
 local Players = game:GetService("Players")
+local PhysicsService = game:GetService("PhysicsService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
 local Shared = ReplicatedStorage:WaitForChild("Shared")
 local Attributes = require(Shared.Constants.Attributes)
+
+local BOT_COLLISION_GROUP = "ClutchBots"
+pcall(function()
+	PhysicsService:RegisterCollisionGroup(BOT_COLLISION_GROUP)
+end)
+PhysicsService:CollisionGroupSetCollidable(BOT_COLLISION_GROUP, BOT_COLLISION_GROUP, false)
 
 export type BotRecord = {
 	name: string,
@@ -85,6 +98,14 @@ function BotSpawner.spawnBot(
 	local model = Players:CreateHumanoidModelFromDescription(description, Enum.HumanoidRigType.R6)
 	model.Name = name
 	model:PivotTo(CFrame.new(position))
+
+	-- No bot-on-bot collision (see header). Clones made by the round machine
+	-- inherit the group.
+	for _, inst in model:GetDescendants() do
+		if inst:IsA("BasePart") then
+			inst.CollisionGroup = BOT_COLLISION_GROUP
+		end
+	end
 
 	local tagColor = if side == "Attack"
 		then Color3.fromRGB(255, 150, 60)
