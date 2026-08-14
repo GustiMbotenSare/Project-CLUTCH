@@ -8,16 +8,17 @@
 -- actual object. No hidden state pretending to be a bomb.
 --
 -- Channels (plant 4s, defuse 7s) cancel on death, on moving off the spot, on
--- taking damage, and — since playtest #8 — on SPOTTING AN ENEMY. Planting
--- while someone is visibly swinging you is how bots die doing nothing; the
--- channel now takes an abort callback from the brain, and the brain passes
--- "an enemy is visible". The planter also FACES the last known threat before
--- crouching: planting with your back to the angle you were just contacted
--- from read as dumb, because it was.
+-- taking damage, and on SPOTTING AN ENEMY. Planting while someone is visibly
+-- swinging you is how bots die doing nothing.
 --
--- Pickup radius is a generous 7 studs (playtest #11): the carrier died in a
--- door throat and four attackers pathed to the zone but never quite within
--- the old 4-stud reach of it. Recovery should not require centimeter routing.
+-- Pickup radius is a generous 7 studs: recovery should not require
+-- centimeter routing.
+--
+-- THE FUSE CANNOT CANCEL ITSELF. explode() runs ON the fuse thread; a naive
+-- cancelFuse() inside it throws "cannot cancel thread" and — because that was
+-- the FIRST line of explode() — the whole function died before setting
+-- exploded. Playtest #12: the spike planted at 23s, the fuse errored at 67s,
+-- and the round soft-locked past 130s with the spike live forever.
 
 local Debris = game:GetService("Debris")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -48,11 +49,13 @@ local function rootOf(model: Model): BasePart?
 	return model:FindFirstChild("HumanoidRootPart") :: BasePart?
 end
 
+-- Never cancel the thread you are running on — explode() is called BY the
+-- fuse thread when the timer expires.
 local function cancelFuse()
-	if fuseThread then
+	if fuseThread and fuseThread ~= coroutine.running() then
 		task.cancel(fuseThread)
-		fuseThread = nil
 	end
+	fuseThread = nil
 end
 
 -- Round reset: no spike, no fuse, no planted state.
@@ -175,7 +178,7 @@ local function channel(bot: any, seconds: number, label: string, clock: () -> nu
 end
 
 local function explode(clock: () -> number)
-	cancelFuse()
+	cancelFuse() -- safe from the fuse thread itself now (see header)
 	MatchState.planted = false
 	MatchState.exploded = true
 
