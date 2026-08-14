@@ -1,35 +1,38 @@
 --!strict
--- Bot brain v3.3: score every intent, commit to the winner, act on it — with
--- the round in the loop, survival instincts that fire, two feet, and now
--- ANGLE HOLDING.
+-- Bot brain v3.4: score every intent, commit to the winner, act on it — with
+-- the round in the loop, survival instincts that fire, two feet, angle
+-- holding, and now FIGHT-OR-FLIGHT plus safe routing.
 --
 -- Utility AI rather than a state machine, because a state machine hides its
 -- reasoning. Every tick produces a full score vector and the log prints it,
 -- so a bad decision can be traced to the term that caused it.
 --
--- COVER POINTS (the 5v5 map): the greybox declares where each piece of cover
--- is used FROM and which way it watches. A holding bot no longer shuffles
--- randomly inside its zone — it picks the cover point facing the likeliest
--- threat, snaps to it, watches the line, and jiggle-peeks: step out, check,
--- step back. Peeking and angle holding, as designed. Attackers post-plant
--- flip the face direction — same cover, opposite watch.
---
--- WALK OR SPRINT: sprint when the coast is clear, shift-walk when contact is
--- fresh, when lurking, when post-plant, and in or entering a choke. The
--- footstep radius follows the mover's speed (Perception).
+-- New after playtest #11 (first 5v5):
+--   * FALLBACK, the "surrender" the user asked for: a bot that is ALONE with
+--     2+ fresh enemy contacts within 2 hops computes whether this fight is
+--     worth taking. Anchors and Snipers peel off readily; Entries need to be
+--     deeper in trouble; Aggression talks bots out of it. Falling back toward
+--     your own lobby with the spike beats donating it to a stacked site.
+--   * SAFE ROUTING: rotations no longer path through the enemy's spawn lobby
+--     (map v3 opened sites to the defender lobby, and the graph happily
+--     routed Rook through it). Deep enemy territory is off-limits for
+--     intermediate hops; the destination itself stays reachable.
+--   * CARRIER DISCIPLINE: the spike carrier alone with a fresh contact within
+--     2 hops of a site stops entry-fragging (Push −0.40). The spike leads
+--     nothing.
+--   * SPIKE RECOVERY walks to the spike itself (7-stud pickup), and the
+--     retrieve bonus collapses to +0.05 when the spike's zone is known-hot —
+--     cautiously, per the user's ask, not an instant five-man yolo.
+--   * Phase changes interrupt walks: the PostRound freeze used to trip the
+--     stuck timer into BLOCKED spam.
+--   * Corridor sampling fallback: door-throat destinations no longer default
+--     to the geometric center (a wall-adjacent, unpathable point that four
+--     bots converged on). Center-line samples toward the zone instead.
 --
 -- ---------------------------------------------------------------------------
--- Fixed after the first 1v1 transcript: MID_BACK is not an anchor; intent
--- scores live in a comparable band; Push has a terminal condition; the stall
--- ramp resets only on a finished goal or contact.
--- Fixed after the second: ROUTE COMMITMENT — one intermediate zone until the
--- zone actually changes, no boundary churn.
--- Fixed after playtest #8: ENGAGE BYPASSES HYSTERESIS; STICKY SITE/ANCHOR
--- PICKS (re-rolled per round); PLANT RESPECTS A HOT SITE; channels abort on a
--- visible enemy; brains sleep while frozen between phases.
--- Fixed after playtest #9: OBJECTIVES INTERRUPT WALKS (planted spike cuts a
--- defender's walk; a carrier on a plant zone stops to plant); Rotate +0.10
--- when the contact is on a site.
+-- History: v3.3 cover points / jiggle peek · v3.2 walk-sprint, objective
+-- interrupts · v3.1 engage hysteresis, sticky picks, hot-site plants · v3
+-- plant/defuse · v2 scoring bands, route commitment · v1 intent scorer.
 -- ---------------------------------------------------------------------------
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -54,19 +57,21 @@ local CANDIDATES = 6 -- standable-point attempts per destination
 local CLEARANCE_RADIUS = 2.6
 local GROUND_TOLERANCE = 2.5
 local ALLY_CROWD_STUDS = 25
--- Walk whole routes, not two-hop legs. Interrupts (combat, and now the spike)
--- still poll every 0.3s inside the walk, so long walks no longer mean slow
--- reactions — and the full stop at every zone boundary was pure jank.
+-- Walk whole routes, not two-hop legs. Interrupts (combat, the spike, phase
+-- changes) still poll every 0.3s inside the walk.
 local DIRECT_WALK_MAX_HOPS = 6
 local INTERRUPT_RECHECK = 0.3 -- seconds between interrupt polls mid-walk
 local FRESH_CONTACT_SECONDS = 6 -- contact newer than this means quiet feet
 local MAX_PEEKS = 3 -- jiggle-peeks per cover hold before re-deciding
+local ENEMY_NEAR_HOPS = 2 -- "in my area" for the fallback math
 
 -- Role priors. Kept in the same band as the situational terms on purpose: a
 -- role should bias a decision, never decide it outright.
 local HOLD_ROLE = { Anchor = 0.30, Sniper = 0.23, Support = 0.10, IGL = 0.07, Lurker = 0.03, Entry = 0.00 }
 local PUSH_ROLE = { Entry = 0.25, Support = 0.11, IGL = 0.08, Lurker = 0.06, Sniper = 0.03, Anchor = 0.00 }
 local LURK_ROLE = { Lurker = 0.30, Sniper = 0.09, Support = 0.03, IGL = 0.03, Entry = 0.00, Anchor = 0.00 }
+-- How willingly each role gives ground when outnumbered alone.
+local FALLBACK_ROLE = { Anchor = 0.15, Sniper = 0.10, IGL = 0.05, Support = 0.00, Lurker = -0.05, Entry = -0.20 }
 
 local SITES = { "A_SITE", "B_SITE" }
 
@@ -77,7 +82,19 @@ local ATK_FORWARD = { "MID", "MID_LEDGE", "A_LOBBY", "B_LOBBY", "A_ELBOW", "B_EL
 local DEF_FORWARD = { "MID", "MID_LEDGE", "MID_WINDOW", "A_SHORT", "B_SHORT" }
 local FLANKS = { "A_MAIN", "B_MAIN", "A_ELBOW", "B_ELBOW" }
 
-local INTENTS = { "Hold", "Push", "Rotate", "Lurk", "Engage", "Plant", "Defuse" }
+-- Deep enemy territory: fine as a DESTINATION, never as a corridor.
+local ENEMY_DEEP = {
+	Attack = { DEF_LOBBY = true, DEF_SPAWN = true },
+	Defense = { ATK_LOBBY = true, ATK_SPAWN = true, MID_COURT = true },
+}
+
+-- Where a falling-back bot regroups.
+local SAFE_ZONES = {
+	Attack = { "ATK_LOBBY", "MID_COURT", "ATK_SPAWN" },
+	Defense = { "DEF_LOBBY", "DEF_SPAWN" },
+}
+
+local INTENTS = { "Hold", "Push", "Rotate", "Lurk", "FallBack", "Engage", "Plant", "Defuse" }
 
 type Context = {
 	bot: any,
@@ -93,21 +110,72 @@ type Context = {
 	atObjective: boolean,
 	onAnchor: boolean,
 	alliesNear: number,
+	enemiesNear: number, -- fresh, within ENEMY_NEAR_HOPS
 }
 
 local function clamp01(n: number): number
 	return math.clamp(n, 0, 1)
 end
 
--- Nearest zone from a list, never the one we are standing in.
-local function nearestOf(keys: { string }, from: string): string?
+-- ---------------------------------------------------------------------------
+-- SAFE ROUTING. BFS over the zone graph that refuses to pass through deep
+-- enemy territory. The destination itself is exempt — rotating INTO the
+-- enemy's site is the job; strolling through their spawn lobby to get there
+-- was the playtest #11 bug.
+-- ---------------------------------------------------------------------------
+local function hopsSafe(from: string, to: string, side: string): number
+	if from == to then
+		return 0
+	end
+	local banned = ENEMY_DEEP[side]
+	local dist: { [string]: number } = { [from] = 0 }
+	local queue = { from }
+	local head = 1
+	while head <= #queue do
+		local current = queue[head]
+		head += 1
+		local zone = Zones.byKey[current]
+		if zone then
+			for _, nextKey in zone.adjacent do
+				if dist[nextKey] == nil and (not banned[nextKey] or nextKey == to) then
+					dist[nextKey] = dist[current] + 1
+					table.insert(queue, nextKey)
+				end
+			end
+		end
+	end
+	return dist[to] or math.huge
+end
+
+local function nextHopSafe(from: string, to: string, side: string): string?
+	if from == to then
+		return nil
+	end
+	local zone = Zones.byKey[from]
+	if not zone then
+		return nil
+	end
+	local best: string? = nil
+	local bestDist = math.huge
+	for _, neighbour in zone.adjacent do
+		local dist = hopsSafe(neighbour, to, side)
+		if dist < bestDist then
+			best = neighbour
+			bestDist = dist
+		end
+	end
+	return best
+end
+
+-- Nearest zone from a list by SAFE hops, never the one we are standing in.
+local function nearestOf(keys: { string }, from: string, side: string): string?
 	local best: string? = nil
 	local bestHops = math.huge
 	for _, key in keys do
 		if key == from then
 			continue
 		end
-		local hops = Zones.hops(from, key)
+		local hops = hopsSafe(from, key, side)
 		if hops < bestHops then
 			best = key
 			bestHops = hops
@@ -121,7 +189,7 @@ local function wantsWalk(intent: string, side: string, currentKey: string, route
 	if intent == "Engage" or intent == "Plant" or intent == "Defuse" then
 		return true -- fights and channels are careful by definition
 	end
-	if intent == "Lurk" then
+	if intent == "Lurk" or intent == "FallBack" then
 		return true -- quiet is the entire point
 	end
 	if contact and now - contact.seenAt < FRESH_CONTACT_SECONDS then
@@ -167,12 +235,20 @@ local function scorePush(ctx: Context): number
 		-- inside its own objective forever, which is exactly what Ace did.
 		score -= 0.65
 	end
-	-- The carrier's job is the site; a dropped spike is everyone's job.
 	if ctx.side == "Attack" and not MatchState.planted then
 		if MatchState.spikeCarrier == ctx.bot then
 			score += 0.15
+			-- CARRIER DISCIPLINE: alone with a fresh nearby contact, the spike
+			-- does not entry-frag. Let the team catch up.
+			if ctx.alliesNear == 0 and ctx.contact and Zones.hops(ctx.zoneKey, ctx.contact.zoneKey) <= ENEMY_NEAR_HOPS then
+				score -= 0.40
+			end
 		elseif MatchState.spikeCarrier == nil and MatchState.spikePart then
-			score += 0.20 -- go get it
+			-- Recovery — but cautiously: a spike in a known-hot zone is a trap
+			-- until proven otherwise.
+			local spikeZone = Zones.keyAt(MatchState.spikePart.Position)
+			local hot = ctx.contact and ctx.contact.zoneKey == spikeZone and ctx.contact.source == "sight"
+			score += if hot then 0.05 else 0.20
 		end
 	end
 	return score
@@ -204,6 +280,25 @@ local function scoreLurk(ctx: Context): number
 	if ctx.alliesNear >= 1 then
 		score -= 0.12 -- lurking in a group is not lurking
 	end
+	return score
+end
+
+-- FALLBACK: alone, outnumbered, and not chained to the objective. The
+-- survival instinct — retreat, regroup, rotate, or re-peek from a better
+-- angle instead of donating the round (or the spike) to a stacked site.
+local function scoreFallBack(ctx: Context): number
+	if ctx.enemiesNear < 2 or ctx.alliesNear > 0 then
+		return -1
+	end
+	if MatchState.planted then
+		return -1 -- the objective overrides survival: retake or die trying
+	end
+	if MatchState.spikeCarrier == ctx.bot and Zones.hasTag(ctx.zoneKey, "plant") then
+		return -1 -- on the site with the spike: plant duty, not retreat
+	end
+	local score = 0.30 + (ctx.enemiesNear - 1) * 0.25
+	score += FALLBACK_ROLE[ctx.role] or 0
+	score -= ctx.aggression * 0.30
 	return score
 end
 
@@ -257,14 +352,13 @@ local SCORERS: { [string]: (Context) -> number } = {
 	Push = scorePush,
 	Rotate = scoreRotate,
 	Lurk = scoreLurk,
+	FallBack = scoreFallBack,
 	Engage = scoreEngage,
 	Plant = scorePlant,
 	Defuse = scoreDefuse,
 }
 
--- Can a humanoid actually stand here? Sampling a zone rectangle blindly puts
--- destinations inside crates and off deck edges; every PATH FAILED in an earlier
--- playtest traced back to skipping this check.
+-- Can a humanoid actually stand here?
 local function isStandable(point: Vector3, ignore: Model): boolean
 	local params = RaycastParams.new()
 	params.FilterType = Enum.RaycastFilterType.Exclude
@@ -287,14 +381,34 @@ local function isStandable(point: Vector3, ignore: Model): boolean
 	return true
 end
 
-local function standablePointIn(key: string, rng: Random, ignore: Model): Vector3?
+-- Corridor-aware sampling: random points first, then center-LINE samples from
+-- the bot toward the zone's middle. The old fallback returned the geometric
+-- center — in a 12-stud door throat that's wall-adjacent and unpathable, and
+-- playtest #11 had four bots converge on exactly that point at B Door.
+local function standablePointIn(key: string, rng: Random, ignore: Model, fromPos: Vector3?): Vector3?
 	for _ = 1, CANDIDATES do
 		local candidate = Zones.samplePoint(key, rng)
 		if candidate and isStandable(candidate, ignore) then
 			return candidate
 		end
 	end
-	return Zones.center(key)
+	local center = Zones.center(key)
+	if not center then
+		return nil
+	end
+	if fromPos then
+		for _, t in { 0.25, 0.5, 0.75 } do
+			local point = fromPos + (center - fromPos) * t
+			point = Vector3.new(point.X, center.Y, point.Z)
+			if isStandable(point, ignore) then
+				return point
+			end
+		end
+	end
+	if isStandable(center, ignore) then
+		return center
+	end
+	return nil
 end
 
 -- The flank that maximises distance from every teammate.
@@ -324,8 +438,7 @@ end
 -- COVER. Pick the declared cover point in this zone whose watch direction best
 -- matches the threat: the freshest contact's zone if we have one, else the
 -- side's default axis (defenders watch south, post-plant attackers watch the
--- defender side — the declared face flips). Returns the point and the face
--- actually in use, or nil when nothing here faces the threat.
+-- defender side — the declared face flips).
 local function pickCoverPoint(ctx: Context): (any?, Vector3?)
 	local best: any = nil
 	local bestFace: Vector3? = nil
@@ -360,9 +473,8 @@ end
 
 -- HOLD THE ANGLE. Walk to the point, face the watch line, then jiggle-peek:
 -- step out perpendicular, check, step back. Returns when combat/objectives
--- interrupt, when a contact appears (the main loop re-scores into Engage or
--- Rotate), when the phase changes, or after MAX_PEEKS cycles. Returns true if
--- the bot actually reached and held the point (a finished goal for the ramp).
+-- interrupt, when a contact appears (the main loop re-scores), when the phase
+-- changes, or after MAX_PEEKS cycles. True if the bot actually held it.
 local function holdAngle(
 	bot: any,
 	model: Model,
@@ -401,7 +513,6 @@ local function holdAngle(
 	end
 
 	for _ = 1, MAX_PEEKS do
-		-- Hold the line, facing it, for a few seconds
 		local holdUntil = clock() + rng:NextNumber(2.5, 4)
 		while clock() < holdUntil do
 			if shouldInterrupt() then
@@ -422,7 +533,6 @@ local function holdAngle(
 		if not canPeek then
 			continue
 		end
-		-- The jiggle peek: out, check, back
 		if Pathing.walkToWithResult(model, peekPos, shouldInterrupt) ~= "arrived" then
 			return true
 		end
@@ -448,9 +558,11 @@ local function resolveTarget(intent: string, ctx: Context, allyZones: { string }
 		if Zones.hasTag(ctx.zoneKey, "plant") then
 			return nil -- channel in place
 		end
-		return ctx.bot.siteChoice or nearestOf(SITES, ctx.zoneKey)
+		return ctx.bot.siteChoice or nearestOf(SITES, ctx.zoneKey, ctx.side)
 	elseif intent == "Defuse" then
 		return MatchState.plantedZoneKey
+	elseif intent == "FallBack" then
+		return nearestOf(SAFE_ZONES[ctx.side], ctx.zoneKey, ctx.side)
 	elseif intent == "Rotate" then
 		return if ctx.contact then ctx.contact.zoneKey else nil
 	elseif intent == "Push" then
@@ -459,11 +571,9 @@ local function resolveTarget(intent: string, ctx: Context, allyZones: { string }
 			if not MatchState.planted and MatchState.spikeCarrier == nil and MatchState.spikePart then
 				return Zones.keyAt(MatchState.spikePart.Position)
 			end
-			-- Both sites are 4 hops from spawn, so "nearest" always resolved to A.
-			-- The per-round sticky pick is what makes routes vary.
-			return ctx.bot.siteChoice or nearestOf(SITES, ctx.zoneKey)
+			return ctx.bot.siteChoice or nearestOf(SITES, ctx.zoneKey, ctx.side)
 		end
-		return nearestOf(DEF_FORWARD, ctx.zoneKey)
+		return nearestOf(DEF_FORWARD, ctx.zoneKey, ctx.side)
 	elseif intent == "Lurk" then
 		return pickLurkZone(ctx, allyZones)
 	end
@@ -473,12 +583,12 @@ local function resolveTarget(intent: string, ctx: Context, allyZones: { string }
 		if ctx.onAnchor then
 			return nil -- already somewhere worth holding
 		end
-		return ctx.bot.holdChoice or nearestOf(DEF_HOLDS, ctx.zoneKey)
+		return ctx.bot.holdChoice or nearestOf(DEF_HOLDS, ctx.zoneKey, ctx.side)
 	end
 	if Zones.hasTag(ctx.zoneKey, "site") or Zones.hasTag(ctx.zoneKey, "choke") or Zones.hasTag(ctx.zoneKey, "heaven") then
 		return nil
 	end
-	return nearestOf(ATK_FORWARD, ctx.zoneKey)
+	return nearestOf(ATK_FORWARD, ctx.zoneKey, ctx.side)
 end
 
 local function formatScores(scores: { [string]: number }): string
@@ -517,8 +627,9 @@ function Brain.start(bot: any, side: string, enemies: { any }, allies: { any }, 
 		local lastThinkLogAt = -math.huge
 		local routeKey: string? = nil -- committed intermediate zone; see header
 
-		-- Cached interrupt predicate. Polled every pathing tick, so it must be
-		-- cheap; hasEyesOn casts rays, hence the recheck window.
+		-- Cached interrupt predicate. Combat, the objective, and now the PHASE
+		-- all cut a walk short — a frozen body mid-walk used to trip the stuck
+		-- timer into between-round BLOCKED spam.
 		local interruptCheckedAt = -math.huge
 		local interruptAnswer = false
 		local function shouldInterrupt(): boolean
@@ -528,15 +639,15 @@ function Brain.start(bot: any, side: string, enemies: { any }, allies: { any }, 
 			end
 			interruptCheckedAt = now
 			interruptAnswer = false
+			if MatchState.phase ~= "Live" and MatchState.phase ~= "Planted" then
+				return true -- frozen between phases: stop walking
+			end
 			local here = Zones.keyAt(Zones.groundOf(model))
 			local visible = Perception.visibleContact(perception)
 			if visible then
 				local assessment = Combat.assess(bot, weapon, visible, enemies, here, combatState, now)
 				interruptAnswer = assessment.engage
 			end
-			-- OBJECTIVES INTERRUPT WALKS. Until playtest #9 only combat could cut a
-			-- walk, so a defender kept strolling to the wrong site for seconds
-			-- after the spike went down, and a carrier walked PAST the plant zone.
 			if not interruptAnswer then
 				if MatchState.planted and side == "Defense" and intent ~= "Defuse" then
 					interruptAnswer = true
@@ -566,7 +677,6 @@ function Brain.start(bot: any, side: string, enemies: { any }, allies: { any }, 
 			end
 
 			-- Frozen between phases: a body that cannot move must not path.
-			-- (Frozen-walk stalls were the between-round BLOCKED spam.)
 			if MatchState.phase ~= "Live" and MatchState.phase ~= "Planted" then
 				task.wait(0.5)
 				continue
@@ -592,7 +702,7 @@ function Brain.start(bot: any, side: string, enemies: { any }, allies: { any }, 
 				Combat.disengage(combatState) -- next fight pays reaction cost again
 			end
 
-			-- A dropped spike is picked up by walking over it
+			-- A dropped spike is picked up by walking near it
 			if side == "Attack" and not MatchState.planted then
 				Objective.tryPickup(bot)
 			end
@@ -608,6 +718,10 @@ function Brain.start(bot: any, side: string, enemies: { any }, allies: { any }, 
 				if ally == bot or not ally.model.Parent then
 					continue
 				end
+				local allyHumanoid = ally.model:FindFirstChildOfClass("Humanoid")
+				if not allyHumanoid or allyHumanoid.Health <= 0 then
+					continue -- the dead do not count as company
+				end
 				local allyGround = Zones.groundOf(ally.model)
 				table.insert(allyZones, Zones.keyAt(allyGround))
 				if (allyGround - ground).Magnitude <= ALLY_CROWD_STUDS then
@@ -615,9 +729,18 @@ function Brain.start(bot: any, side: string, enemies: { any }, allies: { any }, 
 				end
 			end
 
-			-- Anti-stall. Deliberately NOT reset by ordinary walking: resetting on
-			-- every hop turned this into a metronome and produced a two-zone
-			-- ping-pong every 25 seconds.
+			-- Fresh, nearby, DISTINCT enemies — the fallback math's "2-3
+			-- movements in my area".
+			local enemiesNear = 0
+			for _, memoryContact in perception.memory do
+				if now - memoryContact.seenAt < FRESH_CONTACT_SECONDS
+					and Zones.hops(currentKey, memoryContact.zoneKey) <= ENEMY_NEAR_HOPS
+				then
+					enemiesNear += 1
+				end
+			end
+
+			-- Anti-stall. Deliberately NOT reset by ordinary walking.
 			local reference = math.max(lastProgressAt, perception.lastContactAt)
 			local decisiveness = clamp01((now - reference) / Scenario.StallRampSeconds)
 
@@ -639,6 +762,7 @@ function Brain.start(bot: any, side: string, enemies: { any }, allies: { any }, 
 				atObjective = atObjective,
 				onAnchor = table.find(DEF_HOLDS, currentKey) ~= nil,
 				alliesNear = alliesNear,
+				enemiesNear = enemiesNear,
 			}
 
 			local scores: { [string]: number } = {}
@@ -659,9 +783,14 @@ function Brain.start(bot: any, side: string, enemies: { any }, allies: { any }, 
 				end
 			end
 
-			-- Commitment stops intent chatter, but being shot at — or a live
-			-- objective — outranks it.
-			if winner ~= intent and winner ~= "Engage" and winner ~= "Plant" and winner ~= "Defuse" then
+			-- Commitment stops intent chatter, but being shot at, a live
+			-- objective — or a collapsing fight — outranks it.
+			if winner ~= intent
+				and winner ~= "Engage"
+				and winner ~= "Plant"
+				and winner ~= "Defuse"
+				and winner ~= "FallBack"
+			then
 				if now - committedAt < Scenario.MinIntentSeconds then
 					winner = intent
 				end
@@ -676,8 +805,10 @@ function Brain.start(bot: any, side: string, enemies: { any }, allies: { any }, 
 			intent = winner
 			Telemetry.setIntent(bot.name, intent)
 
-			-- Sticky per-round picks: same-site-every-round was a tie-break
-			-- accident, not a personality. RoundMachine clears these between rounds.
+			-- Sticky per-round picks — but the TEAM PLAN (RoundMachine) may have
+			-- assigned them already. The coin roll below only fires for the
+			-- freelancers a plan deliberately leaves open (sniper/lurker in a
+			-- Default, both sides pre-plan).
 			if side == "Attack" and bot.siteChoice == nil then
 				bot.siteChoice = SITES[rng:NextInteger(1, #SITES)]
 				if Scenario.VerboseBrain then
@@ -700,15 +831,12 @@ function Brain.start(bot: any, side: string, enemies: { any }, allies: { any }, 
 
 			local targetKey = resolveTarget(intent, ctx, allyZones, rng)
 
-			-- WALK OR SPRINT, decided per tick and applied to the humanoid. The
-			-- footstep radius follows the speed (Perception), so walking is both
-			-- the careful LOOK and the quiet CHOICE.
+			-- WALK OR SPRINT, decided per tick and applied to the humanoid.
 			local walking = wantsWalk(intent, side, currentKey, routeKey, contact, now)
 			bot.speedMode = if walking then "walk" else "sprint"
 			alive.WalkSpeed = if walking then SimConfig.WalkSpeed else SimConfig.SprintSpeed
 
-			-- Print on change, and periodically even without one. A bot locked to a
-			-- single intent used to produce no reasoning output whatsoever.
+			-- Print on change, and periodically even without one.
 			if Scenario.VerboseBrain and (switched or now - lastThinkLogAt >= Scenario.BrainHeartbeatSeconds) then
 				lastThinkLogAt = now
 				local transition = if switched then ("%s -> %s"):format(previous, intent) else ("%s (steady)"):format(intent)
@@ -789,21 +917,20 @@ function Brain.start(bot: any, side: string, enemies: { any }, allies: { any }, 
 							lastProgressAt = clock() -- holding the angle IS the finished goal
 						end
 					else
-						local spot = standablePointIn(currentKey, rng, model)
+						local spot = standablePointIn(currentKey, rng, model, ground)
 						if spot then
 							Pathing.walkToWithResult(model, spot, shouldInterrupt)
 						end
 						task.wait(rng:NextNumber(0.6, 1.4))
 					end
 				else
-					-- ROUTE COMMITMENT. The arrive radius lets a walk end just inside
-					-- the OLD zone; re-deciding from scratch then picked a different
-					-- neighbour and produced the A Site -> A Ramp -> A Site churn.
-					-- Commit to ONE intermediate zone until the zone actually changes.
+					-- ROUTE COMMITMENT: one intermediate zone until the zone actually
+					-- changes. Distances and hops are SAFE — deep enemy territory is
+					-- never a corridor (the Rook-through-defender-lobby fix).
 					if routeKey == nil then
-						local hops = Zones.hops(currentKey, targetKey)
+						local hops = hopsSafe(currentKey, targetKey, side)
 						routeKey = if hops > DIRECT_WALK_MAX_HOPS
-							then (Zones.nextHop(currentKey, targetKey) or targetKey)
+							then (nextHopSafe(currentKey, targetKey, side) or targetKey)
 							else targetKey
 					end
 
@@ -814,7 +941,24 @@ function Brain.start(bot: any, side: string, enemies: { any }, allies: { any }, 
 						end
 						routeKey = nil
 					else
-						local spot = standablePointIn(routeKey, rng, model)
+						-- Spike recovery walks to the SPIKE, not to a random sample of
+						-- the zone it fell in.
+						local retrieving = side == "Attack"
+							and not MatchState.planted
+							and MatchState.spikeCarrier == nil
+							and MatchState.spikePart ~= nil
+							and routeKey == Zones.keyAt(MatchState.spikePart.Position)
+						local spot
+						if retrieving then
+							local spikePos = MatchState.spikePart.Position
+							spot = Vector3.new(spikePos.X, 1, spikePos.Z)
+							if not isStandable(spot, model) then
+								spot = standablePointIn(routeKey, rng, model, ground)
+							end
+						else
+							spot = standablePointIn(routeKey, rng, model, ground)
+						end
+
 						if spot then
 							local result = Pathing.walkToWithResult(model, spot, shouldInterrupt)
 							if result == "failed" then
@@ -826,6 +970,7 @@ function Brain.start(bot: any, side: string, enemies: { any }, allies: { any }, 
 							-- "aborted" keeps routeKey too; Engage owns what happens next.
 						else
 							routeKey = nil
+							task.wait(SimConfig.DecisionTickSeconds)
 						end
 					end
 				end
