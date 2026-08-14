@@ -1,0 +1,281 @@
+--!strict
+-- Objective: the spike. Carry it, drop it, pick it up, plant it, defuse it,
+-- or watch it take the site and everyone standing on it.
+--
+-- The spike is a real workspace part — a small red neon ball welded above the
+-- carrier's head, dropped where the carrier died, planted where the planter
+-- stood. Bots reason about its position through zones; spectators see an
+-- actual object. No hidden state pretending to be a bomb.
+--
+-- Channels (plant 4s, defuse 7s) cancel on death, on moving off the spot, or
+-- on taking damage — the three honest interruptions. The fuse is real: once
+-- planted, somebody defuses or the site explodes.
+
+local Debris = game:GetService("Debris")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Shared = ReplicatedStorage:WaitForChild("Shared")
+
+local Zones = require(Shared.MapData.Zones)
+local RoundConfig = require(Shared.Constants.RoundConfig)
+
+local MatchState = require(script.Parent.MatchState)
+
+local Objective = {}
+
+local PICKUP_RADIUS = 4
+local DEFUSE_RADIUS = 7
+local CHANNEL_MOVE_TOLERANCE = 2.5
+local EXPLOSION_RADIUS = 30
+local EXPLOSION_DAMAGE = 500
+
+local fuseThread: thread? = nil
+
+local function planarDistance(a: Vector3, b: Vector3): number
+	local dx = a.X - b.X
+	local dz = a.Z - b.Z
+	return math.sqrt(dx * dx + dz * dz)
+end
+
+local function rootOf(model: Model): BasePart?
+	return model:FindFirstChild("HumanoidRootPart") :: BasePart?
+end
+
+local function cancelFuse()
+	if fuseThread then
+		task.cancel(fuseThread)
+		fuseThread = nil
+	end
+end
+
+-- Round reset: no spike, no fuse, no planted state.
+function Objective.reset()
+	cancelFuse()
+	if MatchState.spikePart then
+		MatchState.spikePart:Destroy()
+	end
+	MatchState.spikePart = nil
+	MatchState.spikeCarrier = nil
+	MatchState.planted = false
+	MatchState.plantedZoneKey = nil
+	MatchState.defused = false
+	MatchState.exploded = false
+end
+
+local function makeSpike(): Part
+	local spike = Instance.new("Part")
+	spike.Name = "Spike"
+	spike.Shape = Enum.PartType.Ball
+	spike.Size = Vector3.new(1.4, 1.4, 1.4)
+	spike.Material = Enum.Material.Neon
+	spike.Color = Color3.fromRGB(255, 60, 60)
+	spike.CanCollide = false
+	spike.CanQuery = false
+	spike.Massless = true
+	return spike
+end
+
+-- Weld rides above the carrier's head — the duel's most readable prop.
+function Objective.assignCarrier(bot: any)
+	local root = rootOf(bot.model)
+	if not root then
+		return
+	end
+	local spike = makeSpike()
+	spike.CFrame = root.CFrame * CFrame.new(0, 2.8, 0)
+	spike.Parent = workspace
+	local weld = Instance.new("WeldConstraint")
+	weld.Part0 = spike
+	weld.Part1 = root
+	weld.Parent = spike
+	MatchState.spikePart = spike
+	MatchState.spikeCarrier = bot
+end
+
+-- Carrier died (or planted handled elsewhere): leave the spike where it fell.
+function Objective.dropSpike(bot: any)
+	local spike = MatchState.spikePart
+	if not spike or MatchState.spikeCarrier ~= bot then
+		return
+	end
+	local weld = spike:FindFirstChildOfClass("WeldConstraint")
+	if weld then
+		weld:Destroy()
+	end
+	local ground = Zones.groundOf(bot.model)
+	spike.Anchored = true
+	spike.Position = Vector3.new(ground.X, ground.Y + 0.7, ground.Z)
+	MatchState.spikeCarrier = nil
+	print(("[CLUTCH] %s dropped the spike at %s"):format(
+		bot.name,
+		if Zones.byKey[Zones.keyAt(ground)] then Zones.byKey[Zones.keyAt(ground)].callout else "unknown ground"
+	))
+end
+
+-- An attacker walking over a dropped spike picks it up.
+function Objective.tryPickup(bot: any): boolean
+	local spike = MatchState.spikePart
+	if not spike or MatchState.spikeCarrier ~= nil or MatchState.planted then
+		return false
+	end
+	local root = rootOf(bot.model)
+	if not root or planarDistance(root.Position, spike.Position) > PICKUP_RADIUS then
+		return false
+	end
+	spike.Anchored = false
+	spike.CFrame = root.CFrame * CFrame.new(0, 2.8, 0)
+	local weld = Instance.new("WeldConstraint")
+	weld.Part0 = spike
+	weld.Part1 = root
+	weld.Parent = spike
+	MatchState.spikeCarrier = bot
+	print(("[CLUTCH] %s recovered the spike"):format(bot.name))
+	return true
+end
+
+-- The honest channel: standing still, alive, unhurt. Anything else cancels.
+local function channel(bot: any, seconds: number, label: string, clock: () -> number): boolean
+	local humanoid = bot.model:FindFirstChildOfClass("Humanoid")
+	local root = rootOf(bot.model)
+	if not humanoid or not root then
+		return false
+	end
+	local startPos = root.Position
+	local startHealth = humanoid.Health
+	local startedAt = clock()
+	while clock() - startedAt < seconds do
+		if humanoid.Health <= 0 or not bot.model.Parent then
+			return false
+		end
+		if humanoid.Health < startHealth - 0.01 then
+			print(("[CLUTCH] %s %s cancelled — took damage"):format(bot.name, label))
+			return false
+		end
+		if (root.Position - startPos).Magnitude > CHANNEL_MOVE_TOLERANCE then
+			print(("[CLUTCH] %s %s cancelled — moved off the spot"):format(bot.name, label))
+			return false
+		end
+		task.wait(0.1)
+	end
+	return true
+end
+
+local function explode(clock: () -> number)
+	cancelFuse()
+	MatchState.planted = false
+	MatchState.exploded = true
+
+	local spike = MatchState.spikePart
+	local at = if spike then spike.Position else Vector3.zero
+
+	local flash = Instance.new("Part")
+	flash.Shape = Enum.PartType.Ball
+	flash.Anchored = true
+	flash.CanCollide = false
+	flash.Material = Enum.Material.Neon
+	flash.Color = Color3.fromRGB(255, 160, 60)
+	flash.Size = Vector3.new(EXPLOSION_RADIUS, EXPLOSION_RADIUS, EXPLOSION_RADIUS)
+	flash.Transparency = 0.35
+	flash.CFrame = CFrame.new(at)
+	flash.Parent = workspace
+	Debris:AddItem(flash, 0.6)
+
+	for _, model in workspace:GetChildren() do
+		if model:IsA("Model") and model:GetAttribute("ClutchBot") == true then
+			local root = rootOf(model)
+			local humanoid = model:FindFirstChildOfClass("Humanoid")
+			if root and humanoid and humanoid.Health > 0 and (root.Position - at).Magnitude <= EXPLOSION_RADIUS then
+				model:SetAttribute("LastKilledBy", "THE SPIKE")
+				model:SetAttribute("LastKillHeadshot", false)
+				model:SetAttribute("LastKillDistance", math.floor((root.Position - at).Magnitude))
+				model:SetAttribute("LastKillWeapon", "Spike")
+				humanoid:TakeDamage(EXPLOSION_DAMAGE)
+			end
+		end
+	end
+
+	print(("[CLUTCH] %6.1fs  EXPLODED — the spike takes the site"):format(clock()))
+end
+
+-- Carrier standing on a plant zone commits to the full 4 seconds.
+function Objective.tryStartPlant(bot: any, clock: () -> number): boolean
+	if MatchState.phase ~= "Live" or MatchState.planted then
+		return false
+	end
+	if MatchState.spikeCarrier ~= bot then
+		return false
+	end
+	local ground = Zones.groundOf(bot.model)
+	local zoneKey = Zones.keyAt(ground)
+	if not Zones.hasTag(zoneKey, "plant") then
+		return false
+	end
+
+	local zone = Zones.byKey[zoneKey]
+	print(("[CLUTCH] %6.1fs  PLANT %s is planting at %s…"):format(
+		clock(),
+		bot.name,
+		if zone then zone.callout else zoneKey
+	))
+
+	if not channel(bot, RoundConfig.PlantSeconds, "plant", clock) then
+		return false
+	end
+
+	-- The spike stays where the planter stood
+	local spike = MatchState.spikePart
+	if spike then
+		local weld = spike:FindFirstChildOfClass("WeldConstraint")
+		if weld then
+			weld:Destroy()
+		end
+		spike.Anchored = true
+		spike.Position = Vector3.new(ground.X, ground.Y + 0.7, ground.Z)
+	end
+	MatchState.spikeCarrier = nil
+	MatchState.planted = true
+	MatchState.plantedZoneKey = zoneKey
+	MatchState.plantedAt = clock()
+	MatchState.phase = "Planted"
+	print(("[CLUTCH] %6.1fs  PLANTED at %s — %ds fuse"):format(
+		clock(),
+		if zone then zone.callout else zoneKey,
+		RoundConfig.SpikeFuseSeconds
+	))
+
+	fuseThread = task.spawn(function()
+		task.wait(RoundConfig.SpikeFuseSeconds)
+		if MatchState.planted then
+			explode(clock)
+		end
+	end)
+	return true
+end
+
+-- Defender next to a planted spike commits to the full 7 seconds.
+function Objective.tryStartDefuse(bot: any, clock: () -> number): boolean
+	if not MatchState.planted then
+		return false
+	end
+	local spike = MatchState.spikePart
+	local root = rootOf(bot.model)
+	if not spike or not root or planarDistance(root.Position, spike.Position) > DEFUSE_RADIUS then
+		return false
+	end
+
+	print(("[CLUTCH] %6.1fs  DEFUSE %s is defusing…"):format(clock(), bot.name))
+
+	if not channel(bot, RoundConfig.DefuseSeconds, "defuse", clock) then
+		return false
+	end
+	if not MatchState.planted then
+		return false -- it went off mid-channel
+	end
+
+	cancelFuse()
+	MatchState.planted = false
+	MatchState.defused = true
+	print(("[CLUTCH] %6.1fs  DEFUSED — %s saves the site"):format(clock(), bot.name))
+	return true
+end
+
+return Objective
