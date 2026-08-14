@@ -11,8 +11,8 @@
 --
 -- A third consumer arrived with the spectator dashboard: the CLIENT. Every
 -- sample also stamps the bot's model with replicated attributes (zone callout,
--- live intent, alive flag, K/D/HS, credits, inventory), so the HUD can poll
--- plain attributes and never needs its own remote traffic.
+-- live intent, alive flag, K/D/HS, credits, inventory, walk/sprint mode), so
+-- the HUD can poll plain attributes and never needs its own remote traffic.
 --
 -- RESPAWN-SAFE: the sample loop re-reads bot.model every tick. The round
 -- machine replaces bodies wholesale between rounds, and a loop that captured
@@ -181,6 +181,7 @@ function Telemetry.attach(bot: any, side: string)
 			model:SetAttribute("Headshots", bot.headshots or 0)
 			model:SetAttribute("Credits", bot.credits or 0)
 			model:SetAttribute("Inventory", bot.inventory or "?")
+			model:SetAttribute("Speed", bot.speedMode or "walk")
 
 			task.wait(Scenario.TelemetrySampleSeconds)
 		end
