@@ -1,16 +1,22 @@
 --!strict
--- Bot brain v3.2: score every intent, commit to the winner, act on it — with
--- the round in the loop, survival instincts that fire, and two feet.
+-- Bot brain v3.3: score every intent, commit to the winner, act on it — with
+-- the round in the loop, survival instincts that fire, two feet, and now
+-- ANGLE HOLDING.
 --
 -- Utility AI rather than a state machine, because a state machine hides its
 -- reasoning. Every tick produces a full score vector and the log prints it,
 -- so a bad decision can be traced to the term that caused it.
 --
--- WALK OR SPRINT (playtest #9): bots were permanently at full tilt, which is
--- both loud and reads as reckless. Now: sprint when the coast is clear,
--- shift-walk when contact is fresh, when lurking, when post-plant, and when
--- in or entering a choke — "checking the door" is a speed, and the footstep
--- radius follows it (Perception). The dashboard shows the current mode.
+-- COVER POINTS (the 5v5 map): the greybox declares where each piece of cover
+-- is used FROM and which way it watches. A holding bot no longer shuffles
+-- randomly inside its zone — it picks the cover point facing the likeliest
+-- threat, snaps to it, watches the line, and jiggle-peeks: step out, check,
+-- step back. Peeking and angle holding, as designed. Attackers post-plant
+-- flip the face direction — same cover, opposite watch.
+--
+-- WALK OR SPRINT: sprint when the coast is clear, shift-walk when contact is
+-- fresh, when lurking, when post-plant, and in or entering a choke. The
+-- footstep radius follows the mover's speed (Perception).
 --
 -- ---------------------------------------------------------------------------
 -- Fixed after the first 1v1 transcript: MID_BACK is not an anchor; intent
@@ -18,21 +24,12 @@
 -- ramp resets only on a finished goal or contact.
 -- Fixed after the second: ROUTE COMMITMENT — one intermediate zone until the
 -- zone actually changes, no boundary churn.
--- Fixed after playtest #8:
---   * ENGAGE BYPASSES HYSTERESIS — a forced Engage lost to Push momentum and
---     Ace walked into five bullets without returning fire.
---   * STICKY SITE/ANCHOR PICKS — both sites tie at 4 hops, so "nearest" was
---     always A. Each bot rolls a site/anchor per round; RoundMachine clears it.
---   * PLANT RESPECTS A HOT SITE (contact within 2 hops costs Plant 0.45), and
---     channels abort when an enemy becomes visible (see Objective).
---   * Brains sleep while frozen between phases (the between-round BLOCKED spam).
--- Fixed after playtest #9:
---   * OBJECTIVES INTERRUPT WALKS. The defuse-collapse only fired after the
---     current walk finished, so a defender kept walking to the wrong site for
---     seconds after the plant. shouldInterrupt now also trips on a planted
---     spike (defenders) and on a carrier standing on a plant zone.
---   * Rotate gets +0.10 when the contact is ON a site — "they're hitting B"
---     is a stronger pull than a random footstep.
+-- Fixed after playtest #8: ENGAGE BYPASSES HYSTERESIS; STICKY SITE/ANCHOR
+-- PICKS (re-rolled per round); PLANT RESPECTS A HOT SITE; channels abort on a
+-- visible enemy; brains sleep while frozen between phases.
+-- Fixed after playtest #9: OBJECTIVES INTERRUPT WALKS (planted spike cuts a
+-- defender's walk; a carrier on a plant zone stops to plant); Rotate +0.10
+-- when the contact is on a site.
 -- ---------------------------------------------------------------------------
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -41,6 +38,7 @@ local Shared = ReplicatedStorage:WaitForChild("Shared")
 local SimConfig = require(Shared.Constants.SimConfig)
 local Scenario = require(Shared.Constants.Scenario)
 local Zones = require(Shared.MapData.Zones)
+local Greybox = require(Shared.MapData.Greybox)
 
 local Pathing = require(script.Parent.Pathing)
 local Perception = require(script.Parent.Perception)
@@ -62,6 +60,7 @@ local ALLY_CROWD_STUDS = 25
 local DIRECT_WALK_MAX_HOPS = 6
 local INTERRUPT_RECHECK = 0.3 -- seconds between interrupt polls mid-walk
 local FRESH_CONTACT_SECONDS = 6 -- contact newer than this means quiet feet
+local MAX_PEEKS = 3 -- jiggle-peeks per cover hold before re-deciding
 
 -- Role priors. Kept in the same band as the situational terms on purpose: a
 -- role should bias a decision, never decide it outright.
@@ -320,6 +319,126 @@ local function pickLurkZone(ctx: Context, allyZones: { string }): string?
 		end
 	end
 	return best
+end
+
+-- COVER. Pick the declared cover point in this zone whose watch direction best
+-- matches the threat: the freshest contact's zone if we have one, else the
+-- side's default axis (defenders watch south, post-plant attackers watch the
+-- defender side — the declared face flips). Returns the point and the face
+-- actually in use, or nil when nothing here faces the threat.
+local function pickCoverPoint(ctx: Context): (any?, Vector3?)
+	local best: any = nil
+	local bestFace: Vector3? = nil
+	local bestScore = -0.2 -- below this the angle watches the wrong way entirely
+	for _, point in Greybox.coverPoints do
+		if point.zone ~= ctx.zoneKey then
+			continue
+		end
+		local face = if ctx.side == "Attack" and MatchState.planted then -point.face else point.face
+		face = Vector3.new(face.X, 0, face.Z).Unit
+		local threatDir: Vector3
+		if ctx.contact then
+			local contactCenter = Zones.center(ctx.contact.zoneKey)
+			if contactCenter then
+				threatDir = (contactCenter - point.pos) * Vector3.new(1, 0, 1)
+				threatDir = if threatDir.Magnitude > 0.1 then threatDir.Unit else Vector3.zAxis
+			else
+				threatDir = if ctx.side == "Defense" then Vector3.zAxis else -Vector3.zAxis
+			end
+		else
+			threatDir = if ctx.side == "Defense" then Vector3.zAxis else -Vector3.zAxis
+		end
+		local score = face:Dot(threatDir) + (if point.kind == "partial" then 0.10 else 0)
+		if score > bestScore then
+			best = point
+			bestFace = face
+			bestScore = score
+		end
+	end
+	return best, bestFace
+end
+
+-- HOLD THE ANGLE. Walk to the point, face the watch line, then jiggle-peek:
+-- step out perpendicular, check, step back. Returns when combat/objectives
+-- interrupt, when a contact appears (the main loop re-scores into Engage or
+-- Rotate), when the phase changes, or after MAX_PEEKS cycles. Returns true if
+-- the bot actually reached and held the point (a finished goal for the ramp).
+local function holdAngle(
+	bot: any,
+	model: Model,
+	cover: any,
+	faceDir: Vector3,
+	shouldInterrupt: () -> boolean,
+	perception: any,
+	rng: Random,
+	clock: () -> number
+): boolean
+	if not isStandable(cover.pos, model) then
+		return false
+	end
+	local result = Pathing.walkToWithResult(model, cover.pos, shouldInterrupt)
+	if result ~= "arrived" then
+		return false
+	end
+
+	local root = model:FindFirstChild("HumanoidRootPart") :: BasePart?
+	local perp = Vector3.new(-faceDir.Z, 0, faceDir.X)
+	local peekDistance = if cover.kind == "partial" then 4 else 5
+	local peekPos = cover.pos + perp * peekDistance
+	if not isStandable(peekPos, model) then
+		peekPos = cover.pos - perp * peekDistance
+	end
+	local canPeek = isStandable(peekPos, model)
+
+	if Scenario.VerboseBrain then
+		local watchProbe = Zones.calloutAt(cover.pos + faceDir * 20)
+		print(("[CLUTCH] %6.1fs  ANGLE %s holds %s, watching %s"):format(
+			clock(),
+			bot.name,
+			cover.name,
+			watchProbe
+		))
+	end
+
+	for _ = 1, MAX_PEEKS do
+		-- Hold the line, facing it, for a few seconds
+		local holdUntil = clock() + rng:NextNumber(2.5, 4)
+		while clock() < holdUntil do
+			if shouldInterrupt() then
+				return true
+			end
+			if Perception.visibleContact(perception) then
+				return true -- contact: the main loop owns the fight
+			end
+			if MatchState.phase ~= "Live" and MatchState.phase ~= "Planted" then
+				return true
+			end
+			if root then
+				root.CFrame = CFrame.lookAt(root.Position, root.Position + faceDir)
+			end
+			task.wait(0.25)
+		end
+
+		if not canPeek then
+			continue
+		end
+		-- The jiggle peek: out, check, back
+		if Pathing.walkToWithResult(model, peekPos, shouldInterrupt) ~= "arrived" then
+			return true
+		end
+		local checkUntil = clock() + 0.7
+		while clock() < checkUntil do
+			if shouldInterrupt() then
+				return true
+			end
+			if Perception.visibleContact(perception) then
+				return true
+			end
+			task.wait(0.15)
+		end
+		Pathing.walkToWithResult(model, cover.pos, shouldInterrupt)
+	end
+	return true
 end
 
 local function resolveTarget(intent: string, ctx: Context, allyZones: { string }, rng: Random): string?
@@ -661,14 +780,21 @@ function Brain.start(bot: any, side: string, enemies: { any }, allies: { any }, 
 				lastProgressAt = clock()
 			elseif intent ~= "Engage" then
 				if targetKey == nil or targetKey == currentKey then
-					-- Settle into the zone we already want to be in. Short dwell: the
-					-- old 1.5-3.5s wait read as aimless shuffling.
+					-- Settle the zone. With declared cover, HOLD THE ANGLE instead of
+					-- shuffling: snap to the point facing the threat and jiggle-peek.
 					routeKey = nil
-					local spot = standablePointIn(currentKey, rng, model)
-					if spot then
-						Pathing.walkToWithResult(model, spot, shouldInterrupt)
+					local cover, faceDir = pickCoverPoint(ctx)
+					if cover and faceDir then
+						if holdAngle(bot, model, cover, faceDir, shouldInterrupt, perception, rng, clock) then
+							lastProgressAt = clock() -- holding the angle IS the finished goal
+						end
+					else
+						local spot = standablePointIn(currentKey, rng, model)
+						if spot then
+							Pathing.walkToWithResult(model, spot, shouldInterrupt)
+						end
+						task.wait(rng:NextNumber(0.6, 1.4))
 					end
-					task.wait(rng:NextNumber(0.6, 1.4))
 				else
 					-- ROUTE COMMITMENT. The arrive radius lets a walk end just inside
 					-- the OLD zone; re-deciding from scratch then picked a different
