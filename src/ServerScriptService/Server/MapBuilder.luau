@@ -14,7 +14,19 @@ local function buildPart(spec: Greybox.PartSpec): Part
 	part.Name = spec.name
 	part.Anchored = true
 	part.Size = spec.size
-	part.CFrame = CFrame.new(spec.pos)
+
+	-- Rotation is optional and only used by ramps. Euler degrees -> CFrame.
+	local cf = CFrame.new(spec.pos)
+	if spec.rot then
+		cf = cf
+			* CFrame.Angles(
+				math.rad(spec.rot.X),
+				math.rad(spec.rot.Y),
+				math.rad(spec.rot.Z)
+			)
+	end
+	part.CFrame = cf
+
 	part.Color = spec.color or Color3.fromRGB(110, 110, 120)
 	part.Material = Enum.Material.SmoothPlastic
 	part.TopSurface = Enum.SurfaceType.Smooth
@@ -32,7 +44,11 @@ function MapBuilder.build(mapSpec: Greybox.MapSpec): Folder
 	local arena = Instance.new("Folder")
 	arena.Name = "Arena"
 
+	local rampCount = 0
 	for _, spec in ipairs(mapSpec.parts) do
+		if spec.rot then
+			rampCount += 1
+		end
 		buildPart(spec).Parent = arena
 	end
 
@@ -51,7 +67,12 @@ function MapBuilder.build(mapSpec: Greybox.MapSpec): Folder
 	end
 
 	arena.Parent = workspace
-	print(("[CLUTCH] arena built: %d parts, %d plant zones"):format(#mapSpec.parts, #mapSpec.plantZones))
+	print(("[CLUTCH] arena built: %d parts (%d ramps), %d plant zones, %d POIs"):format(
+		#mapSpec.parts,
+		rampCount,
+		#mapSpec.plantZones,
+		#mapSpec.pois
+	))
 	return arena
 end
 
