@@ -11,12 +11,14 @@
 --
 -- A third consumer arrived with the spectator dashboard: the CLIENT. Every
 -- sample also stamps the bot's model with replicated attributes (zone callout,
--- live intent, alive flag, K/D/HS, credits), so the HUD can poll plain
--- attributes and never needs its own remote traffic.
+-- live intent, alive flag, K/D/HS, credits, inventory), so the HUD can poll
+-- plain attributes and never needs its own remote traffic.
 --
 -- RESPAWN-SAFE: the sample loop re-reads bot.model every tick. The round
 -- machine replaces bodies wholesale between rounds, and a loop that captured
--- the old model would go blind at the first reset.
+-- the old model would go blind at the first reset. The swap teleports the bot
+-- ~100 studs between samples — jumps over 25 studs are suppressed as MOVE
+-- lines, because "A Site -> Attacker Spawn" is a body swap, not a rotation.
 --
 -- Dwell time is the first honest diagnostic for "are these bots using the map,
 -- or pacing one corner".
@@ -26,6 +28,8 @@ local Shared = ReplicatedStorage:WaitForChild("Shared")
 
 local Zones = require(Shared.MapData.Zones)
 local Scenario = require(Shared.Constants.Scenario)
+
+local TELEPORT_STUDS = 25 -- a jump this large between samples is a body swap
 
 export type Sample = {
 	t: number,
@@ -117,6 +121,16 @@ function Telemetry.attach(bot: any, side: string)
 			local key = if zone then zone.key else Zones.VOID
 			local t = now()
 
+			-- Body-swap detection BEFORE inserting the new sample: the comparison
+			-- is against the previous sample's position.
+			local previousSample = track.samples[#track.samples]
+			local teleported = false
+			if previousSample then
+				local dx = ground.X - previousSample.x
+				local dz = ground.Z - previousSample.z
+				teleported = math.sqrt(dx * dx + dz * dz) > TELEPORT_STUDS
+			end
+
 			if #track.samples < Scenario.TelemetryMaxSamples then
 				table.insert(track.samples, {
 					t = t,
@@ -136,9 +150,11 @@ function Telemetry.attach(bot: any, side: string)
 				track.dwell[previous] = (track.dwell[previous] or 0) + held
 				track.zoneKey = key
 				track.zoneSince = t
-				track.transitions += 1
 
-				if Scenario.LogZoneTransitions and previous ~= Zones.VOID then
+				if teleported then
+					-- Round-reset body swap: bookkeeping only, not a rotation.
+				elseif Scenario.LogZoneTransitions and previous ~= Zones.VOID then
+					track.transitions += 1
 					local fromZone = Zones.byKey[previous]
 					local fromName = if fromZone then fromZone.callout else "Off-map"
 					local toName = if zone then zone.callout else "Off-map"
@@ -164,6 +180,7 @@ function Telemetry.attach(bot: any, side: string)
 			model:SetAttribute("Deaths", bot.deaths or 0)
 			model:SetAttribute("Headshots", bot.headshots or 0)
 			model:SetAttribute("Credits", bot.credits or 0)
+			model:SetAttribute("Inventory", bot.inventory or "?")
 
 			task.wait(Scenario.TelemetrySampleSeconds)
 		end
