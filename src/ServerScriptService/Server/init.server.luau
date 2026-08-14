@@ -1,9 +1,11 @@
 --!strict
 -- Project CLUTCH — server bootstrap.
 --
--- Brain v2. The map is greyboxed, every area has a name, bots decide where to go
--- by scoring intents against what they can actually perceive, and they shoot
--- each other with a weapon that has an opinion about range.
+-- Brain v2 + spectator dashboard. The map is greyboxed, every area has a name,
+-- bots decide where to go by scoring intents against what they can actually
+-- perceive, and they shoot each other with a weapon that has an opinion about
+-- range. The client shows a live match dashboard fed by replicated attributes
+-- (Telemetry) and a kill-feed RemoteEvent (here).
 --
 -- Boots into Duel1v1 by default (see Shared/Constants/Scenario). Ten bots at
 -- once produced a log nobody could read; two produce an auditable transcript.
@@ -35,10 +37,18 @@ local ShootingRange = require(script.ShootingRange)
 
 local RESPAWN_DELAY = 3
 
-print(("[CLUTCH] server online — brain v2 (%s)"):format(Scenario.Mode))
+print(("[CLUTCH] server online — brain v2 + spectator HUD (%s)"):format(Scenario.Mode))
 
 MapBuilder.build(Greybox)
 print(("[CLUTCH] %d named zones loaded"):format(#Zones.list))
+
+-- Client contract. The dashboard finds this folder by name; keep it stable.
+local remotes = Instance.new("Folder")
+remotes.Name = "CLUTCH"
+remotes.Parent = ReplicatedStorage
+local killFeed = Instance.new("RemoteEvent")
+killFeed.Name = "KillFeed"
+killFeed.Parent = remotes
 
 -- Structural audit, every boot. Attacker and defender routes to each site
 -- should be comparable in length. In a real tac shooter defenders arrive on
@@ -135,14 +145,29 @@ if Scenario.UniformStats then
 	))
 end
 
--- Survive death with the rig intact so a bot can be revived rather than rebuilt
+-- Survive death with the rig intact long enough to CLONE it. A dead humanoid
+-- cannot be revived — setting Health on a dead rig never sticks (playtest #6:
+-- one kill produced an endless RESET metronome because the "revived" bot was
+-- still dead). Respawn replaces the body wholesale from this pristine copy.
 for _, bot in roster do
 	local humanoid = (bot.model :: Model):FindFirstChildOfClass("Humanoid")
 	if humanoid then
 		humanoid.BreakJointsOnDeath = false
 	end
 	bot.spawnPivot = (bot.model :: Model):GetPivot()
+	bot.template = (bot.model :: Model):Clone()
 	bot.weapon = weapon
+end
+
+-- Static dashboard identity. Telemetry adds the live state (zone, intent,
+-- alive, K/D/HS) as attributes on the same model at 4Hz.
+local function markBot(bot: any, side: string)
+	local model = bot.model :: Model
+	model:SetAttribute("ClutchBot", true)
+	model:SetAttribute("BotName", bot.name)
+	model:SetAttribute("Side", side)
+	model:SetAttribute("Role", bot.role)
+	model:SetAttribute("Weapon", weapon.DisplayName)
 end
 
 -- Both rosters, with every attribute that feeds a shot.
@@ -173,45 +198,60 @@ for _, bot in defenders do
 	Telemetry.attach(bot, "Defense")
 end
 
--- A dead bot heals, walks back to spawn and gets a fresh brain, so a single
--- Studio session produces repeated engagements instead of one kill and silence.
--- Deliberately crude: real respawn logic belongs to the round state machine,
--- along with buy phases and the score.
+-- A dead bot is replaced from its pristine template, returns to spawn and gets
+-- a fresh brain, so a single Studio session produces repeated engagements
+-- instead of one kill and silence. Deliberately crude: real respawn logic
+-- belongs to the round state machine, along with buy phases and the score.
 --
--- acknowledgedDead is the whole fix for the respawn LOOP: the watcher polls
--- every 0.25s and used to re-fire on the same corpse for the entire 3-second
--- delay. Onyx respawned 14 times without being shot because of it.
+-- handledModel gates the corpse, not a boolean: the watcher re-reads bot.model
+-- every poll because respawn swaps it.
 local function watchForDeath(bot: any, side: string, enemies: { any }, allies: { any })
 	task.spawn(function()
-		local model = bot.model :: Model
-		local acknowledgedDead = false
-		while model.Parent do
-			local humanoid = model:FindFirstChildOfClass("Humanoid")
-			if not humanoid then
-				return
-			end
-			if humanoid.Health <= 0 and not acknowledgedDead then
-				acknowledgedDead = true
-				print(("[CLUTCH] %6.1fs  RESET %s respawning in %ds"):format(
-					Telemetry.clock(),
-					bot.name,
-					RESPAWN_DELAY
-				))
-				task.wait(RESPAWN_DELAY)
-				if not model.Parent then
-					return
+		local handledModel: Model? = nil
+		while true do
+			local model = bot.model :: Model?
+			if model and model.Parent then
+				local humanoid = model:FindFirstChildOfClass("Humanoid")
+				if humanoid and humanoid.Health <= 0 and handledModel ~= model then
+					handledModel = model
+					bot.deaths = (bot.deaths or 0) + 1
+
+					-- Combat stamped the corpse with who did it; read before destroying.
+					local killerName = model:GetAttribute("LastKilledBy")
+					if killerName then
+						killFeed:FireAllClients({
+							killer = killerName,
+							victim = bot.name,
+							headshot = model:GetAttribute("LastKillHeadshot") == true,
+							distance = model:GetAttribute("LastKillDistance") or 0,
+							weapon = model:GetAttribute("LastKillWeapon") or "?",
+						})
+					end
+
+					print(("[CLUTCH] %6.1fs  RESET %s respawning in %ds"):format(
+						Telemetry.clock(),
+						bot.name,
+						RESPAWN_DELAY
+					))
+					task.wait(RESPAWN_DELAY)
+
+					local fresh = (bot.template :: Model):Clone()
+					model:Destroy() -- ends the old brain/perception loops too
+					fresh:PivotTo(bot.spawnPivot)
+					local freshHumanoid = fresh:FindFirstChildOfClass("Humanoid")
+					if freshHumanoid then
+						freshHumanoid.BreakJointsOnDeath = false
+					end
+					fresh.Parent = workspace
+					bot.model = fresh
+					markBot(bot, side)
+					task.wait(0.5)
+					Brain.start(bot, side, enemies, allies, rng, Telemetry.clock, weapon)
+					print(("[CLUTCH] %6.1fs  RESET %s back at spawn with a fresh brain"):format(
+						Telemetry.clock(),
+						bot.name
+					))
 				end
-				model:PivotTo(bot.spawnPivot)
-				humanoid.Health = humanoid.MaxHealth
-				task.wait(0.5)
-				Brain.start(bot, side, enemies, allies, rng, Telemetry.clock, weapon, function()
-					Combat.pollHealth(bot, bot.combatState, Telemetry.clock())
-				end)
-				print(("[CLUTCH] %6.1fs  RESET %s back at spawn with a fresh brain"):format(
-					Telemetry.clock(),
-					bot.name
-				))
-				acknowledgedDead = false -- alive again; arm the next reset
 			end
 			task.wait(0.25)
 		end
@@ -219,10 +259,12 @@ local function watchForDeath(bot: any, side: string, enemies: { any }, allies: {
 end
 
 for _, bot in attackers do
+	markBot(bot, "Attack")
 	Brain.start(bot, "Attack", defenders, attackers, rng, Telemetry.clock, weapon)
 	watchForDeath(bot, "Attack", defenders, attackers)
 end
 for _, bot in defenders do
+	markBot(bot, "Defense")
 	Brain.start(bot, "Defense", attackers, defenders, rng, Telemetry.clock, weapon)
 	watchForDeath(bot, "Defense", attackers, defenders)
 end
