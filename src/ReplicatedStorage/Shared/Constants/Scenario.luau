@@ -25,22 +25,28 @@ return {
 	DuelAttacker = "Ace",
 	DuelDefender = "Onyx",
 
-	-- Both duelists carry this. A pistol is the right test weapon: its 40-stud
-	-- optimal band is well inside the distances this map produces, so range
-	-- discipline actually gets exercised.
+	-- Everyone opens with this; the economy decides what they carry later. A
+	-- pistol is the right test weapon: its 40-stud optimal band is well inside
+	-- the distances this map produces, so range discipline gets exercised.
 	DuelWeapon = "Sidearm",
 
 	-- CONTROLLED EXPERIMENT. With this on, every bot gets identical attributes,
 	-- so any behavioural difference must come from role, side or situation — not
 	-- from a stat roll. Turn it off to watch attributes reassert themselves.
+	--
+	-- The block is tuned to a "competent ranked player", not a pro and not a
+	-- bot: Game Sense highest (so range discipline and rotations are visible),
+	-- Aggression deliberately moderate (75 produced dry ego-peeks), Aim/Reactions
+	-- human rather than aimbot. Dumb decisions should be traceable to the
+	-- brain's weights, not to a stat handing out free wins.
 	UniformStats = true,
 	UniformStatBlock = {
-		Aim = 75,
-		Reactions = 75,
-		GameSense = 75,
-		Aggression = 75,
-		UtilityUsage = 75,
-		Clutch = 75,
+		Aim = 70,
+		Reactions = 70,
+		GameSense = 80,
+		Aggression = 60,
+		UtilityUsage = 70,
+		Clutch = 70,
 		Consistency = 75,
 	} :: StatBlock,
 
@@ -73,6 +79,7 @@ return {
 	StallRampSeconds = 25,
 
 	-- Minimum seconds a bot must stay committed to an intent before switching.
-	-- Engage is exempt: getting shot at is allowed to interrupt anything.
+	-- Engage/Plant/Defuse are exempt: getting shot at — or a live objective —
+	-- is allowed to interrupt anything.
 	MinIntentSeconds = 4,
 }
