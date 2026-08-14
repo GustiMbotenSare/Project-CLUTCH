@@ -2,7 +2,7 @@
 -- Project CLUTCH — server bootstrap.
 --
 -- Brain v2. The map is greyboxed, every area has a name, bots decide where to go
--- by scoring intents against what they can actually perceive, and they now shoot
+-- by scoring intents against what they can actually perceive, and they shoot
 -- each other with a weapon that has an opinion about range.
 --
 -- Boots into Duel1v1 by default (see Shared/Constants/Scenario). Ten bots at
@@ -30,6 +30,7 @@ local MapBuilder = require(script.MapBuilder)
 local BotSpawner = require(script.BotSpawner)
 local Telemetry = require(script.Telemetry)
 local Brain = require(script.Brain)
+local Combat = require(script.Combat)
 local ShootingRange = require(script.ShootingRange)
 
 local RESPAWN_DELAY = 3
@@ -176,15 +177,21 @@ end
 -- Studio session produces repeated engagements instead of one kill and silence.
 -- Deliberately crude: real respawn logic belongs to the round state machine,
 -- along with buy phases and the score.
+--
+-- acknowledgedDead is the whole fix for the respawn LOOP: the watcher polls
+-- every 0.25s and used to re-fire on the same corpse for the entire 3-second
+-- delay. Onyx respawned 14 times without being shot because of it.
 local function watchForDeath(bot: any, side: string, enemies: { any }, allies: { any })
 	task.spawn(function()
 		local model = bot.model :: Model
+		local acknowledgedDead = false
 		while model.Parent do
 			local humanoid = model:FindFirstChildOfClass("Humanoid")
 			if not humanoid then
 				return
 			end
-			if humanoid.Health <= 0 then
+			if humanoid.Health <= 0 and not acknowledgedDead then
+				acknowledgedDead = true
 				print(("[CLUTCH] %6.1fs  RESET %s respawning in %ds"):format(
 					Telemetry.clock(),
 					bot.name,
@@ -197,11 +204,14 @@ local function watchForDeath(bot: any, side: string, enemies: { any }, allies: {
 				model:PivotTo(bot.spawnPivot)
 				humanoid.Health = humanoid.MaxHealth
 				task.wait(0.5)
-				Brain.start(bot, side, enemies, allies, rng, Telemetry.clock, weapon)
+				Brain.start(bot, side, enemies, allies, rng, Telemetry.clock, weapon, function()
+					Combat.pollHealth(bot, bot.combatState, Telemetry.clock())
+				end)
 				print(("[CLUTCH] %6.1fs  RESET %s back at spawn with a fresh brain"):format(
 					Telemetry.clock(),
 					bot.name
 				))
+				acknowledgedDead = false -- alive again; arm the next reset
 			end
 			task.wait(0.25)
 		end
