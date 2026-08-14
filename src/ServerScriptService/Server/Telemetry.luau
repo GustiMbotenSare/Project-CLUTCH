@@ -49,6 +49,12 @@ local function now(): number
 	return os.clock() - START
 end
 
+-- Every subsystem that timestamps a log line must share this epoch, or the
+-- interleaved transcript stops lining up and 1v1 auditing becomes useless.
+function Telemetry.clock(): number
+	return now()
+end
+
 local function shortSide(side: string): string
 	return if side == "Attack" then "ATK" else "DEF"
 end
