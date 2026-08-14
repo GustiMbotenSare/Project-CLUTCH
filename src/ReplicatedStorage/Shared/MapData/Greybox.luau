@@ -1,35 +1,28 @@
 --!strict
--- Greybox v2.3 — still data, still no Studio work.
+-- Greybox v2.4 — still data, still no Studio work.
+--
+-- v2.3 → v2.4 (playtest #8 — the A Short door scrape):
+--   * The 6-stud short doors (the site↔short connectors at x ±30) left 0.5
+--     studs of margin per side for an AgentRadius-2.5 rig. Paths computed
+--     fine, but the humanoid scraped the doorframe until the stuck timer gave
+--     up — the repeated BLOCKED lines en route to A Site. Short doors are now
+--     10 studs wide (pocket walls shortened to make room). Chokes still choke;
+--     they just no longer demand centimeter-perfect threading.
 --
 -- v2.2 → v2.3 (playtest #7 — spawn rows to opposite corners):
---   * Spawns moved much farther apart: attackers to the far EAST (x 52..68),
---     defenders to the far WEST (x -68..-52). Spawn-to-spawn distance is now
---     ~150 studs (was ~93), so first contact tests pathing and instinct — not
---     who draws first across a lobby. Every spawn-to-spawn sightline crosses
---     a screen wall; the mid gap remains the intended opening contest.
+--   * Attackers far east (x 52..68), defenders far west (x -68..-52): ~150
+--     studs apart, every spawn-to-spawn sightline crosses a screen wall, and
+--     the mid gap remains the intended opening contest.
 --
 -- v2.1 → v2.2 (playtest #5/#6 — spawn-to-spawn sightline):
---   * Both spawn lobbies had a completely open boundary, so the two duelists
---     saw each other at 87 studs from their own spawn lines 4 seconds in and
---     traded pistol fire across the whole map. A pistol's optimal band is 40
---     studs; an 88-stud opener teaches the bots nothing about range discipline.
---   * v2.2 added SpawnScreenN/S: 12-tall walls sealing the lobby boundary
---     except a 26-wide gap at mid (x -13..13).
---   * v2.2 ALSO moved both spawn rows off the mid axis in OPPOSITE directions.
---     The first version of the screens left the spawn lines at x -8..8 — dead
---     centre of the mid gap — so playtest #6 opened with the exact same
---     88-stud sightline the walls were built to remove.
+--   * SpawnScreenN/S seal the lobby boundary except a 26-wide mid gap
+--     (x -13..13); spawn rows moved off the mid axis after the first version
+--     left both spawn lines dead centre of that gap.
 --
 -- v2 → v2.1 (playtest #2 — nothing climbed):
---   * Vertical access was broken by construction: staircases sat UNDER their
---     own platforms, leaving ~2 studs of headroom for a 5-stud humanoid.
---     Replaced with SOLID plinths (no ambiguous crawl space for the navmesh)
---     plus shallow ~16-degree ramps on a clear face. No jumping required.
---   * Mid ledge relocated to sit in line with the mid window crossing, so
---     holding height actually controls the mid duel.
---   * Defender half-cover moved off the spawn line — bots were spawning
---     inside it and the pathfinder tried to route over the top.
---   * Crates moved out of ramp footprints.
+--   * Solid plinths + ~16-degree ramps replaced staircases built under their
+--     own platforms; mid ledge aligned to the window crossing; defender
+--     half-cover moved off the spawn line; crates out of ramp footprints.
 --
 -- Coordinates: y up. Attackers south (+z), defenders north (-z).
 -- Site A west (-x), Site B east (+x). Floor top y = 1.
@@ -117,11 +110,12 @@ local parts: { PartSpec } = {
 	{ name = "SiteSouthB1", pos = Vector3.new(62.5, 7, -16), size = Vector3.new(15, 12, 2), color = WALL },
 	{ name = "SiteSouthB2", pos = Vector3.new(37, 7, -16), size = Vector3.new(14, 12, 2), color = WALL },
 
-	-- Pocket inner walls, 6-wide short doors (A: x -30, B: x 30)
-	{ name = "PocketEastA1", pos = Vector3.new(-30, 7, -20.5), size = Vector3.new(2, 12, 9), color = WALL },
-	{ name = "PocketEastA2", pos = Vector3.new(-30, 7, -35.5), size = Vector3.new(2, 12, 9), color = WALL },
-	{ name = "PocketWestB1", pos = Vector3.new(30, 7, -20.5), size = Vector3.new(2, 12, 9), color = WALL },
-	{ name = "PocketWestB2", pos = Vector3.new(30, 7, -35.5), size = Vector3.new(2, 12, 9), color = WALL },
+	-- Pocket inner walls, 10-wide short doors (A: x -30, B: x 30).
+	-- Widened from 6 in v2.4: rigs scraped the frame into stuck-loops.
+	{ name = "PocketEastA1", pos = Vector3.new(-30, 7, -19.5), size = Vector3.new(2, 12, 7), color = WALL },
+	{ name = "PocketEastA2", pos = Vector3.new(-30, 7, -36.5), size = Vector3.new(2, 12, 7), color = WALL },
+	{ name = "PocketWestB1", pos = Vector3.new(30, 7, -19.5), size = Vector3.new(2, 12, 7), color = WALL },
+	{ name = "PocketWestB2", pos = Vector3.new(30, 7, -36.5), size = Vector3.new(2, 12, 7), color = WALL },
 
 	-- Mid dividers with 8-wide short-door gaps (z -34..-26)
 	{ name = "DividerW1", pos = Vector3.new(-20, 7, -2.5), size = Vector3.new(2, 12, 35), color = WALL },
