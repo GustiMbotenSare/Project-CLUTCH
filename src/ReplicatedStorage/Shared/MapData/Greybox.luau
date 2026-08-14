@@ -1,5 +1,12 @@
 --!strict
--- Greybox v2.2 — still data, still no Studio work.
+-- Greybox v2.3 — still data, still no Studio work.
+--
+-- v2.2 → v2.3 (playtest #7 — spawn rows to opposite corners):
+--   * Spawns moved much farther apart: attackers to the far EAST (x 52..68),
+--     defenders to the far WEST (x -68..-52). Spawn-to-spawn distance is now
+--     ~150 studs (was ~93), so first contact tests pathing and instinct — not
+--     who draws first across a lobby. Every spawn-to-spawn sightline crosses
+--     a screen wall; the mid gap remains the intended opening contest.
 --
 -- v2.1 → v2.2 (playtest #5/#6 — spawn-to-spawn sightline):
 --   * Both spawn lobbies had a completely open boundary, so the two duelists
@@ -8,11 +15,10 @@
 --     studs; an 88-stud opener teaches the bots nothing about range discipline.
 --   * v2.2 added SpawnScreenN/S: 12-tall walls sealing the lobby boundary
 --     except a 26-wide gap at mid (x -13..13).
---   * v2.2 ALSO moved both spawn rows off the mid axis in OPPOSITE directions
---     (attackers east, defenders west). The first version of the screens left
---     the spawn lines at x -8..8 — dead centre of the mid gap — so playtest
---     #6 opened with the exact same 88-stud sightline the walls were built
---     to remove. Own your gap geometry, folks.
+--   * v2.2 ALSO moved both spawn rows off the mid axis in OPPOSITE directions.
+--     The first version of the screens left the spawn lines at x -8..8 — dead
+--     centre of the mid gap — so playtest #6 opened with the exact same
+--     88-stud sightline the walls were built to remove.
 --
 -- v2 → v2.1 (playtest #2 — nothing climbed):
 --   * Vertical access was broken by construction: staircases sat UNDER their
@@ -183,25 +189,26 @@ local parts: { PartSpec } = {
 local Greybox: MapSpec = {
 	parts = parts,
 
-	-- Offset EAST, away from the mid gap. The first screens left both spawn
-	-- lines at x -8..8 — dead centre of the gap — so nothing actually changed.
+	-- FAR EAST row (x 52..68). ~150 studs from the defender row; every
+	-- spawn-to-spawn sightline crosses a screen wall. Stays west of x 70:
+	-- east of the lane wall is sealed dead space (VOID).
 	attackSpawns = {
-		Vector3.new(40, 3, 44),
-		Vector3.new(36, 3, 44),
-		Vector3.new(32, 3, 44),
-		Vector3.new(28, 3, 44),
-		Vector3.new(24, 3, 44),
+		Vector3.new(52, 3, 44),
+		Vector3.new(56, 3, 44),
+		Vector3.new(60, 3, 44),
+		Vector3.new(64, 3, 44),
+		Vector3.new(68, 3, 44),
 	},
 
-	-- Offset WEST, opposite the attackers. Any spawn-to-spawn line now crosses
-	-- a screen wall, not the mid gap. (Pulled back to z -49 in v2.1: v2 spawns
-	-- sat inside the defender half-cover.)
+	-- FAR WEST row (x -68..-52), opposite corner from the attackers.
+	-- (Pulled back to z -49 in v2.1: v2 spawns sat inside the defender
+	-- half-cover.)
 	defenseSpawns = {
-		Vector3.new(-40, 3, -49),
-		Vector3.new(-36, 3, -49),
-		Vector3.new(-32, 3, -49),
-		Vector3.new(-28, 3, -49),
-		Vector3.new(-24, 3, -49),
+		Vector3.new(-68, 3, -49),
+		Vector3.new(-64, 3, -49),
+		Vector3.new(-60, 3, -49),
+		Vector3.new(-56, 3, -49),
+		Vector3.new(-52, 3, -49),
 	},
 
 	plantZones = {
