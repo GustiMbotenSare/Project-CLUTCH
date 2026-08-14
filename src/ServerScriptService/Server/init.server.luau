@@ -1,16 +1,22 @@
 --!strict
 -- Project CLUTCH — server bootstrap.
 --
--- Brain v1. The map is greyboxed, every area has a name, and bots decide where
--- to go by scoring intents against what they can actually perceive.
+-- Brain v2. The map is greyboxed, every area has a name, bots decide where to go
+-- by scoring intents against what they can actually perceive, and they now shoot
+-- each other with a weapon that has an opinion about range.
 --
 -- Boots into Duel1v1 by default (see Shared/Constants/Scenario). Ten bots at
 -- once produced a log nobody could read; two produce an auditable transcript.
 -- Flip Scenario.Mode to "Full5v5" once the decisions look sane.
 --
+-- UniformStats is on by default. Every bot gets identical attributes, which
+-- makes this a controlled experiment: any difference in behaviour between the
+-- two duelists must come from role, side or situation, not from a stat roll.
+-- Turn it off to watch attributes reassert themselves.
+--
 -- Retired from the default path: Patrol (random POI wandering, scaffolding for
--- proving the navmesh worked) and ShootingRange (proved the duel maths). Both
--- still exist; the range can be switched back on via Scenario.RunShootingRange.
+-- proving the navmesh worked) and ShootingRange (proved the duel maths against a
+-- dummy). Both still exist; the range can be re-enabled via Scenario.
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Shared = ReplicatedStorage:WaitForChild("Shared")
@@ -18,6 +24,7 @@ local Shared = ReplicatedStorage:WaitForChild("Shared")
 local Greybox = require(Shared.MapData.Greybox)
 local Zones = require(Shared.MapData.Zones)
 local Scenario = require(Shared.Constants.Scenario)
+local Weapons = require(Shared.Constants.Weapons)
 
 local MapBuilder = require(script.MapBuilder)
 local BotSpawner = require(script.BotSpawner)
@@ -25,7 +32,9 @@ local Telemetry = require(script.Telemetry)
 local Brain = require(script.Brain)
 local ShootingRange = require(script.ShootingRange)
 
-print(("[CLUTCH] server online — brain v1 (%s)"):format(Scenario.Mode))
+local RESPAWN_DELAY = 3
+
+print(("[CLUTCH] server online — brain v2 (%s)"):format(Scenario.Mode))
 
 MapBuilder.build(Greybox)
 print(("[CLUTCH] %d named zones loaded"):format(#Zones.list))
@@ -48,6 +57,22 @@ end
 hopAudit("ATK_SPAWN")
 hopAudit("DEF_SPAWN")
 
+-- Which weapon everyone is holding, and the thresholds its carrier reasons
+-- about. Printing this means the log explains its own engagement decisions.
+local weapon = Weapons[Scenario.DuelWeapon]
+if not weapon then
+	warn(("[CLUTCH] unknown weapon %q, falling back to Sidearm"):format(tostring(Scenario.DuelWeapon)))
+	weapon = Weapons.Sidearm
+end
+print(("[CLUTCH] weapon: %s (%s) — %d body / %d head, optimal to %d studs, effective to %d studs"):format(
+	weapon.DisplayName,
+	weapon.Class,
+	weapon.DamageBody,
+	math.floor(weapon.DamageBody * weapon.HeadshotMultiplier),
+	weapon.OptimalRangeStuds,
+	weapon.MaxEffectiveRangeStuds
+))
+
 -- Let the navmesh bake before anyone asks it for a path
 task.wait(1.5)
 
@@ -57,22 +82,6 @@ local teams = BotSpawner.spawnTeams(Greybox, rng)
 local attackers = teams.attack
 local defenders = teams.defense
 print(("[CLUTCH] spawned %d attackers, %d defenders"):format(#attackers, #defenders))
-
--- Both rosters now. Previously only attackers were printed, which made it
--- impossible to reason about defender behaviour from the log alone.
-local function printRoster(label: string, roster: { any })
-	for _, bot in roster do
-		print(("[CLUTCH] %s %s (%s) — Aim %d / Rct %d / GS %d / Agg %d"):format(
-			label,
-			bot.name,
-			bot.role,
-			bot.attributes.Aim,
-			bot.attributes.Reactions,
-			bot.attributes.GameSense,
-			bot.attributes.Aggression
-		))
-	end
-end
 
 -- Duel mode: keep one bot per side, remove the rest.
 local function keepOnly(roster: { any }, wanted: string): { any }
@@ -103,6 +112,54 @@ if Scenario.Mode == "Duel1v1" then
 	print("[CLUTCH] duel mode — everyone else sent home")
 end
 
+local roster: { any } = {}
+for _, bot in attackers do
+	table.insert(roster, bot)
+end
+for _, bot in defenders do
+	table.insert(roster, bot)
+end
+
+-- CONTROLLED EXPERIMENT. Overwrite the rolled attributes with one identical
+-- block. Two bots differing on six axes at once make it impossible to say which
+-- attribute caused which behaviour.
+if Scenario.UniformStats then
+	for _, bot in roster do
+		for stat, value in Scenario.UniformStatBlock do
+			bot.attributes[stat] = value
+		end
+	end
+	print(("[CLUTCH] UNIFORM STATS: every attribute forced to %d — differences are role/side/situation only"):format(
+		Scenario.UniformStatBlock.Aim
+	))
+end
+
+-- Survive death with the rig intact so a bot can be revived rather than rebuilt
+for _, bot in roster do
+	local humanoid = (bot.model :: Model):FindFirstChildOfClass("Humanoid")
+	if humanoid then
+		humanoid.BreakJointsOnDeath = false
+	end
+	bot.spawnPivot = (bot.model :: Model):GetPivot()
+	bot.weapon = weapon
+end
+
+-- Both rosters, with every attribute that feeds a shot.
+local function printRoster(label: string, side: { any })
+	for _, bot in side do
+		print(("[CLUTCH] %s %s (%s) — Aim %d / Rct %d / GS %d / Agg %d / Cons %d — %s"):format(
+			label,
+			bot.name,
+			bot.role,
+			bot.attributes.Aim,
+			bot.attributes.Reactions,
+			bot.attributes.GameSense,
+			bot.attributes.Aggression,
+			bot.attributes.Consistency,
+			weapon.DisplayName
+		))
+	end
+end
 printRoster("ATK", attackers)
 printRoster("DEF", defenders)
 
@@ -115,15 +172,53 @@ for _, bot in defenders do
 	Telemetry.attach(bot, "Defense")
 end
 
+-- A dead bot heals, walks back to spawn and gets a fresh brain, so a single
+-- Studio session produces repeated engagements instead of one kill and silence.
+-- Deliberately crude: real respawn logic belongs to the round state machine,
+-- along with buy phases and the score.
+local function watchForDeath(bot: any, side: string, enemies: { any }, allies: { any })
+	task.spawn(function()
+		local model = bot.model :: Model
+		while model.Parent do
+			local humanoid = model:FindFirstChildOfClass("Humanoid")
+			if not humanoid then
+				return
+			end
+			if humanoid.Health <= 0 then
+				print(("[CLUTCH] %6.1fs  RESET %s respawning in %ds"):format(
+					Telemetry.clock(),
+					bot.name,
+					RESPAWN_DELAY
+				))
+				task.wait(RESPAWN_DELAY)
+				if not model.Parent then
+					return
+				end
+				model:PivotTo(bot.spawnPivot)
+				humanoid.Health = humanoid.MaxHealth
+				task.wait(0.5)
+				Brain.start(bot, side, enemies, allies, rng, Telemetry.clock, weapon)
+				print(("[CLUTCH] %6.1fs  RESET %s back at spawn with a fresh brain"):format(
+					Telemetry.clock(),
+					bot.name
+				))
+			end
+			task.wait(0.25)
+		end
+	end)
+end
+
 for _, bot in attackers do
-	Brain.start(bot, "Attack", defenders, attackers, rng, Telemetry.clock)
+	Brain.start(bot, "Attack", defenders, attackers, rng, Telemetry.clock, weapon)
+	watchForDeath(bot, "Attack", defenders, attackers)
 end
 for _, bot in defenders do
-	Brain.start(bot, "Defense", attackers, defenders, rng, Telemetry.clock)
+	Brain.start(bot, "Defense", attackers, defenders, rng, Telemetry.clock, weapon)
+	watchForDeath(bot, "Defense", attackers, defenders)
 end
 
 Telemetry.startReporting()
-print("[CLUTCH] brains online — watch for THINK / MOVE / SPOT lines")
+print("[CLUTCH] brains online — watch for THINK / ENGAGE / SHOT / MOVE lines")
 
 if Scenario.RunShootingRange and #attackers > 0 then
 	task.wait(2)
