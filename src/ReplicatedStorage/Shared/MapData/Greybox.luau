@@ -1,12 +1,15 @@
 --!strict
 -- Greybox v3.1 — the 5v5 map. Still data, still no Studio work.
 --
--- v3 → v3.1 (playtest #11 — the map-read pass):
+-- v3 → v3.1 (playtest #11/#12 — the map-read pass):
 --   * Sites deepen four studs south (z -50..-18): at 47×28 they read as
 --     corridors next to their lobbies. Site south walls, pocket walls and
 --     door zones shift to match.
 --   * WestCap walls seal the lane corridor straight into the site's NW corner
 --     — an open bleed that wasn't in the zone graph and read as a weird gap.
+--   * A second cover layer per site: a mid-site partial crate between the
+--     door and the plant, so a site isn't three props in an empty field.
+--     (More shape work lands with the stall data from the diagnostics.)
 --
 -- v2.4 → v3 (the 5v5 scale-up):
 --   * Canvas 170×110 → 230×150; lanes 12 → 22 wide; proper site pockets.
@@ -128,7 +131,9 @@ local parts: { PartSpec } = {
 	{ name = "PocketEastA2", pos = Vector3.new(-48, 7, -47), size = Vector3.new(2, 12, 6), color = WALL },
 	-- Short cap: attackers may not walk A Short straight into the defender lobby
 	{ name = "ShortCapA", pos = Vector3.new(-37, 7, -45), size = Vector3.new(22, 12, 2), color = WALL },
-	-- Site cover: default crate + head-glitch (partial), tower (full)
+	-- Site cover, two layers: mid-site partial (door→plant), then the default
+	-- crate + head-glitch (partial) and the tower (full) around the plant zone.
+	{ name = "AMidCrate", pos = Vector3.new(-62, 3.25, -26), size = Vector3.new(5, PARTIAL, 4), color = CRATE },
 	{ name = "ADefaultCrate", pos = Vector3.new(-66, 3.25, -36), size = Vector3.new(6, PARTIAL, 6), color = CRATE },
 	{ name = "AHeadGlitch", pos = Vector3.new(-80, 3.25, -28), size = Vector3.new(5, PARTIAL, 5), color = CRATE },
 	{ name = "ATower", pos = Vector3.new(-54, 7, -41), size = Vector3.new(8, 12, 8), color = COVER_FULL },
@@ -141,6 +146,7 @@ local parts: { PartSpec } = {
 	{ name = "PocketWestB1", pos = Vector3.new(48, 7, -27), size = Vector3.new(2, 12, 18), color = WALL },
 	{ name = "PocketWestB2", pos = Vector3.new(48, 7, -47), size = Vector3.new(2, 12, 6), color = WALL },
 	{ name = "ShortCapB", pos = Vector3.new(37, 7, -45), size = Vector3.new(22, 12, 2), color = WALL },
+	{ name = "BMidCrate", pos = Vector3.new(62, 3.25, -26), size = Vector3.new(5, PARTIAL, 4), color = CRATE },
 	{ name = "BDefaultCrate", pos = Vector3.new(66, 3.25, -36), size = Vector3.new(6, PARTIAL, 6), color = CRATE },
 	{ name = "BHeadGlitch", pos = Vector3.new(80, 3.25, -28), size = Vector3.new(5, PARTIAL, 5), color = CRATE },
 	{ name = "BTower", pos = Vector3.new(54, 7, -41), size = Vector3.new(8, 12, 8), color = COVER_FULL },
