@@ -61,6 +61,9 @@ local SAMPLE_DIAG_SECONDS = 10
 
 local K = BrainCore.K -- shared constants (freshness windows, hop budgets, spacing)
 
+-- Zones defenders consider "forward" positions (for the at-objective read).
+local DEF_FORWARD = { "MID", "MID_LEDGE", "MID_WINDOW", "A_SHORT", "B_SHORT" }
+
 -- WALK OR SPRINT — the info doctrine's speed half:
 local function wantsWalk(intent: string, side: string, currentKey: string, routeKey: string?, contact: any, now: number): boolean
 	if intent == "Engage" or intent == "Plant" or intent == "Defuse" then
@@ -511,7 +514,7 @@ function Brain.start(bot: any, side: string, enemies: { any }, allies: { any }, 
 
 			local atObjective = if side == "Attack"
 				then Zones.hasTag(currentKey, "site")
-				else table.find(BrainCore.DEF_FORWARD_SET, currentKey) ~= nil
+				else table.find(DEF_FORWARD, currentKey) ~= nil
 
 			-- Post-plant attackers spread across the site web, not a spot in the
 			-- open: the planted site + its heaven + its short.
@@ -651,7 +654,7 @@ function Brain.start(bot: any, side: string, enemies: { any }, allies: { any }, 
 				end
 
 				if targetModel then
-					local root = model:FindFirstChild("HumanoidRootPart") :: BasePart?
+					local root = model:FindFirstChildOfClass("HumanoidRootPart") :: BasePart?
 					if root and alive then
 						alive:MoveTo(root.Position)
 					end
