@@ -6,31 +6,22 @@
 -- "take this fight" competes with "reposition first" instead of overriding it.
 --
 -- RANGE DISCIPLINE is the interesting part. Every weapon has an optimal band.
--- Whether a bot RESPECTS that band is what Game Sense buys:
+-- Whether a bot RESPECTS that band is what Game Sense buys. Three situations
+-- override discipline entirely: the enemy has eyes on it, it is contesting a
+-- site, or it is taking damage.
 --
---   high Game Sense  → holds fire outside optimal range, closes distance first
---   low  Game Sense  → shoots from anywhere and wastes the magazine
+-- SMOOTH AIM (playtest #14's request). Bots no longer snap to target: the
+-- model's facing rotates toward it at a turn rate driven by Reactions, and
+-- while the crosshair is off the target the cone is WIDE — the "flick and
+-- shoot too early" look is real inaccuracy, not a cosmetic. A 90° swing at
+-- Reactions 70 takes ~0.3s; the first bullets of a panic 180 land anywhere.
+-- This is what ends the cowboy instant-headshot duels.
 --
--- Three situations override discipline entirely, because a bot that dies
--- politely holding fire is worse than one that shoots badly:
---
---   1. The enemy already has eyes on it (no free reposition — you are trading)
---   2. It is contesting a site (leaving the plant is a loss by default)
---   3. It is taking damage (something is already shooting)
---
--- Every attribute lands on the same shot: Reactions sets the delay before the
--- first bullet, Aim sets both spread and how often the head is attempted,
--- Consistency widens or tightens the cone, Aggression biases willingness.
+-- GUNFIRE IS HEARD: every burst stamps MatchState.lastShot; Perception turns
+-- it into a SOUND contact for every enemy.
 --
 -- KILLS are reported two ways: the DOWN log line, and stamps on the victim's
--- model (LastKilledBy / LastKillHeadshot / LastKillDistance / LastKillWeapon)
--- which the round machine's death watcher reads for the kill feed before the
--- corpse is retired. Lifetime K/D/HS live on the bot record and ride to the
--- dashboard as replicated attributes written by Telemetry.
---
--- GUNFIRE IS HEARD. Every burst stamps MatchState.lastShot; Perception turns
--- that stamp into a SOUND contact for every enemy, so bots react to fire they
--- cannot see — the rotate-toward-the-shots behavior playtest #9 was missing.
+-- model which the round machine's death watcher reads for the kill feed.
 
 local Debris = game:GetService("Debris")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -61,6 +52,13 @@ local RECOIL_RESET_SHOTS = 4
 local HEADSHOT_INTENT_FLOOR = 0.10
 local HEADSHOT_INTENT_RANGE = 0.35
 local TRACER_LIFETIME = 0.09
+
+-- Smooth aim. Turn rate in degrees/sec: 140 at Reactions 0, ~400 at 100 —
+-- human flick territory, not aimbot. Off-target shots pay for it: the cone
+-- doubles for every 45° of remaining angular error.
+local TURN_BASE_DEG_PER_SEC = 140
+local TURN_REACTION_DEG_PER_SEC = 2.6
+local TURN_INACCURACY_PER_45DEG = 1.0
 
 export type Assessment = {
 	engage: boolean,
@@ -107,8 +105,7 @@ function Combat.band(weapon: any, distance: number): Band
 end
 
 -- Linear falloff from full damage at optimal range to MinDamageMultiplier at
--- the edge of effective range. Past that it keeps decaying, so a lucky
--- long-range hit still counts for something.
+-- the edge of effective range. Past that it keeps decaying.
 function Combat.damageMultiplier(weapon: any, distance: number): number
 	if distance <= weapon.OptimalRangeStuds then
 		return 1
@@ -126,13 +123,11 @@ local function spreadFor(weapon: any, attributes: any, distance: number, sprayIn
 	local spread = weapon.FirstBulletSpreadDeg + sprayIndex * weapon.SprayErrorGrowthDeg
 	spread = math.min(spread, math.max(weapon.MaxSprayErrorDeg, weapon.FirstBulletSpreadDeg))
 
-	-- Distance past the comfortable band costs accuracy
 	if distance > weapon.OptimalRangeStuds then
 		local over = (distance - weapon.OptimalRangeStuds) / 10
 		spread += over * weapon.RangeSpreadPer10Studs
 	end
 
-	-- Aim tightens the cone, Consistency decides how much it wobbles
 	spread *= 1.35 - (attributes.Aim / 100) * 0.7
 	spread *= 1 + (100 - attributes.Consistency) / 100 * 0.25
 	return math.max(spread, 0.01)
@@ -181,7 +176,6 @@ function Combat.assess(
 		reason = ("beyond effective range (%d studs)"):format(math.floor(distance))
 	end
 
-	-- Forced engagements. Any one of these overrides range discipline.
 	local forced = false
 	local enemyModel = findEnemyModel(enemies, contact.name)
 	if enemyModel and Perception.hasEyesOn(enemyModel, bot.model) then
@@ -210,7 +204,6 @@ function Combat.assess(
 	}
 end
 
--- Track incoming damage so "taking fire" can force a response.
 function Combat.pollHealth(bot: any, state: State, now: number)
 	local humanoid = bot.model:FindFirstChildOfClass("Humanoid")
 	if not humanoid then
@@ -253,14 +246,32 @@ local function hitSpark(at: Vector3)
 	Debris:AddItem(spark, 0.12)
 end
 
--- Turn to face the target. A hard yaw snap for now; smoothed aim comes with the
--- broadcast layer, where it will actually be visible.
-local function faceTarget(root: BasePart, targetPos: Vector3)
+-- SMOOTH AIM. Rotate the model toward the target, yaw-limited by Reactions,
+-- and return the angular error REMAINING after this step (radians) — the
+-- shooter pays for it in spread. A 90° swing at Reactions 70 takes ~0.3s.
+local function yawOf(look: Vector3): number
+	return math.atan2(-look.X, -look.Z)
+end
+
+local function shortestAngle(from: number, to: number): number
+	return (to - from + math.pi) % (math.pi * 2) - math.pi
+end
+
+function Combat.faceTargetSmooth(bot: any, root: BasePart, targetPos: Vector3, dt: number): number
 	local flat = Vector3.new(targetPos.X, root.Position.Y, targetPos.Z)
-	if (flat - root.Position).Magnitude < 0.1 then
-		return
+	local toTarget = flat - root.Position
+	if toTarget.Magnitude < 0.1 then
+		return 0
 	end
-	root.CFrame = CFrame.lookAt(root.Position, flat)
+	local currentYaw = yawOf(root.CFrame.LookVector)
+	local desiredYaw = yawOf(toTarget.Unit)
+	local delta = shortestAngle(currentYaw, desiredYaw)
+
+	local rateDeg = TURN_BASE_DEG_PER_SEC + bot.attributes.Reactions * TURN_REACTION_DEG_PER_SEC
+	local maxStep = math.rad(rateDeg) * math.clamp(dt, 0, 0.5)
+	local step = math.clamp(delta, -maxStep, maxStep)
+	root.CFrame = CFrame.new(root.Position) * CFrame.Angles(0, currentYaw + step, 0)
+	return math.abs(delta - step)
 end
 
 -- Fires one burst. Returns true if the target died.
@@ -288,14 +299,15 @@ function Combat.fireBurst(
 	MatchState.lastShot = { by = bot.name, pos = selfRoot.Position, at = clock() }
 
 	-- Reaction delay, paid once per fresh engagement rather than per shot
+	local reactionDelay = 0
 	if state.engagedSince == nil then
 		state.engagedSince = clock()
 		local span = SimConfig.ReactionDelayBaseSeconds - SimConfig.ReactionDelayMinSeconds
-		local delay = SimConfig.ReactionDelayBaseSeconds - (attributes.Reactions / 100) * span
+		reactionDelay = SimConfig.ReactionDelayBaseSeconds - (attributes.Reactions / 100) * span
 		if Scenario.LogCombat then
-			print(("[CLUTCH] %6.1fs  AIM %s reacts in %.2fs"):format(clock(), bot.name, delay))
+			print(("[CLUTCH] %6.1fs  AIM %s reacts in %.2fs"):format(clock(), bot.name, reactionDelay))
 		end
-		task.wait(delay)
+		task.wait(reactionDelay)
 	end
 
 	for shot = 1, weapon.BurstShots do
@@ -307,13 +319,19 @@ function Combat.fireBurst(
 			return false
 		end
 
-		faceTarget(selfRoot, targetRoot.Position)
+		-- Turn toward the target FIRST; whatever error remains widens the cone.
+		-- The first shot after the reaction delay has had that whole window to
+		-- swing — the classic peeker's-advantage trade.
+		local dt = weapon.FireInterval + (if shot == 1 then reactionDelay else 0)
+		local aimError = Combat.faceTargetSmooth(bot, selfRoot, targetRoot.Position, dt)
 
 		local sprayIndex = state.shotsSinceReset % RECOIL_RESET_SHOTS
 
-		-- Head is only attempted on a settled crosshair, never mid-spray
+		-- Head is only attempted on a settled crosshair: no head-hunting while
+		-- still turning, and never mid-spray.
 		local headshotIntent = HEADSHOT_INTENT_FLOOR + (attributes.Aim / 100) ^ 2 * HEADSHOT_INTENT_RANGE
-		local goingForHead = sprayIndex == 0 and targetHead ~= nil and rng:NextNumber() < headshotIntent
+		local settled = aimError < math.rad(6)
+		local goingForHead = settled and sprayIndex == 0 and targetHead ~= nil and rng:NextNumber() < headshotIntent
 		local aimPart = if goingForHead and targetHead then targetHead else targetRoot
 
 		local origin = selfHead.Position
@@ -321,8 +339,10 @@ function Combat.fireBurst(
 		local distance = toTarget.Magnitude
 		local direction = toTarget.Unit
 
-		-- Scatter inside a cone whose half-angle is the computed spread
 		local spreadDeg = spreadFor(weapon, attributes, distance, sprayIndex)
+		-- Off-target penalty: every 45° of remaining error doubles the cone.
+		spreadDeg *= 1 + (math.deg(aimError) / 45) * TURN_INACCURACY_PER_45DEG
+
 		local perpA = direction:Cross(Vector3.yAxis)
 		if perpA.Magnitude < 0.01 then
 			perpA = direction:Cross(Vector3.xAxis)
@@ -375,8 +395,6 @@ function Combat.fireBurst(
 
 			if targetHumanoid.Health <= 0 then
 				bot.kills = (bot.kills or 0) + 1
-				-- Stamp the corpse. The round machine's death watcher reads these for
-				-- the kill feed before the body is retired at round's end.
 				targetModel:SetAttribute("LastKilledBy", bot.name)
 				targetModel:SetAttribute("LastKillHeadshot", isHead)
 				targetModel:SetAttribute("LastKillDistance", math.floor(distance))
@@ -407,8 +425,8 @@ function Combat.fireBurst(
 	return false
 end
 
--- Called when a bot breaks contact: the next engagement pays reaction cost again
--- and the recoil pattern resets.
+-- Called when a bot breaks contact: the next engagement pays reaction cost
+-- again and the recoil pattern resets.
 function Combat.disengage(state: State)
 	state.engagedSince = nil
 	state.shotsSinceReset = 0
