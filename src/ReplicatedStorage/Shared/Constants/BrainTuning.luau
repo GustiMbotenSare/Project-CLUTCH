@@ -9,10 +9,12 @@
 --     on) perturbs the scalar fields between matches, scores each candidate
 --     against the objective metrics, and refits toward the elites.
 --
--- v4.3 additions (playtest #15): Rotate gains the confirmation gate weights
--- (PressureBonus / BaitPenalty), Hold gains SpikeGuardBonus, and
--- RetrieveBonus rose 0.20 -> 0.35 — the dropped spike is the round's real
--- objective and must outscore the comfort of the site you're standing on.
+-- v4.4 (playtest #16): the defuse is a SOLO job — only the single closest
+-- living defender takes it (SupportWavePenalty at closerToSite >= 1); the
+-- rest guard the area.
+-- v4.3 (playtest #15): Rotate gains the confirmation gate weights
+-- (PressureBonus / BaitPenalty), Hold gains SpikeGuardBonus, RetrieveBonus
+-- 0.20 -> 0.35 — the dropped spike is the round's real objective.
 --
 -- Role tables are data too, but the CEM only perturbs scalars for now.
 
@@ -79,7 +81,7 @@ return {
 	Defuse = {
 		Base = 0.75,
 		GameSenseBonus = 0.15,
-		SupportWavePenalty = -0.75, -- the two closest defuse; the rest rotate in
+		SupportWavePenalty = -0.75, -- the single closest defuses; the rest guard
 		OnSiteBonus = 0.50,
 	},
 }
