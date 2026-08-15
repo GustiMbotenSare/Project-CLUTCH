@@ -5,17 +5,20 @@
 -- the brain can compare against Hold/Push/Rotate like any other intent, so
 -- "take this fight" competes with "reposition first" instead of overriding it.
 --
--- RANGE DISCIPLINE is the interesting part. Every weapon has an optimal band.
--- Whether a bot RESPECTS that band is what Game Sense buys. Three situations
--- override discipline entirely: the enemy has eyes on it, it is contesting a
--- site, or it is taking damage.
+-- RANGE DISCIPLINE: every weapon has an optimal band; Game Sense decides
+-- whether a bot respects it. Four situations override discipline entirely:
+-- the enemy has eyes on it, it is contesting a site, it is taking damage —
+-- or it is SUPPRESSED (playtest #16: a bullet cracking three studs past your
+-- skull is information even when it doesn't hit; near-misses stamp the
+-- victim's combat state, and suppression forces a response like damage does).
 --
--- SMOOTH AIM (playtest #14's request). Bots no longer snap to target: the
--- model's facing rotates toward it at a turn rate driven by Reactions, and
--- while the crosshair is off the target the cone is WIDE — the "flick and
--- shoot too early" look is real inaccuracy, not a cosmetic. A 90° swing at
--- Reactions 70 takes ~0.3s; the first bullets of a panic 180 land anywhere.
--- This is what ends the cowboy instant-headshot duels.
+-- SMOOTH AIM, ROUND TWO (playtest #16's "stop, pan randomly, flick" report):
+-- the reaction window is no longer dead time — the bot TURNS toward the
+-- target for the whole delay, eyes before the finger. The model's facing
+-- rotates at a Reactions-driven rate, remaining angular error widens the
+-- cone, and headshots require a settled crosshair. Combined with the brain's
+-- facing loop (AutoRotate is off; the legs no longer own the eyes), a bot
+-- can watch the flank while it crosses the lane.
 --
 -- GUNFIRE IS HEARD: every burst stamps MatchState.lastShot; Perception turns
 -- it into a SOUND contact for every enemy.
@@ -34,6 +37,11 @@ local Perception = require(script.Parent.Perception)
 local MatchState = require(script.Parent.MatchState)
 
 local Combat = {}
+
+-- Every living bot's combat state, keyed by name (Brain.start writes it).
+-- Shots read the TARGET's state to stamp suppression — near-misses are
+-- team-free, victim-local information.
+Combat.states = {} :: { [string]: any }
 
 export type Band = "Optimal" | "Stretch" | "Extreme"
 
@@ -60,6 +68,11 @@ local TURN_BASE_DEG_PER_SEC = 140
 local TURN_REACTION_DEG_PER_SEC = 2.6
 local TURN_INACCURACY_PER_45DEG = 1.0
 
+-- Suppression: a miss passing this close to the head counts as being shot
+-- AT, and the victim reacts for this long afterwards.
+local SUPPRESS_RADIUS = 3
+local SUPPRESS_MEMORY_SECONDS = 1.5
+
 export type Assessment = {
 	engage: boolean,
 	score: number,
@@ -77,6 +90,7 @@ export type State = {
 	engagedSince: number?,
 	lastHealth: number,
 	lastDamagedAt: number,
+	lastSuppressedAt: number,
 	shotsFired: number,
 	hits: number,
 	headshots: number,
@@ -89,6 +103,7 @@ function Combat.newState(startHealth: number): State
 		engagedSince = nil,
 		lastHealth = startHealth,
 		lastDamagedAt = -math.huge,
+		lastSuppressedAt = -math.huge,
 		shotsFired = 0,
 		hits = 0,
 		headshots = 0,
@@ -187,6 +202,9 @@ function Combat.assess(
 	elseif now - state.lastDamagedAt <= 2.5 then
 		forced = true
 		reason = "taking fire"
+	elseif now - state.lastSuppressedAt <= SUPPRESS_MEMORY_SECONDS then
+		forced = true
+		reason = "pinned down" -- bullets cracking past count as being shot AT
 	end
 	if forced then
 		score += FORCED_BONUS
@@ -298,16 +316,25 @@ function Combat.fireBurst(
 	-- Gunfire is a sound event: every enemy in the match hears this burst
 	MatchState.lastShot = { by = bot.name, pos = selfRoot.Position, at = clock() }
 
-	-- Reaction delay, paid once per fresh engagement rather than per shot
-	local reactionDelay = 0
+	-- Reaction delay, paid once per fresh engagement. THE EYES MOVE FIRST: the
+	-- bot turns toward the target THROUGH the delay instead of freezing and
+	-- then flicking — the "stops, pans randomly, flicks" read from #16 was
+	-- this window spent facing wherever the walk happened to leave it.
 	if state.engagedSince == nil then
 		state.engagedSince = clock()
 		local span = SimConfig.ReactionDelayBaseSeconds - SimConfig.ReactionDelayMinSeconds
-		reactionDelay = SimConfig.ReactionDelayBaseSeconds - (attributes.Reactions / 100) * span
+		local delay = SimConfig.ReactionDelayBaseSeconds - (attributes.Reactions / 100) * span
 		if Scenario.LogCombat then
-			print(("[CLUTCH] %6.1fs  AIM %s reacts in %.2fs"):format(clock(), bot.name, reactionDelay))
+			print(("[CLUTCH] %6.1fs  AIM %s reacts in %.2fs"):format(clock(), bot.name, delay))
 		end
-		task.wait(reactionDelay)
+		local turnStarted = clock()
+		while clock() - turnStarted < delay do
+			if targetHumanoid.Health <= 0 or not targetModel.Parent then
+				return false
+			end
+			Combat.faceTargetSmooth(bot, selfRoot, targetRoot.Position, 0.05)
+			task.wait(0.05)
+		end
 	end
 
 	for shot = 1, weapon.BurstShots do
@@ -320,10 +347,7 @@ function Combat.fireBurst(
 		end
 
 		-- Turn toward the target FIRST; whatever error remains widens the cone.
-		-- The first shot after the reaction delay has had that whole window to
-		-- swing — the classic peeker's-advantage trade.
-		local dt = weapon.FireInterval + (if shot == 1 then reactionDelay else 0)
-		local aimError = Combat.faceTargetSmooth(bot, selfRoot, targetRoot.Position, dt)
+		local aimError = Combat.faceTargetSmooth(bot, selfRoot, targetRoot.Position, weapon.FireInterval)
 
 		local sprayIndex = state.shotsSinceReset % RECOIL_RESET_SHOTS
 
@@ -409,14 +433,28 @@ function Combat.fireBurst(
 				))
 				return true
 			end
-		elseif Scenario.LogCombat then
-			print(("[CLUTCH] %6.1fs  MISS %s -> %s | %.1f deg cone at %.0f studs"):format(
-				clock(),
-				bot.name,
-				targetModel.Name,
-				spreadDeg,
-				distance
-			))
+		else
+			-- SUPPRESSION: the miss was information. A bullet cracking past the
+			-- target's ears marks them as shot AT — they react even unhurt.
+			local reference = if targetHead then targetHead else targetRoot
+			local toRef = reference.Position - origin
+			local along = math.clamp(toRef:Dot(aimDir), 0, reach)
+			local closest = origin + aimDir * along
+			if (closest - reference.Position).Magnitude <= SUPPRESS_RADIUS then
+				local targetState = Combat.states[targetModel.Name]
+				if targetState then
+					targetState.lastSuppressedAt = clock()
+				end
+			end
+			if Scenario.LogCombat then
+				print(("[CLUTCH] %6.1fs  MISS %s -> %s | %.1f deg cone at %.0f studs"):format(
+					clock(),
+					bot.name,
+					targetModel.Name,
+					spreadDeg,
+					distance
+				))
+			end
 		end
 
 		task.wait(weapon.FireInterval)
