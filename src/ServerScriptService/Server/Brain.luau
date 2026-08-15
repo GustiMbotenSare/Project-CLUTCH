@@ -1,34 +1,30 @@
 --!strict
--- Bot brain v4.3: team intel is real now — bots rotate on CONFIRMED hits,
--- guard the dropped spike, and retrieve it like the round depends on it.
+-- Bot brain v4.4: the RUNTIME half. BrainCore.luau owns the judgment
+-- (scorers, routing, sampler, cover picks, team pressure, resolveTarget);
+-- this module owns what the bot DOES about it each tick: comms, facing,
+-- walks, holds, channels, diagnostics.
 --
--- v4.3 (playtest #15, the match-4 autopsy):
---   * TEAM PRESSURE MODEL: each tick, a side pools every living bot's fresh
---     memory into a per-zone count of DISTINCT confirmed enemies. Defender
---     rotation runs on it: 2+ contacts at an area is a hit (Rotate +
---     PressureBonus), a lone contact is a bait until proven otherwise
---     (BaitPenalty). The B-anchor no longer sprints cross-map because one
---     lurker showed a shoulder — and no longer SITS there while four
---     attackers execute (zero defender rotations in five rounds, #15).
---   * THE DROPPED SPIKE IS THE ROUND: while the spike is down, attackers
---     waive the at-objective penalty entirely (a site without the spike is
---     not an objective) and RetrieveBonus is 0.35 — #15 round 4: Rook held
---     an empty B Site for 70 seconds, 0.04 short of the hysteresis margin
---     forever, and the clock won. Never again.
---   * SPIKE GUARD: a dropped spike is a third site. The two closest living
---     defenders are assigned to sit on it; it unpicks itself the moment an
---     attacker picks the spike up.
---   * DELIBERATE FACING: bots idle-facing now turn onto the threat direction
---     (or their side's watch direction) instead of contemplating walls. The
---     visor on the rig (BotSpawner) makes it visible.
---   * ANTI-TRAIN: the approach peek is skipped when a living teammate is
---     already in the zone ahead — the first bot checks the corner, the rest
---     trade off the information instead of queueing for the same window.
+-- v4.4 (playtest #16):
+--   * THE FACING LOOP. AutoRotate is off — the legs no longer own the eyes.
+--     The brain leaves a facePoint every tick (a visible enemy, a fresh
+--     contact, the waypoint, the watch line, the threat direction) and a
+--     dedicated loop turns toward it at the hold rate. Combat owns facing
+--     mid-burst (faster, accuracy-coupled). A bot can now watch the flank
+--     while it crosses the lane.
+--   * SUPPRESSION RIDES THE RADIO: getting pinned by near-misses (Combat
+--     stamps it) produces a callout like taking damage does.
+--   * HONEST SPIKE MARKS (joined memory): the drop's FACT is public, its
+--     LOCATION is per-side intel — attackers heard the carrier die (radio
+--     mark from the round machine), defenders must put eyes on the drop.
+--     Retrieval and spike-guard both walk to the side's MARK, never the
+--     omniscient truth.
+--   * Solo-defuser scoring threshold (BrainCore: closerToSite >= 1).
 --
--- v4.2 carried: BrainTuning rack, role-affinity positioning, smooth hold
--- facing. v4.1: barrier phase, sampler rebuild, personal space, retake
--- structure, post-plant web, swings. v4.0: callouts, claims, approach peeks.
--- Earlier history in the git log. Style rule: no inner quotes in log strings.
+-- v4.3 carried: team-pressure confirmation gate, the round-4 retrieval fix,
+-- spike guard, deliberate idle facing, anti-train peeks. v4.1/v4.2: barrier
+-- phase, sampler rebuild, retake structure, post-plant web, swings, the
+-- tuning rack, role affinity. Earlier history in the git log. Style rule:
+-- no inner quotes in log strings. Ever. (Brain:772, 2026-08-15.)
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Shared = ReplicatedStorage:WaitForChild("Shared")
@@ -36,7 +32,6 @@ local Shared = ReplicatedStorage:WaitForChild("Shared")
 local SimConfig = require(Shared.Constants.SimConfig)
 local Scenario = require(Shared.Constants.Scenario)
 local Zones = require(Shared.MapData.Zones)
-local Greybox = require(Shared.MapData.Greybox)
 local Tuning = require(Shared.Constants.BrainTuning)
 
 local Pathing = require(script.Parent.Pathing)
@@ -45,6 +40,7 @@ local Combat = require(script.Parent.Combat)
 local Telemetry = require(script.Parent.Telemetry)
 local Objective = require(script.Parent.Objective)
 local MatchState = require(script.Parent.MatchState)
+local BrainCore = require(script.Parent.BrainCore)
 
 local Brain = {}
 
@@ -52,198 +48,18 @@ local Brain = {}
 -- brains read their own — and the TEAM PRESSURE model reads all of them.
 Brain.perceptions = {} :: { [string]: any }
 
-local CANDIDATES = 6
-local CLEARANCE_RADIUS = 2.6
-local GROUND_TOLERANCE = 2.5
-local ALLY_CROWD_STUDS = 25
-local PERSONAL_SPACE = 6 -- sampled destinations keep this much room per teammate
-local DIRECT_WALK_MAX_HOPS = 6
 local INTERRUPT_RECHECK = 0.3
-local FRESH_CONTACT_SECONDS = 6
 local MAX_PEEKS = 3
 local SWING_CHANCE = 0.25 -- occasional wide peek; the rest are jiggles
 local SWING_STUDS = 9
-local ENEMY_NEAR_HOPS = 2
 local INTERRUPT_COMBAT_RANGE = 30
 local STALL_LOG_SECONDS = 8
 local CALLOUT_COOLDOWN = 4
 local APPROACH_PEEK_COOLDOWN = 6
 local APPROACH_PEEK_HOPS = 2
 local SAMPLE_DIAG_SECONDS = 10
-local HOLD_TURN_DEG_PER_SEC = 360 -- angle-hold facing cap (combat has its own)
-local PRESSURE_FRESH_SECONDS = 5 -- a contact older than this is not pressure
 
-local SITES = { "A_SITE", "B_SITE" }
-
--- MID_BACK deliberately absent. Including it made a corridor an acceptable
--- anchor, which is how a defender ended up holding nothing for 84 seconds.
-local DEF_HOLDS = { "A_SITE", "A_HEAVEN", "B_SITE", "B_HEAVEN" }
-local ATK_FORWARD = { "MID", "MID_LEDGE", "A_LOBBY", "B_LOBBY", "A_ELBOW", "B_ELBOW" }
-local DEF_FORWARD = { "MID", "MID_LEDGE", "MID_WINDOW", "A_SHORT", "B_SHORT" }
-local FLANKS = { "A_MAIN", "B_MAIN", "A_ELBOW", "B_ELBOW" }
-
--- Deep enemy territory: fine as a DESTINATION, never as a corridor.
-local ENEMY_DEEP = {
-	Attack = { DEF_LOBBY = true, DEF_SPAWN = true },
-	Defense = { ATK_LOBBY = true, ATK_SPAWN = true, MID_COURT = true },
-}
-
-local SAFE_ZONES = {
-	Attack = { "ATK_LOBBY", "MID_COURT", "ATK_SPAWN" },
-	Defense = { "DEF_LOBBY", "DEF_SPAWN" },
-}
-
--- Role-based positioning: within an assigned zone, which KIND of angle the
--- role gravitates to (matched against the point's zone tags).
-local ROLE_ZONE_AFFINITY = {
-	Sniper = { heaven = 0.25 },
-	Lurker = { connector = 0.25, choke = 0.15 },
-	Entry = { site = 0.15, choke = 0.10 },
-	Anchor = { site = 0.20 },
-	Support = { site = 0.10, heaven = 0.10 },
-	IGL = { mid = 0.20, choke = 0.10 },
-}
-
-local INTENTS = { "Hold", "Push", "Rotate", "Lurk", "FallBack", "Engage", "Plant", "Defuse" }
-
-type Pressure = { [string]: { [string]: boolean } }
-
-type Context = {
-	bot: any,
-	side: string,
-	role: string,
-	zoneKey: string,
-	aggression: number,
-	gameSense: number,
-	decisiveness: number,
-	contact: any,
-	visible: any,
-	assessment: any,
-	atObjective: boolean,
-	onAnchor: boolean,
-	alliesNear: number,
-	enemiesNear: number,
-	closerToSite: number,
-	coverZoneSet: { string }?,
-	pressure: Pressure,
-	spikeDown: boolean,
-	spikeZoneKey: string?,
-	guardRank: number,
-}
-
-local function clamp01(n: number): number
-	return math.clamp(n, 0, 1)
-end
-
--- The barrier phase: defenders are live during Buy (deploying to their
--- holds); attackers sleep frozen until LIVE.
-local function phaseIsLive(side: string): boolean
-	return MatchState.phase == "Live"
-		or MatchState.phase == "Planted"
-		or (MatchState.phase == "Buy" and side == "Defense")
-end
-
--- ---------------------------------------------------------------------------
--- TEAM PRESSURE. Pool every living teammate's fresh memory into a per-zone
--- set of DISTINCT confirmed enemies. One shoulder is a bait; two is a hit.
--- ---------------------------------------------------------------------------
-local function teamPressure(allies: { any }, now: number): Pressure
-	local pressure: Pressure = {}
-	for _, ally in allies do
-		local allyPerception = Brain.perceptions[ally.name]
-		local allyHumanoid = ally.model and ally.model:FindFirstChildOfClass("Humanoid")
-		if not allyPerception or not allyHumanoid or allyHumanoid.Health <= 0 then
-			continue
-		end
-		for enemyName, memoryContact in allyPerception.memory do
-			if enemyName ~= "the spike" and now - memoryContact.seenAt <= PRESSURE_FRESH_SECONDS then
-				local atZone = pressure[memoryContact.zoneKey]
-				if not atZone then
-					atZone = {}
-					pressure[memoryContact.zoneKey] = atZone
-				end
-				atZone[enemyName] = true
-			end
-		end
-	end
-	return pressure
-end
-
-local function pressureCount(pressure: Pressure, zoneKey: string): number
-	local names = pressure[zoneKey]
-	if not names then
-		return 0
-	end
-	local count = 0
-	for _ in names do
-		count += 1
-	end
-	return count
-end
-
--- ---------------------------------------------------------------------------
--- SAFE ROUTING. BFS over the zone graph that refuses to pass through deep
--- enemy territory. The destination itself is exempt.
--- ---------------------------------------------------------------------------
-local function hopsSafe(from: string, to: string, side: string): number
-	if from == to then
-		return 0
-	end
-	local banned = ENEMY_DEEP[side]
-	local dist: { [string]: number } = { [from] = 0 }
-	local queue = { from }
-	local head = 1
-	while head <= #queue do
-		local current = queue[head]
-		head += 1
-		local zone = Zones.byKey[current]
-		if zone then
-			for _, nextKey in zone.adjacent do
-				if dist[nextKey] == nil and (not banned[nextKey] or nextKey == to) then
-					dist[nextKey] = dist[current] + 1
-					table.insert(queue, nextKey)
-				end
-			end
-		end
-	end
-	return dist[to] or math.huge
-end
-
-local function nextHopSafe(from: string, to: string, side: string): string?
-	if from == to then
-		return nil
-	end
-	local zone = Zones.byKey[from]
-	if not zone then
-		return nil
-	end
-	local best: string? = nil
-	local bestDist = math.huge
-	for _, neighbour in zone.adjacent do
-		local dist = hopsSafe(neighbour, to, side)
-		if dist < bestDist then
-			best = neighbour
-			bestDist = dist
-		end
-	end
-	return best
-end
-
-local function nearestOf(keys: { string }, from: string, side: string): string?
-	local best: string? = nil
-	local bestHops = math.huge
-	for _, key in keys do
-		if key == from then
-			continue
-		end
-		local hops = hopsSafe(from, key, side)
-		if hops < bestHops then
-			best = key
-			bestHops = hops
-		end
-	end
-	return best
-end
+local K = BrainCore.K -- shared constants (freshness windows, hop budgets, spacing)
 
 -- WALK OR SPRINT — the info doctrine's speed half:
 local function wantsWalk(intent: string, side: string, currentKey: string, routeKey: string?, contact: any, now: number): boolean
@@ -253,7 +69,7 @@ local function wantsWalk(intent: string, side: string, currentKey: string, route
 	if intent == "Lurk" or intent == "FallBack" then
 		return true
 	end
-	if contact and now - contact.seenAt < FRESH_CONTACT_SECONDS then
+	if contact and now - contact.seenAt < K.FRESH_CONTACT_SECONDS then
 		return true -- fresh info: go quiet
 	end
 	if side == "Attack" and MatchState.planted then
@@ -268,408 +84,8 @@ local function wantsWalk(intent: string, side: string, currentKey: string, route
 	return false -- no info, no threat: run
 end
 
--- ---------------------------------------------------------------------------
--- SCORERS. Every weight reads BrainTuning LIVE — the tuner perturbs the
--- table between matches and the next tick plays by the new numbers.
--- ---------------------------------------------------------------------------
-local function scoreHold(ctx: Context): number
-	local T = Tuning.Hold
-	local score = T.Base + (T.Role[ctx.role] or 0.10)
-	if ctx.side == "Defense" then
-		score += T.DefenseBonus
-	end
-	score += ctx.aggression * T.AggressionPenalty
-	score += ctx.decisiveness * T.DecisivenessPenalty
-	if not ctx.contact then
-		score += T.NoContactBonus
-	end
-	if Zones.hasTag(ctx.zoneKey, "site") or Zones.hasTag(ctx.zoneKey, "heaven") then
-		score += T.HighGroundBonus
-	end
-	-- Guarding the dropped spike IS defending it.
-	if ctx.spikeDown and ctx.spikeZoneKey and ctx.zoneKey == ctx.spikeZoneKey then
-		score += T.SpikeGuardBonus
-	end
-	return score
-end
-
-local function scorePush(ctx: Context): number
-	local T = Tuning.Push
-	local score = T.Base + (T.Role[ctx.role] or 0.08)
-	score += ctx.aggression * T.AggressionBonus
-	if ctx.side == "Attack" then
-		score += T.AttackBonus
-	end
-	score += ctx.decisiveness * T.DecisivenessBonus
-	-- A site WITHOUT the spike is not an objective. The at-objective penalty
-	-- is waived while the spike is down — #15 round 4's 70-second freeze.
-	if ctx.atObjective and not ctx.spikeDown then
-		score += T.AtObjectivePenalty
-	end
-	if ctx.side == "Attack" and not MatchState.planted then
-		if MatchState.spikeCarrier == ctx.bot then
-			score += T.CarrierBonus
-			-- CARRIER DISCIPLINE: alone with a fresh nearby contact, the spike
-			-- does not entry-frag. Let the team catch up.
-			if ctx.alliesNear == 0 and ctx.contact and Zones.hops(ctx.zoneKey, ctx.contact.zoneKey) <= ENEMY_NEAR_HOPS then
-				score += T.CarrierAloneHotPenalty
-			end
-		elseif MatchState.spikeCarrier == nil and MatchState.spikePart then
-			-- Recovery — but cautiously: a spike in a known-hot zone is a trap.
-			local hot = ctx.contact and ctx.contact.zoneKey == ctx.spikeZoneKey and ctx.contact.source == "sight"
-			score += if hot then T.RetrieveHotBonus else T.RetrieveBonus
-		end
-	end
-	return score
-end
-
-local function scoreRotate(ctx: Context): number
-	if not ctx.contact then
-		return -1
-	end
-	local hops = Zones.hops(ctx.zoneKey, ctx.contact.zoneKey)
-	if hops == 0 or hops == math.huge then
-		return -1
-	end
-	local T = Tuning.Rotate
-	local score = T.Base + ctx.gameSense * T.GameSenseBonus
-	score += clamp01(hops / 6) * T.DistanceBonus
-	if ctx.contact.source == "sound" then
-		score += T.SoundPenalty
-	end
-	if Zones.hasTag(ctx.contact.zoneKey, "site") then
-		score += T.SiteBonus
-	end
-	-- CONFIRMATION GATE (defense): rotate on a confirmed hit — 2+ distinct
-	-- fresh contacts at the area — not on a one-man bait. Post-plant the
-	-- objective itself is confirmation enough.
-	if ctx.side == "Defense" and not MatchState.planted then
-		local count = pressureCount(ctx.pressure, ctx.contact.zoneKey)
-		if count >= 2 then
-			score += T.PressureBonus
-		elseif count <= 1 then
-			score += T.BaitPenalty
-		end
-	end
-	return score
-end
-
-local function scoreLurk(ctx: Context): number
-	local T = Tuning.Lurk
-	local score = T.Base + (T.Role[ctx.role] or 0.02)
-	score += (1 - ctx.aggression) * T.CalmBonus
-	score += ctx.decisiveness * T.DecisivenessPenalty
-	if ctx.alliesNear >= 1 then
-		score += T.CrowdPenalty
-	end
-	return score
-end
-
--- FALLBACK: alone, outnumbered, and not chained to the objective.
-local function scoreFallBack(ctx: Context): number
-	if ctx.enemiesNear < 2 or ctx.alliesNear > 0 then
-		return -1
-	end
-	if MatchState.planted then
-		return -1 -- the objective overrides survival
-	end
-	if MatchState.spikeCarrier == ctx.bot and Zones.hasTag(ctx.zoneKey, "plant") then
-		return -1
-	end
-	local T = Tuning.FallBack
-	local score = T.Base + (ctx.enemiesNear - 1) * T.PerExtraEnemy
-	score += T.Role[ctx.role] or 0
-	score += ctx.aggression * T.AggressionPenalty
-	return score
-end
-
-local function scoreEngage(ctx: Context): number
-	if not ctx.assessment then
-		return -1
-	end
-	return ctx.assessment.score
-end
-
-local function scorePlant(ctx: Context): number
-	if ctx.side ~= "Attack" or MatchState.planted or MatchState.phase ~= "Live" then
-		return -1
-	end
-	if MatchState.spikeCarrier ~= ctx.bot then
-		return -1
-	end
-	local T = Tuning.Plant
-	local score = T.Base + ctx.decisiveness * T.DecisivenessBonus
-	if Zones.hasTag(ctx.zoneKey, "plant") then
-		score += T.OnSiteBonus
-	end
-	if ctx.contact then
-		local hops = Zones.hops(ctx.zoneKey, ctx.contact.zoneKey)
-		if hops <= 2 then
-			score += T.HotSitePenalty
-		else
-			score += T.ContactPenalty
-		end
-	end
-	return score
-end
-
--- RETAKE STRUCTURE: only the two CLOSEST defenders take the defuse itself;
--- everyone else rotates in as the trade wave (driven by the plant contact).
-local function scoreDefuse(ctx: Context): number
-	if ctx.side ~= "Defense" or not MatchState.planted then
-		return -1
-	end
-	local T = Tuning.Defuse
-	local score = T.Base + ctx.gameSense * T.GameSenseBonus
-	if ctx.closerToSite >= 2 then
-		score += T.SupportWavePenalty
-	end
-	if ctx.zoneKey == MatchState.plantedZoneKey then
-		score += T.OnSiteBonus
-	end
-	return score
-end
-
-local SCORERS: { [string]: (Context) -> number } = {
-	Hold = scoreHold,
-	Push = scorePush,
-	Rotate = scoreRotate,
-	Lurk = scoreLurk,
-	FallBack = scoreFallBack,
-	Engage = scoreEngage,
-	Plant = scorePlant,
-	Defuse = scoreDefuse,
-}
-
-local function isBotPart(part: BasePart): boolean
-	local ancestor = part:FindFirstAncestorOfClass("Model")
-	return ancestor ~= nil and ancestor:GetAttribute("ClutchBot") == true
-end
-
--- ---------------------------------------------------------------------------
--- SAMPLER. 1. The ground a point stands on is never an obstruction. 2. Bots
--- never veto ground for bots — but destinations keep PERSONAL_SPACE from
--- living teammates. 3. Failure speaks: the rejecting part's name is logged.
--- ---------------------------------------------------------------------------
-local function standableReason(point: Vector3, ignore: Model): (boolean, string?)
-	local params = RaycastParams.new()
-	params.FilterType = Enum.RaycastFilterType.Exclude
-	params.FilterDescendantsInstances = { ignore }
-
-	local hit = workspace:Raycast(point + Vector3.new(0, 6, 0), Vector3.new(0, -12, 0), params)
-	if not hit then
-		return false, "no ground"
-	end
-	if math.abs(hit.Position.Y + 0.5 - point.Y) > GROUND_TOLERANCE then
-		return false, "off-height"
-	end
-
-	local parts = workspace:GetPartBoundsInRadius(hit.Position + Vector3.new(0, 2.5, 0), CLEARANCE_RADIUS)
-	for _, part in parts do
-		if part.CanCollide
-			and part ~= hit.Instance -- the floor beneath you is not an obstruction
-			and not part:IsDescendantOf(ignore)
-			and not isBotPart(part)
-		then
-			return false, part:GetFullName()
-		end
-	end
-	return true, nil
-end
-
-local function crowdClear(point: Vector3, allies: { any }?, selfBot: any): boolean
-	if not allies then
-		return true
-	end
-	for _, ally in allies do
-		if ally == selfBot then
-			continue
-		end
-		local allyModel = ally.model
-		if not allyModel or not allyModel.Parent then
-			continue
-		end
-		local allyHumanoid = allyModel:FindFirstChildOfClass("Humanoid")
-		if not allyHumanoid or allyHumanoid.Health <= 0 then
-			continue
-		end
-		local allyRoot = allyModel:FindFirstChild("HumanoidRootPart") :: BasePart?
-		if allyRoot then
-			local flat = Vector3.new(allyRoot.Position.X, point.Y, allyRoot.Position.Z)
-			if (flat - point).Magnitude < PERSONAL_SPACE then
-				return false
-			end
-		end
-	end
-	return true
-end
-
--- Ground-only validation for AUTHORED positions (cover points hug their own
--- cover by design; a clearance sphere vetoes all of them).
-local function hasGround(point: Vector3, ignore: Model): boolean
-	local params = RaycastParams.new()
-	params.FilterType = Enum.RaycastFilterType.Exclude
-	params.FilterDescendantsInstances = { ignore }
-	local hit = workspace:Raycast(point + Vector3.new(0, 6, 0), Vector3.new(0, -12, 0), params)
-	return hit ~= nil and math.abs(hit.Position.Y + 0.5 - point.Y) <= GROUND_TOLERANCE
-end
-
--- Random samples, then center-LINE samples at the LOCAL ground height, then
--- the zone center. Returns the point, or nil plus the last rejection reason.
-local function standablePointIn(
-	key: string,
-	rng: Random,
-	ignore: Model,
-	fromPos: Vector3?,
-	allies: { any }?,
-	selfBot: any
-): (Vector3?, string?)
-	local lastReason: string? = nil
-	local function try(point: Vector3?): Vector3?
-		if not point then
-			return nil
-		end
-		local ok, reason = standableReason(point, ignore)
-		if not ok then
-			lastReason = reason
-			return nil
-		end
-		if not crowdClear(point, allies, selfBot) then
-			lastReason = "a teammate is standing there"
-			return nil
-		end
-		return point
-	end
-
-	for _ = 1, CANDIDATES do
-		local point = try(Zones.samplePoint(key, rng))
-		if point then
-			return point, nil
-		end
-	end
-	local center = Zones.center(key)
-	if not center then
-		return nil, "unknown zone"
-	end
-	if fromPos then
-		for _, t in { 0.25, 0.5, 0.75 } do
-			local along = fromPos + (center - fromPos) * t
-			-- ride the LOCAL ground; the destination's height belongs to the deck
-			local point = try(Vector3.new(along.X, fromPos.Y, along.Z))
-			if point then
-				return point, nil
-			end
-		end
-	end
-	local point = try(center)
-	return point, lastReason
-end
-
-local function pickLurkZone(ctx: Context, allyZones: { string }): string?
-	local best: string? = nil
-	local bestScore = -math.huge
-	for _, key in FLANKS do
-		if key == ctx.zoneKey then
-			continue
-		end
-		local minHops = math.huge
-		for _, allyKey in allyZones do
-			local hops = Zones.hops(key, allyKey)
-			if hops ~= math.huge then
-				minHops = math.min(minHops, hops)
-			end
-		end
-		local score = if minHops == math.huge then 99 else minHops
-		if score > bestScore then
-			best = key
-			bestScore = score
-		end
-	end
-	return best
-end
-
--- COVER. Pick the declared cover point whose watch direction best matches the
--- threat, across the bot's cover zone set, skipping points claimed by a
--- living teammate — with a role affinity bump (the plan says WHERE, the role
--- says how it stands there).
-local function pickCoverPoint(ctx: Context, allies: { any }): (any?, Vector3?)
-	local zones = ctx.coverZoneSet or { ctx.zoneKey }
-	local affinity = ROLE_ZONE_AFFINITY[ctx.role]
-	local best: any = nil
-	local bestFace: Vector3? = nil
-	local bestScore = -0.2
-	for _, point in Greybox.coverPoints do
-		if not table.find(zones, point.zone) then
-			continue
-		end
-		local taken = false
-		for _, ally in allies do
-			if ally ~= ctx.bot and ally.claimedCover == point.name then
-				local allyHumanoid = ally.model and ally.model:FindFirstChildOfClass("Humanoid")
-				if allyHumanoid and allyHumanoid.Health > 0 then
-					taken = true
-					break
-				end
-			end
-		end
-		if taken then
-			continue
-		end
-		local face = if ctx.side == "Attack" and MatchState.planted then -point.face else point.face
-		face = Vector3.new(face.X, 0, face.Z).Unit
-		local threatDir: Vector3
-		if ctx.contact then
-			local contactCenter = Zones.center(ctx.contact.zoneKey)
-			if contactCenter then
-				threatDir = (contactCenter - point.pos) * Vector3.new(1, 0, 1)
-				threatDir = if threatDir.Magnitude > 0.1 then threatDir.Unit else Vector3.zAxis
-			else
-				threatDir = if ctx.side == "Defense" then Vector3.zAxis else -Vector3.zAxis
-			end
-		else
-			threatDir = if ctx.side == "Defense" then Vector3.zAxis else -Vector3.zAxis
-		end
-		local score = face:Dot(threatDir) + (if point.kind == "partial" then 0.10 else 0)
-		if affinity then
-			for tag, bonus in affinity do
-				if Zones.hasTag(point.zone, tag) then
-					score += bonus
-				end
-			end
-		end
-		if score > bestScore then
-			best = point
-			bestFace = face
-			bestScore = score
-		end
-	end
-	return best, bestFace
-end
-
--- Smooth facing. Combat owns its own turn rate and accuracy coupling; this is
--- the watch-line / idle-settle version.
-local function faceTowardSmooth(root: BasePart, dir: Vector3, dt: number)
-	local currentYaw = math.atan2(-root.CFrame.LookVector.X, -root.CFrame.LookVector.Z)
-	local desiredYaw = math.atan2(-dir.X, -dir.Z)
-	local delta = (desiredYaw - currentYaw + math.pi) % (math.pi * 2) - math.pi
-	local maxStep = math.rad(HOLD_TURN_DEG_PER_SEC) * dt
-	root.CFrame = CFrame.new(root.Position) * CFrame.Angles(0, currentYaw + math.clamp(delta, -maxStep, maxStep), 0)
-end
-
--- Where should an idle bot LOOK? At the freshest contact if there is one,
--- else toward the enemy's half. Never the wall.
-local function threatFaceDir(side: string, contact: any, fromPos: Vector3): Vector3
-	if contact then
-		local dir = (contact.pos - fromPos) * Vector3.new(1, 0, 1)
-		if dir.Magnitude > 0.1 then
-			return dir.Unit
-		end
-	end
-	return if side == "Defense" then Vector3.zAxis else -Vector3.zAxis
-end
-
--- HOLD THE ANGLE. Walk to the point, turn onto the watch line smoothly, then
--- jiggle-peek — or occasionally SWING wide.
+-- HOLD THE ANGLE. Walk to the point, leave the watch line as a facePoint
+-- (the facing loop owns the turn), then jiggle-peek — or occasionally SWING.
 local function holdAngle(
 	bot: any,
 	model: Model,
@@ -681,7 +97,7 @@ local function holdAngle(
 	clock: () -> number,
 	maxPeeks: number?
 ): boolean
-	if not hasGround(cover.pos, model) then
+	if not BrainCore.hasGround(cover.pos, model) then
 		return false
 	end
 	local result = Pathing.walkToWithResult(model, cover.pos, shouldInterrupt)
@@ -689,8 +105,8 @@ local function holdAngle(
 		return false
 	end
 
-	local root = model:FindFirstChild("HumanoidRootPart") :: BasePart?
 	local perp = Vector3.new(-faceDir.Z, 0, faceDir.X)
+	bot.facePoint = cover.pos + faceDir * 20
 
 	if Scenario.VerboseBrain then
 		local watchProbe = Zones.calloutAt(cover.pos + faceDir * 20)
@@ -711,9 +127,6 @@ local function holdAngle(
 			if Perception.visibleContact(perception) then
 				return true -- contact: the main loop owns the fight
 			end
-			if root then
-				faceTowardSmooth(root, faceDir, 0.25)
-			end
 			task.wait(0.25)
 		end
 
@@ -721,10 +134,10 @@ local function holdAngle(
 		local swinging = rng:NextNumber() < SWING_CHANCE
 		local peekDistance = if swinging then SWING_STUDS elseif cover.kind == "partial" then 4 else 5
 		local peekPos = cover.pos + perp * peekDistance
-		if not hasGround(peekPos, model) then
+		if not BrainCore.hasGround(peekPos, model) then
 			peekPos = cover.pos - perp * peekDistance
 		end
-		if not hasGround(peekPos, model) then
+		if not BrainCore.hasGround(peekPos, model) then
 			continue
 		end
 		if swinging and Scenario.VerboseBrain then
@@ -748,68 +161,9 @@ local function holdAngle(
 	return true
 end
 
-local function resolveTarget(intent: string, ctx: Context, allyZones: { string }, rng: Random): string?
-	if intent == "Engage" then
-		return nil
-	elseif intent == "Plant" then
-		if Zones.hasTag(ctx.zoneKey, "plant") then
-			return nil
-		end
-		return ctx.bot.siteChoice or nearestOf(SITES, ctx.zoneKey, ctx.side)
-	elseif intent == "Defuse" then
-		return MatchState.plantedZoneKey
-	elseif intent == "FallBack" then
-		return nearestOf(SAFE_ZONES[ctx.side], ctx.zoneKey, ctx.side)
-	elseif intent == "Rotate" then
-		return if ctx.contact then ctx.contact.zoneKey else nil
-	elseif intent == "Push" then
-		if ctx.side == "Attack" then
-			-- The dropped spike outranks any site assignment: the round is
-			-- un-winnable without it.
-			if not MatchState.planted and MatchState.spikeCarrier == nil and MatchState.spikePart then
-				return ctx.spikeZoneKey
-			end
-			return ctx.bot.siteChoice or nearestOf(SITES, ctx.zoneKey, ctx.side)
-		end
-		return nearestOf(DEF_FORWARD, ctx.zoneKey, ctx.side)
-	elseif intent == "Lurk" then
-		return pickLurkZone(ctx, allyZones)
-	end
-
-	-- Hold
-	if ctx.side == "Defense" then
-		-- GUARD THE DROP: a dropped spike is a third site. The two closest
-		-- living defenders sit on it; everyone else keeps their assignments.
-		if ctx.spikeDown and ctx.spikeZoneKey then
-			if ctx.zoneKey == ctx.spikeZoneKey then
-				return nil -- on guard
-			end
-			if ctx.guardRank < 2 then
-				return ctx.spikeZoneKey
-			end
-		end
-		if ctx.onAnchor then
-			return nil
-		end
-		return ctx.bot.holdChoice or nearestOf(DEF_HOLDS, ctx.zoneKey, ctx.side)
-	end
-	-- Post-plant attackers take the site web (site + heaven + short), not a
-	-- spot in the open.
-	if MatchState.planted and ctx.coverZoneSet then
-		if table.find(ctx.coverZoneSet, ctx.zoneKey) then
-			return nil
-		end
-		return nearestOf(ctx.coverZoneSet, ctx.zoneKey, ctx.side)
-	end
-	if Zones.hasTag(ctx.zoneKey, "site") or Zones.hasTag(ctx.zoneKey, "choke") or Zones.hasTag(ctx.zoneKey, "heaven") then
-		return nil
-	end
-	return nearestOf(ATK_FORWARD, ctx.zoneKey, ctx.side)
-end
-
 local function formatScores(scores: { [string]: number }): string
 	local parts = {}
-	for _, intent in INTENTS do
+	for _, intent in BrainCore.INTENTS do
 		table.insert(parts, ("%s %.2f"):format(intent, scores[intent]))
 	end
 	return table.concat(parts, "  ")
@@ -836,6 +190,29 @@ function Brain.start(bot: any, side: string, enemies: { any }, allies: { any }, 
 	local humanoid = model:FindFirstChildOfClass("Humanoid")
 	local combatState = Combat.newState(if humanoid then humanoid.Health else 100)
 	bot.combatState = combatState
+	Combat.states[bot.name] = combatState -- incoming fire stamps suppression here
+
+	-- THE FACING LOOP. The brain leaves a facePoint every tick; this loop
+	-- turns toward it at the hold rate. Combat owns facing mid-burst (the
+	-- 0.4s after a shot); the rest of the time the eyes are the brain's.
+	bot.facePoint = nil :: Vector3?
+	task.spawn(function()
+		while model.Parent do
+			local humanoidNow = model:FindFirstChildOfClass("Humanoid")
+			if not humanoidNow or humanoidNow.Health <= 0 then
+				break
+			end
+			local root = model:FindFirstChild("HumanoidRootPart") :: BasePart?
+			local target = bot.facePoint :: Vector3?
+			if root and target and clock() - combatState.lastShotAt > 0.4 then
+				local dir = (target - root.Position) * Vector3.new(1, 0, 1)
+				if dir.Magnitude > 0.5 then
+					BrainCore.faceTowardSmooth(root, dir.Unit, 0.08)
+				end
+			end
+			task.wait(0.08)
+		end
+	end)
 
 	task.spawn(function()
 		local intent = if side == "Attack" then "Push" else "Hold"
@@ -851,6 +228,7 @@ function Brain.start(bot: any, side: string, enemies: { any }, allies: { any }, 
 		local lastSampleDiagAt = -math.huge
 		local lastCalloutAt: { [string]: number } = {}
 		local lastDamageSeen = combatState.lastDamagedAt or 0
+		local lastSuppressSeen = combatState.lastSuppressedAt or -math.huge
 		local lastApproachPeekAt = -math.huge
 
 		-- Radio a contact to every living teammate. They receive it as a
@@ -863,7 +241,6 @@ function Brain.start(bot: any, side: string, enemies: { any }, allies: { any }, 
 			end
 			lastCalloutAt[contact.name] = now
 			if Scenario.VerboseBrain then
-				-- No inner quotes in log strings. Ever. (Brain:772, 2026-08-15.)
 				print(("[CLUTCH] %6.1fs  CALLOUT %s: %s — %s"):format(now, bot.name, verb, contact.zoneCallout))
 			end
 			task.delay(SimConfig.CalloutDelaySeconds, function()
@@ -905,7 +282,7 @@ function Brain.start(bot: any, side: string, enemies: { any }, allies: { any }, 
 			end
 			interruptCheckedAt = now
 			interruptAnswer = false
-			if not phaseIsLive(side) then
+			if not BrainCore.phaseIsLive(side) then
 				return true
 			end
 			local here = Zones.keyAt(Zones.groundOf(model))
@@ -943,7 +320,7 @@ function Brain.start(bot: any, side: string, enemies: { any }, allies: { any }, 
 			end
 
 			-- The barrier phase: defenders live during Buy; attackers sleep frozen.
-			if not phaseIsLive(side) then
+			if not BrainCore.phaseIsLive(side) then
 				task.wait(0.5)
 				continue
 			end
@@ -973,7 +350,8 @@ function Brain.start(bot: any, side: string, enemies: { any }, allies: { any }, 
 			end
 
 			-- CALLOUTS. A fresh sighting goes out on the radio; so does taking
-			-- fire from a suspect we already know about. Cooldown per enemy.
+			-- fire from a known suspect — and so does getting PINNED by fire
+			-- that never lands. Cooldown per enemy.
 			if visible then
 				shareContact(visible, ("Contact: %s"):format(visible.name), now)
 			else
@@ -984,6 +362,13 @@ function Brain.start(bot: any, side: string, enemies: { any }, allies: { any }, 
 						shareContact(contact, ("Under fire — %s"):format(contact.name), now)
 					end
 				end
+				local suppressedAt = combatState.lastSuppressedAt or -math.huge
+				if suppressedAt > lastSuppressSeen then
+					lastSuppressSeen = suppressedAt
+					if contact then
+						shareContact(contact, ("Pinned by %s"):format(contact.name), now)
+					end
+				end
 			end
 
 			if side == "Attack" and not MatchState.planted then
@@ -991,8 +376,8 @@ function Brain.start(bot: any, side: string, enemies: { any }, allies: { any }, 
 			end
 
 			-- THE PLANT IS LOUD. Every defender hears it: a standing sound contact
-			-- at the planted site, so Rotate drives the trade wave while the two
-			-- closest defenders take the defuse itself.
+			-- at the planted site, so Rotate drives the guard ring while the
+			-- single closest defender takes the defuse itself.
 			if side == "Defense" and MatchState.planted and MatchState.plantedZoneKey then
 				local spikeZone = Zones.byKey[MatchState.plantedZoneKey]
 				local spikePos = if MatchState.spikePart
@@ -1013,22 +398,63 @@ function Brain.start(bot: any, side: string, enemies: { any }, allies: { any }, 
 				end
 			end
 
-			-- The dropped spike is a live map fact for both sides: attackers must
-			-- retrieve it, defenders guard it.
+			-- THE DROPPED SPIKE, honestly. The FACT is public (a carrier died);
+			-- WHERE it lies is per-side intel: attackers heard it on the radio,
+			-- defenders must put eyes on the drop to mark it.
 			local spikeDown = not MatchState.planted and MatchState.spikeCarrier == nil and MatchState.spikePart ~= nil
-			local spikeZoneKey: string? = nil
+			local spikeFactZoneKey: string? = nil
 			if spikeDown and MatchState.spikePart then
-				spikeZoneKey = Zones.keyAt(MatchState.spikePart.Position)
+				spikeFactZoneKey = Zones.keyAt(MatchState.spikePart.Position)
 			end
 
-			-- Team intel pool: distinct fresh enemies per zone, across the whole
-			-- side's combined senses. The confirmation gate runs on this.
-			local pressure = teamPressure(allies, now)
+			-- EYES ON THE DROP: seeing the dropped spike marks it for your side.
+			-- (The spike part is CanQuery=false: LOS means nothing solid sits
+			-- between you and it.)
+			if spikeDown and MatchState.spikePart and spikeFactZoneKey then
+				local toSpike = MatchState.spikePart.Position - ground
+				local dist = toSpike.Magnitude
+				if dist <= SimConfig.VisionRangeStuds then
+					local losParams = RaycastParams.new()
+					losParams.FilterType = Enum.RaycastFilterType.Exclude
+					losParams.FilterDescendantsInstances = { model }
+					local hit = workspace:Raycast(ground, toSpike, losParams)
+					local blocked = hit ~= nil and (hit.Position - ground).Magnitude < dist - 1.5
+					if not blocked then
+						local markField = if side == "Attack" then "spikeMarkAtk" else "spikeMarkDef"
+						local existing = MatchState[markField]
+						if existing == nil or existing.zoneKey ~= spikeFactZoneKey or now - existing.at > 3 then
+							MatchState[markField] = { pos = MatchState.spikePart.Position, zoneKey = spikeFactZoneKey, at = now }
+							if Scenario.VerboseBrain then
+								print(("[CLUTCH] %6.1fs  CALLOUT %s: spike marked — %s"):format(
+									now,
+									bot.name,
+									if Zones.byKey[spikeFactZoneKey] then Zones.byKey[spikeFactZoneKey].callout else spikeFactZoneKey
+								))
+							end
+						end
+					end
+				end
+			end
+
+			-- What MY side knows about where the spike lies (nil = we don't).
+			local mySpikeMark = if side == "Attack" then MatchState.spikeMarkAtk else MatchState.spikeMarkDef
+			local mySpikeZoneKey: string? = if spikeDown and mySpikeMark then mySpikeMark.zoneKey else nil
+
+			-- Deliberate facing: look at what matters, not where the legs point.
+			if visible then
+				bot.facePoint = visible.pos
+			elseif contact and now - contact.seenAt < K.FRESH_CONTACT_SECONDS then
+				bot.facePoint = contact.pos
+			end
 
 			local assessment = nil
 			if visible then
 				assessment = Combat.assess(bot, weapon, visible, enemies, currentKey, combatState, now)
 			end
+
+			-- Team intel pool: distinct fresh enemies per zone, across the whole
+			-- side's combined senses. The confirmation gate runs on this.
+			local pressure = BrainCore.teamPressure(allies, Brain.perceptions, now)
 
 			local allyZones = {}
 			local alliesNear = 0
@@ -1036,11 +462,11 @@ function Brain.start(bot: any, side: string, enemies: { any }, allies: { any }, 
 			local guardRank = 0
 			local myHopsToSite = math.huge
 			if side == "Defense" and MatchState.planted and MatchState.plantedZoneKey then
-				myHopsToSite = hopsSafe(currentKey, MatchState.plantedZoneKey, side)
+				myHopsToSite = BrainCore.hopsSafe(currentKey, MatchState.plantedZoneKey, side)
 			end
 			local myHopsToSpike = math.huge
-			if spikeDown and spikeZoneKey and side == "Defense" then
-				myHopsToSpike = hopsSafe(currentKey, spikeZoneKey, side)
+			if spikeDown and mySpikeZoneKey and side == "Defense" then
+				myHopsToSpike = BrainCore.hopsSafe(currentKey, mySpikeZoneKey, side)
 			end
 			for _, ally in allies do
 				if ally == bot or not ally.model.Parent then
@@ -1053,16 +479,16 @@ function Brain.start(bot: any, side: string, enemies: { any }, allies: { any }, 
 				local allyGround = Zones.groundOf(ally.model)
 				local allyKey = Zones.keyAt(allyGround)
 				table.insert(allyZones, allyKey)
-				if (allyGround - ground).Magnitude <= ALLY_CROWD_STUDS then
+				if (allyGround - ground).Magnitude <= K.ALLY_CROWD_STUDS then
 					alliesNear += 1
 				end
 				if myHopsToSite ~= math.huge then
-					if hopsSafe(allyKey, MatchState.plantedZoneKey, side) < myHopsToSite then
+					if BrainCore.hopsSafe(allyKey, MatchState.plantedZoneKey, side) < myHopsToSite then
 						closerToSite += 1
 					end
 				end
 				if myHopsToSpike ~= math.huge then
-					if hopsSafe(allyKey, spikeZoneKey :: string, side) < myHopsToSpike then
+					if BrainCore.hopsSafe(allyKey, mySpikeZoneKey :: string, side) < myHopsToSpike then
 						guardRank += 1
 					end
 				end
@@ -1073,19 +499,19 @@ function Brain.start(bot: any, side: string, enemies: { any }, allies: { any }, 
 				if memoryContact.name == "the spike" then
 					continue -- the objective is not a threat count
 				end
-				if now - memoryContact.seenAt < FRESH_CONTACT_SECONDS
-					and Zones.hops(currentKey, memoryContact.zoneKey) <= ENEMY_NEAR_HOPS
+				if now - memoryContact.seenAt < K.FRESH_CONTACT_SECONDS
+					and Zones.hops(currentKey, memoryContact.zoneKey) <= K.ENEMY_NEAR_HOPS
 				then
 					enemiesNear += 1
 				end
 			end
 
 			local reference = math.max(lastProgressAt, perception.lastContactAt)
-			local decisiveness = clamp01((now - reference) / Scenario.StallRampSeconds)
+			local decisiveness = math.clamp((now - reference) / Scenario.StallRampSeconds, 0, 1)
 
 			local atObjective = if side == "Attack"
 				then Zones.hasTag(currentKey, "site")
-				else table.find(DEF_FORWARD, currentKey) ~= nil
+				else table.find(BrainCore.DEF_FORWARD_SET, currentKey) ~= nil
 
 			-- Post-plant attackers spread across the site web, not a spot in the
 			-- open: the planted site + its heaven + its short.
@@ -1099,7 +525,7 @@ function Brain.start(bot: any, side: string, enemies: { any }, allies: { any }, 
 				}
 			end
 
-			local ctx: Context = {
+			local ctx: BrainCore.Context = {
 				bot = bot,
 				side = side,
 				role = bot.role,
@@ -1111,25 +537,25 @@ function Brain.start(bot: any, side: string, enemies: { any }, allies: { any }, 
 				visible = visible,
 				assessment = assessment,
 				atObjective = atObjective,
-				onAnchor = table.find(DEF_HOLDS, currentKey) ~= nil,
+				onAnchor = table.find(BrainCore.DEF_HOLDS, currentKey) ~= nil,
 				alliesNear = alliesNear,
 				enemiesNear = enemiesNear,
 				closerToSite = closerToSite,
 				coverZoneSet = coverZoneSet,
 				pressure = pressure,
 				spikeDown = spikeDown,
-				spikeZoneKey = spikeZoneKey,
+				spikeZoneKey = mySpikeZoneKey,
 				guardRank = guardRank,
 			}
 
 			local scores: { [string]: number } = {}
-			for _, name in INTENTS do
-				scores[name] = SCORERS[name](ctx)
+			for _, name in BrainCore.INTENTS do
+				scores[name] = BrainCore.SCORERS[name](ctx)
 			end
 
 			local winner = intent
 			local winnerScore = scores[intent]
-			for _, name in INTENTS do
+			for _, name in BrainCore.INTENTS do
 				local margin = if name == "Engage" then 0 else Tuning.Hysteresis
 				if name ~= intent and scores[name] > winnerScore + margin then
 					winner = name
@@ -1160,7 +586,7 @@ function Brain.start(bot: any, side: string, enemies: { any }, allies: { any }, 
 			-- The TEAM PLAN (RoundMachine) may have assigned these already; the
 			-- roll only fires for freelancers the plan leaves open.
 			if side == "Attack" and bot.siteChoice == nil then
-				bot.siteChoice = SITES[rng:NextInteger(1, #SITES)]
+				bot.siteChoice = BrainCore.SITES[rng:NextInteger(1, #BrainCore.SITES)]
 				if Scenario.VerboseBrain then
 					print(("[CLUTCH] %6.1fs  PLAN %s calls %s this round"):format(
 						clock(),
@@ -1169,7 +595,7 @@ function Brain.start(bot: any, side: string, enemies: { any }, allies: { any }, 
 					))
 				end
 			elseif side == "Defense" and bot.holdChoice == nil then
-				bot.holdChoice = DEF_HOLDS[rng:NextInteger(1, #DEF_HOLDS)]
+				bot.holdChoice = BrainCore.DEF_HOLDS[rng:NextInteger(1, #BrainCore.DEF_HOLDS)]
 				if Scenario.VerboseBrain then
 					print(("[CLUTCH] %6.1fs  PLAN %s anchors %s this round"):format(
 						clock(),
@@ -1179,7 +605,7 @@ function Brain.start(bot: any, side: string, enemies: { any }, allies: { any }, 
 				end
 			end
 
-			local targetKey = resolveTarget(intent, ctx, allyZones, rng)
+			local targetKey = BrainCore.resolveTarget(intent, ctx, allyZones, rng)
 
 			local walking = wantsWalk(intent, side, currentKey, routeKey, contact, now)
 			bot.speedMode = if walking then "walk" else "sprint"
@@ -1257,7 +683,7 @@ function Brain.start(bot: any, side: string, enemies: { any }, allies: { any }, 
 					-- Settle the zone. Claim the angle first — two bots on one crate
 					-- was the doorway traffic jam.
 					routeKey = nil
-					local cover, faceDir = pickCoverPoint(ctx, allies)
+					local cover, faceDir = BrainCore.pickCoverPoint(ctx, allies)
 					if cover and faceDir then
 						bot.claimedCover = cover.name
 						if holdAngle(bot, model, cover, faceDir, shouldInterrupt, perception, rng, clock) then
@@ -1265,31 +691,25 @@ function Brain.start(bot: any, side: string, enemies: { any }, allies: { any }, 
 						end
 						bot.claimedCover = nil
 					else
-						local spot = standablePointIn(currentKey, rng, model, ground, allies, bot)
+						local spot = BrainCore.standablePointIn(currentKey, rng, model, ground, allies, bot)
 						if spot then
 							Pathing.walkToWithResult(model, spot, shouldInterrupt)
 						end
-						-- Face the threat, never the wall: idle settles turn onto the
-						-- contact direction (or their side's watch direction).
+						-- Face the threat, never the wall: idle settles leave a
+						-- facePoint for the facing loop to turn onto.
 						local root = model:FindFirstChild("HumanoidRootPart") :: BasePart?
 						if root then
-							local faceDirNow = threatFaceDir(side, contact, root.Position)
-							for _ = 1, 4 do
-								faceTowardSmooth(root, faceDirNow, 0.15)
-								task.wait(0.1)
-							end
+							bot.facePoint = root.Position + BrainCore.threatFaceDir(side, contact, root.Position) * 20
 						end
 						task.wait(rng:NextNumber(0.6, 1.4))
 					end
 				else
 					-- THE INFO DOCTRINE, approach half: check the angle before you
-					-- cross it. Fires on decaying contacts within 2 hops, or simply
-					-- because the next zone is a choke (check corners) — but never
-					-- when a living teammate is ALREADY in that zone: the first bot
-					-- checks the corner, the rest trade off the information.
+					-- cross it — but never when a living teammate is ALREADY in that
+					-- zone: the first bot checks the corner, the rest trade off it.
 					local contactClose = contact ~= nil
 						and now - contact.seenAt < SimConfig.MemoryDecaySeconds
-						and hopsSafe(currentKey, contact.zoneKey, side) <= APPROACH_PEEK_HOPS
+						and BrainCore.hopsSafe(currentKey, contact.zoneKey, side) <= APPROACH_PEEK_HOPS
 					local chokeAhead = routeKey ~= nil and Zones.hasTag(routeKey, "choke")
 					local allyAhead = routeKey ~= nil and table.find(allyZones, routeKey) ~= nil
 					if (intent == "Push" or intent == "Rotate" or intent == "Lurk")
@@ -1297,7 +717,7 @@ function Brain.start(bot: any, side: string, enemies: { any }, allies: { any }, 
 						and not allyAhead
 						and now - lastApproachPeekAt > APPROACH_PEEK_COOLDOWN
 					then
-						local cover, faceDir = pickCoverPoint(ctx, allies)
+						local cover, faceDir = BrainCore.pickCoverPoint(ctx, allies)
 						if cover and faceDir then
 							lastApproachPeekAt = now
 							bot.claimedCover = cover.name
@@ -1307,9 +727,9 @@ function Brain.start(bot: any, side: string, enemies: { any }, allies: { any }, 
 					end
 
 					if routeKey == nil then
-						local hops = hopsSafe(currentKey, targetKey, side)
-						routeKey = if hops > DIRECT_WALK_MAX_HOPS
-							then (nextHopSafe(currentKey, targetKey, side) or targetKey)
+						local hops = BrainCore.hopsSafe(currentKey, targetKey, side)
+						routeKey = if hops > K.DIRECT_WALK_MAX_HOPS
+							then (BrainCore.nextHopSafe(currentKey, targetKey, side) or targetKey)
 							else targetKey
 					end
 
@@ -1321,21 +741,25 @@ function Brain.start(bot: any, side: string, enemies: { any }, allies: { any }, 
 					else
 						local retrieving = side == "Attack"
 							and spikeDown
-							and routeKey == spikeZoneKey
+							and mySpikeZoneKey ~= nil
+							and routeKey == mySpikeZoneKey
 						local spot, sampleReason
-						if retrieving and MatchState.spikePart then
-							local spikePos = MatchState.spikePart.Position
+						if retrieving and mySpikeMark then
+							local spikePos = mySpikeMark.pos
 							spot = Vector3.new(spikePos.X, 1, spikePos.Z)
-							local ok, reason = standableReason(spot, model)
+							local ok, reason = BrainCore.standableReason(spot, model)
 							if not ok then
 								sampleReason = reason
 								spot = nil
 							end
 						else
-							spot, sampleReason = standablePointIn(routeKey, rng, model, ground, allies, bot)
+							spot, sampleReason = BrainCore.standablePointIn(routeKey, rng, model, ground, allies, bot)
 						end
 
 						if spot then
+							if not (visible or (contact and now - contact.seenAt < K.FRESH_CONTACT_SECONDS)) then
+								bot.facePoint = spot -- watch where you're walking
+							end
 							local result = Pathing.walkToWithResult(model, spot, shouldInterrupt)
 							if result == "failed" then
 								routeKey = nil
@@ -1385,6 +809,9 @@ function Brain.start(bot: any, side: string, enemies: { any }, allies: { any }, 
 		perception.running = false
 		if Brain.perceptions[bot.name] == perception then
 			Brain.perceptions[bot.name] = nil
+		end
+		if Combat.states[bot.name] == combatState then
+			Combat.states[bot.name] = nil
 		end
 		if onStop then
 			task.defer(onStop)
