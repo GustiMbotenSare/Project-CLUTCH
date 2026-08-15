@@ -1,21 +1,17 @@
 --!strict
--- Greybox v4 — the de-labyrinthed 5v5 map. Still data, still no Studio work.
+-- Greybox v4.1 — the de-labyrinthed 5v5 map + spawn sight seals.
+--
+-- v4 → v4.1 (playtest #14):
+--   * DEFENDER SPAWN SCREENS (z=-58). The site→lobby back route left a clean
+--     sightline from A Site INTO the defender spawn — Echo killed Jinx there
+--     at 52 studs while she was still deploying. Screens span the spawn face
+--     with one mid gap (x -25..25); defenders exit around it.
 --
 -- v3.1 → v4 (playtest #13 — the "claustrophobic rat maze" review):
---   * TRENCHES REMOVED. The 22-wide parallel-wall lanes are gone. Lanes are
---     open boulevards (35+ studs) with dedicated full/partial cover islands
---     instead of walls — room to strafe, fall back, and swing.
---   * SITES OPENED UP. The tower/bunker clutter is out. Each site keeps a
---     default crate + a mid crate, gets a 20-wide main door (was 12), and the
---     heaven is now a real OVERLOOK: a long elevated deck on the site's north
---     edge with a rail, watching the door and the plant zone. That's the
---     verticality the review asked for — sniper-usable, attacker-visible.
---   * MID CONNECTS CLEANLY. The short connectors now open straight into Mid
---     (single 8-wide gaps in the dividers), so mid control converts to a
---     split without a staggered T-intersection maze.
---   * Same skeleton discipline: 25 zone keys survive (bounds re-derived), the
---     defender back route survives (sites open toward the defender lobby
---     between the heaven deck and the pocket wall), shorts stay capped.
+--   * Trench lanes removed — open boulevards with cover islands.
+--   * Sites opened up — 20-wide main doors, no bunker clutter, and heavens
+--     are real overlook decks (rail over the door + plant zone).
+--   * Shorts connect straight into Mid via single divider gaps.
 --
 -- Coordinates: y up. Attackers south (+z), defenders north (-z).
 -- Site A west (-x), Site B east (+x). Floor top y = 1.
@@ -92,8 +88,14 @@ local parts: { PartSpec } = {
 	{ name = "ScrN1", pos = Vector3.new(-32, 7, -46), size = Vector3.new(32, 12, 2), color = WALL },
 	{ name = "ScrN2", pos = Vector3.new(32, 7, -46), size = Vector3.new(32, 12, 2), color = WALL },
 
+	-- DEFENDER SPAWN SCREENS (z=-58): the back route left spawn visible from
+	-- the sites (playtest #14: Echo killed Jinx in spawn from A Site at 52
+	-- studs). One mid gap (x -25..25); defenders deploy around it.
+	{ name = "DefScreenL", pos = Vector3.new(-70, 7, -58), size = Vector3.new(90, 12, 2), color = WALL },
+	{ name = "DefScreenR", pos = Vector3.new(70, 7, -58), size = Vector3.new(90, 12, 2), color = WALL },
+
 	-- A LANE: no inner wall. The outer wall + two cover islands make the
--- 	space, not a corridor. Full block mid-lane is the S-bend anchor.
+	-- space, not a corridor. Full block mid-lane is the S-bend anchor.
 	{ name = "LaneWestOuter", pos = Vector3.new(-105, 7, 17.5), size = Vector3.new(2, 12, 79), color = WALL },
 	{ name = "ALaneFull", pos = Vector3.new(-88, 7, 8), size = Vector3.new(8, 12, 8), color = COVER_FULL },
 	{ name = "ALaneHalf", pos = Vector3.new(-88, 3.25, 30), size = Vector3.new(6, PARTIAL, 3), color = CRATE },
