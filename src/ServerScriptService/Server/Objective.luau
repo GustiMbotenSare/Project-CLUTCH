@@ -25,6 +25,11 @@
 -- the FIRST line of explode() — the whole function died before setting
 -- exploded. Playtest #12: the spike planted at 23s, the fuse errored at 67s,
 -- and the round soft-locked past 130s with the spike live forever.
+--
+-- PLANT FACING IS A HANDOFF (playtest #17): faceThreat used to write the
+-- root's CFrame directly — the same physics-stomp that put every walk in the
+-- match into BLOCKED. Now it hands the brain's facing loop a facePoint and
+-- the planter turns THROUGH the channel via AimAlign.
 
 local Debris = game:GetService("Debris")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -224,20 +229,14 @@ local function explode(clock: () -> number)
 	print(("[CLUTCH] %6.1fs  EXPLODED — the spike takes the site"):format(clock()))
 end
 
--- Face the last known threat before crouching. Planting with your back to the
--- angle you were contacted from is how you die doing nothing.
+-- Face the last known threat before crouching: hand the facing loop the
+-- point and the planter turns THROUGH the channel via AimAlign. (Direct
+-- CFrame writes on a possibly-walking root were playtest #17's BLOCKED.)
 local function faceThreat(bot: any, threatPos: Vector3?)
 	if not threatPos then
 		return
 	end
-	local root = rootOf(bot.model)
-	if not root then
-		return
-	end
-	local flat = Vector3.new(threatPos.X, root.Position.Y, threatPos.Z)
-	if (flat - root.Position).Magnitude > 0.1 then
-		root.CFrame = CFrame.lookAt(root.Position, flat)
-	end
+	bot.facePoint = threatPos
 end
 
 -- Carrier standing on a plant zone commits to the full 4 seconds — unless an
