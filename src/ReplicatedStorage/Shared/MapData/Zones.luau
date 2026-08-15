@@ -3,7 +3,7 @@
 -- names ("Long A", "Catwalk", "Mid Doors").
 --
 -- Why this module exists:
---   * Bots should reason about SPACE, not coordinates. "Rotate to B Site" is a
+--   * Bots reason about SPACE, not coordinates. "Rotate to B Site" is a
 --     decision a caster can narrate; "walk to 50, 1, -30" is a side effect.
 --   * Callouts, the kill feed and the future TTS caster all need real names.
 --   * Movement logs collapse from 4Hz coordinate spam into a zone timeline.
@@ -12,15 +12,15 @@
 --
 -- Zones are semantic labels over space, NOT collision volumes. They overlap
 -- freely; the SMALLEST containing zone wins, so "A Door" beats "A Site".
--- Floor zones occupy y 0..5.5 and decks y 4.2..9, resolved against a bot's
--- GROUND position (feet). The bands OVERLAP 4.2..5.5: a ramp's top end sits
--- at y ~5 while still inside the ramp zone's footprint, and the smallest-
--- zone-wins rule keeps decks correct anyway (heaven is smaller than site).
+-- Floor zones occupy y 0..5.5 and decks y 4.2..9 (bands overlap so ramp tops
+-- never fall between them), resolved against a bot's GROUND position.
 --
--- v3: re-derived for the 230x150 5v5 greybox; sites adjoin DEF_LOBBY (the
--- defender back route).
--- v3.1 (playtest #11): sites grow 4 studs south (z -50..-18) — the site read
--- as a corridor next to the lobby. Doors/shorts/lobbies shift to match.
+-- v4: re-derived for the de-labyrinthed greybox. Same 25 keys survive.
+--   * Shorts open straight into MID (the divider gaps moved to z -30..-22);
+--     MID_BACK is now a pure pass-through (window <-> defender lobby).
+--   * Heavens are long overlook decks on the sites' north edges.
+--   * Lanes lost their inner walls: A_MAIN/A_LOBBY is a zone line, not a
+--     wall line — the boulevard the playtest #13 review asked for.
 
 export type ZoneKey = string
 export type Control = "Attack" | "Defense" | "Neutral"
@@ -51,77 +51,76 @@ type ZoneDef = {
 local FLOOR_MIN, FLOOR_MAX = 0, 5.5 -- overlaps the deck band; ramps span both
 local DECK_MIN, DECK_MAX = 4.2, 9
 
--- Bounds derived from Greybox v3.1 geometry. Attackers south (+z), defenders
+-- Bounds derived from Greybox v4 geometry. Attackers south (+z), defenders
 -- north (-z), Site A west (-x), Site B east (+x).
 local defs: { ZoneDef } = {
 	{
 		key = "ATK_SPAWN", callout = "Attacker Spawn",
-		x = { -115, 115 }, z = { 55, 70 },
+		x = { -115, 115 }, z = { 58, 72 },
 		control = "Attack", tags = { "spawn" },
-		adjacent = { "ATK_LOBBY" },
+		adjacent = {},
 	},
 	{
 		key = "ATK_LOBBY", callout = "Attacker Lobby",
-		x = { -115, 115 }, z = { 28, 55 },
+		x = { -115, 115 }, z = { 32, 58 },
 		control = "Attack", tags = { "lobby" },
 		adjacent = { "ATK_SPAWN", "A_MAIN", "B_MAIN", "MID_COURT", "A_LOBBY", "B_LOBBY" },
 	},
 
-	-- A side (corridor x -94..-72 between the lane walls)
+	-- A side: open boulevard (no inner wall) + lobby + site pocket
 	{
 		key = "A_MAIN", callout = "A Main",
-		x = { -94, -72 }, z = { -2, 55 },
+		x = { -105, -70 }, z = { -2, 55 },
 		control = "Neutral", tags = { "lane", "flank" },
 		adjacent = { "A_ELBOW" },
 	},
 	{
 		key = "A_ELBOW", callout = "A Elbow",
-		x = { -94, -72 }, z = { -26, -2 },
+		x = { -105, -70 }, z = { -22, -2 },
 		control = "Neutral", tags = { "lane", "choke", "flank" },
 		adjacent = { "A_LOBBY" },
 	},
 	{
 		key = "A_LOBBY", callout = "A Lobby",
-		x = { -72, -26 }, z = { -18, 28 },
+		x = { -70, -26 }, z = { -20, 32 },
 		control = "Neutral", tags = { "lobby" },
 		adjacent = { "A_DOOR", "A_SHORT" },
 	},
 	{
 		key = "A_DOOR", callout = "A Door",
-		x = { -66, -54 }, z = { -20, -14 },
+		x = { -75, -55 }, z = { -22, -14 }, -- the 20-wide main door
 		control = "Neutral", tags = { "choke" },
 		adjacent = { "A_SITE" },
 	},
 	{
 		key = "A_SITE", callout = "A Site",
-		x = { -95, -48 }, z = { -50, -18 }, -- v3.1: four studs deeper south
+		x = { -95, -45 }, z = { -52, -20 },
 		control = "Defense", tags = { "site", "plant" },
-		-- DEF_LOBBY: the back route. Sites open north; defenders arrive first.
-		adjacent = { "A_RAMP", "A_SHORT", "A_HEAVEN", "DEF_LOBBY" },
+		adjacent = { "A_SHORT", "A_RAMP", "A_HEAVEN", "DEF_LOBBY" },
 	},
 	{
 		key = "A_RAMP", callout = "A Ramp",
-		x = { -80, -66 }, z = { -48, -38 },
+		x = { -69, -55 }, z = { -52, -42 },
 		control = "Defense", tags = { "connector" },
 		adjacent = { "A_HEAVEN" },
 	},
 	{
 		key = "A_HEAVEN", callout = "A Heaven",
-		x = { -92, -80 }, z = { -48, -38 }, elevated = true,
+		x = { -91, -69 }, z = { -52, -42 }, elevated = true,
 		control = "Defense", tags = { "heaven", "site" },
-		adjacent = { "A_RAMP" },
+		adjacent = {}, -- mirrors: A_RAMP up, A_SITE drop
 	},
 	{
 		key = "A_SHORT", callout = "A Short",
-		x = { -48, -26 }, z = { -50, -18 },
+		x = { -45, -26 }, z = { -52, -20 },
 		control = "Neutral", tags = { "connector", "choke" },
-		adjacent = { "MID_BACK" },
+		adjacent = { "MID" }, -- clean mid connector; site/lobby via mirrors
 	},
 
 	-- Mid
 	{
 		key = "MID_COURT", callout = "Mid Courtyard",
-		x = { -26, 26 }, z = { 12, 28 },
+		x = { -26, 26 }, z = { 12, 32 },
 		control = "Attack", tags = { "mid" },
 		adjacent = { "MID" },
 	},
@@ -133,9 +132,9 @@ local defs: { ZoneDef } = {
 	},
 	{
 		key = "MID_LEDGE", callout = "Mid Ledge",
-		x = { -8, 8 }, z = { -24, -12 }, elevated = true,
+		x = { -8, 8 }, z = { -22, -12 }, elevated = true,
 		control = "Neutral", tags = { "mid", "heaven" },
-		adjacent = { "MID" },
+		adjacent = {}, -- mirror: MID
 	},
 	{
 		key = "MID_WINDOW", callout = "Mid Window",
@@ -145,71 +144,71 @@ local defs: { ZoneDef } = {
 	},
 	{
 		key = "MID_BACK", callout = "Mid Back",
-		x = { -26, 26 }, z = { -45, -32 },
+		x = { -26, 26 }, z = { -46, -32 },
 		control = "Defense", tags = { "mid" },
-		adjacent = { "B_SHORT", "DEF_LOBBY" },
+		adjacent = { "DEF_LOBBY" },
 	},
 
 	-- B side (mirror)
 	{
 		key = "B_SHORT", callout = "B Short",
-		x = { 26, 48 }, z = { -50, -18 },
+		x = { 26, 45 }, z = { -52, -20 },
 		control = "Neutral", tags = { "connector", "choke" },
-		adjacent = { "B_SITE", "B_LOBBY" },
+		adjacent = { "B_SITE" }, -- MID + B_LOBBY via mirrors
 	},
 	{
 		key = "B_SITE", callout = "B Site",
-		x = { 48, 95 }, z = { -50, -18 }, -- v3.1: four studs deeper south
+		x = { 45, 95 }, z = { -52, -20 },
 		control = "Defense", tags = { "site", "plant" },
 		adjacent = { "B_RAMP", "B_HEAVEN", "B_DOOR", "DEF_LOBBY" },
 	},
 	{
 		key = "B_RAMP", callout = "B Ramp",
-		x = { 66, 80 }, z = { -48, -38 },
+		x = { 55, 69 }, z = { -52, -42 },
 		control = "Defense", tags = { "connector" },
 		adjacent = { "B_HEAVEN" },
 	},
 	{
 		key = "B_HEAVEN", callout = "B Heaven",
-		x = { 80, 92 }, z = { -48, -38 }, elevated = true,
+		x = { 69, 91 }, z = { -52, -42 }, elevated = true,
 		control = "Defense", tags = { "heaven", "site" },
-		adjacent = { "B_RAMP" },
+		adjacent = {},
 	},
 	{
 		key = "B_DOOR", callout = "B Door",
-		x = { 54, 66 }, z = { -20, -14 },
+		x = { 55, 75 }, z = { -22, -14 },
 		control = "Neutral", tags = { "choke" },
 		adjacent = { "B_LOBBY" },
 	},
 	{
 		key = "B_LOBBY", callout = "B Lobby",
-		x = { 26, 72 }, z = { -18, 28 },
+		x = { 26, 70 }, z = { -20, 32 },
 		control = "Neutral", tags = { "lobby" },
-		adjacent = { "B_ELBOW" },
+		adjacent = { "B_ELBOW", "B_SHORT" },
 	},
 	{
 		key = "B_ELBOW", callout = "B Elbow",
-		x = { 72, 94 }, z = { -26, -2 },
+		x = { 70, 105 }, z = { -22, -2 },
 		control = "Neutral", tags = { "lane", "choke", "flank" },
 		adjacent = { "B_MAIN" },
 	},
 	{
 		key = "B_MAIN", callout = "B Main",
-		x = { 72, 94 }, z = { -2, 55 },
+		x = { 70, 105 }, z = { -2, 55 },
 		control = "Neutral", tags = { "lane", "flank" },
-		adjacent = { "ATK_LOBBY" },
+		adjacent = {}, -- mirrors: B_ELBOW, ATK_LOBBY
 	},
 
 	-- Defender side
 	{
 		key = "DEF_LOBBY", callout = "Defender Lobby",
-		x = { -115, 115 }, z = { -55, -45 },
+		x = { -115, 115 }, z = { -58, -46 },
 		control = "Defense", tags = { "lobby" },
-		adjacent = { "DEF_SPAWN" },
+		adjacent = { "DEF_SPAWN" }, -- sites + mid back via mirrors
 	},
 	{
 		key = "DEF_SPAWN", callout = "Defender Spawn",
-		x = { -115, 115 }, z = { -70, -55 },
+		x = { -115, 115 }, z = { -74, -58 },
 		control = "Defense", tags = { "spawn" },
 		adjacent = {},
 	},
