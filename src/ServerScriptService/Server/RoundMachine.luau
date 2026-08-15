@@ -14,15 +14,20 @@
 -- calls it — this is the seed of the M2 tactics board, where the manager
 -- makes the call and the same machinery executes it.
 --
--- CORPSES ARE GHOSTS: the dead freeze in place (anchored) and lose ALL
--- collision — a body in a doorway blocks nobody, and standable-point checks
--- no longer shrink around corpses.
+-- THE DEAD LEAVE. A corpse ghosts instantly (no collision, anchored so it
+-- can't sink), reads on the kill feed for a beat, then is REMOVED — a
+-- standing name-tagged corpse read as a living player on the broadcast. A
+-- ragdoll flourish replaces the removal when the animation pass lands.
 --
--- FUSE WATCHDOG: the explosion lives in Objective's fuse thread, and once
--- upon a time that thread crashed on itself (playtest #12's 130-second
--- soft-locked round). If the planted phase ever runs 5s past the fuse
--- without a resolution, the round machine declares the spike itself the
--- winner rather than letting a match hang forever.
+-- FUSE WATCHDOG: if the planted phase ever runs past the fuse without a
+-- resolution, the round machine declares the spike itself the winner rather
+-- than letting a match hang (playtest #12's 130-second soft-lock).
+--
+-- Also owns: the economy (win/loss ladders, kill rewards, plant bonus), the
+-- body swapper (pristine rigs each round, brain picks and cover claims
+-- cleared so the plan can reassign them), each bot's INVENTORY string, the
+-- random spike carrier, and the SpikeDown publish (dropped ≠ planted — the
+-- dashboard conflated them).
 --
 -- Deliberately NOT here: halftime side swaps (needs team identity), overtime,
 -- armor/shields, weapon drops on death. All tracked in the build doc.
@@ -42,6 +47,7 @@ local RoundMachine = {}
 
 local DEFAULT_WALK_SPEED = 16
 local DEFAULT_JUMP_POWER = 50
+local CORPSE_LINGER_SECONDS = 1.25 -- enough for the kill to read, then gone
 
 local SITES = { "A_SITE", "B_SITE" }
 local DEF_FORWARD = { "MID", "MID_LEDGE", "MID_WINDOW", "A_SHORT", "B_SHORT" }
@@ -98,7 +104,7 @@ local function markBot(bot: any, side: string)
 	model:SetAttribute("Weapon", if bot.weapon then bot.weapon.DisplayName else "?")
 end
 
--- The dead become scenery: frozen where they fell, zero collision.
+-- The dead ghost instantly (zero collision, anchored in place)...
 local function ghostCorpse(model: Model)
 	for _, inst in model:GetDescendants() do
 		if inst:IsA("BasePart") then
@@ -107,8 +113,18 @@ local function ghostCorpse(model: Model)
 	end
 	local root = model:FindFirstChild("HumanoidRootPart") :: BasePart?
 	if root then
-		root.Anchored = true -- keeps the no-clip rig from sinking through the floor
+		root.Anchored = true
 	end
+end
+
+-- ...then leave the map entirely. The dashboard keeps the bot's card (greyed)
+-- from its last attributes; the world stops pretending they're standing there.
+local function removeCorpseLater(model: Model)
+	task.delay(CORPSE_LINGER_SECONDS, function()
+		if model.Parent then
+			model:Destroy()
+		end
+	end)
 end
 
 -- v1 buy logic: the best primary you can afford, or the free Sidearm. Snipers
@@ -141,11 +157,12 @@ end
 -- Every round starts with pristine rigs at spawn. Old bodies (and the brains,
 -- perception loops and death watchers riding them) are destroyed; Telemetry
 -- tracks survive because they re-read bot.model every tick. Per-round brain
--- picks (siteChoice/holdChoice) are cleared so the plan can reassign them.
+-- picks AND cover claims are cleared so the plan can reassign them.
 local function resetBodies(ctx: Ctx)
 	for _, bot in ctx.roster do
 		bot.siteChoice = nil
 		bot.holdChoice = nil
+		bot.claimedCover = nil
 		local old = bot.model :: Model?
 		local fresh = (bot.template :: Model):Clone()
 		if old then
@@ -168,6 +185,12 @@ local function publish(ctx: Ctx)
 	ctx.remotes:SetAttribute("AtkScore", MatchState.atkScore)
 	ctx.remotes:SetAttribute("DefScore", MatchState.defScore)
 	ctx.remotes:SetAttribute("Planted", MatchState.planted)
+	-- Dropped and planted are different headlines; the dashboard used to show
+	-- "SPIKE DOWN" for both.
+	ctx.remotes:SetAttribute(
+		"SpikeDown",
+		MatchState.spikePart ~= nil and MatchState.spikeCarrier == nil and not MatchState.planted
+	)
 end
 
 -- ---------------------------------------------------------------------------
@@ -271,8 +294,7 @@ end
 
 -- One watcher per bot per round. A death is final: kill feed, killer's kill
 -- reward, spike drop if the carrier fell, the victim drops to the free pistol
--- (bought primaries die with the body), the corpse turns into a no-clip
--- ghost, and that's it until next round.
+-- (bought primaries die with the body), the corpse ghosts then leaves.
 local function watchDeaths(ctx: Ctx, roundId: number)
 	for _, bot in ctx.roster do
 		task.spawn(function()
@@ -284,7 +306,8 @@ local function watchDeaths(ctx: Ctx, roundId: number)
 				local humanoid = model:FindFirstChildOfClass("Humanoid")
 				if humanoid and humanoid.Health <= 0 then
 					bot.deaths = (bot.deaths or 0) + 1
-					ghostCorpse(model) -- the dead never block a path
+					ghostCorpse(model) -- never block a path, even for the linger beat
+					removeCorpseLater(model)
 					local killerName = model:GetAttribute("LastKilledBy")
 					if killerName then
 						ctx.killFeed:FireAllClients({
@@ -412,8 +435,7 @@ function RoundMachine.start(ctx: Ctx)
 				and clock() > MatchState.plantedAt + RoundConfig.SpikeFuseSeconds + FUSE_WATCHDOG_GRACE
 			then
 				-- The fuse thread owns the explosion — but if it ever dies silently
-				-- (playtest #12's self-cancel crash), the match must not hang. The
-				-- spike always wins a fuse that outlives itself.
+				-- (playtest #12's self-cancel crash), the match must not hang.
 				warn("[CLUTCH] FUSE WATCHDOG: spike overstayed its fuse — calling it")
 				MatchState.exploded = true
 			else
