@@ -23,6 +23,11 @@
 -- to the carried weapon (Sidearm stub, Falcon length, Longshot long) — the
 -- broadcast can show loadouts before the inventory line is read.
 --
+-- CLONES ARE NOT SELF-SUFFICIENT (playtest #17): a fresh body inherits the
+-- template's parts but not its LOOPS — the procedural walk must be restarted
+-- per body, and AimAlign's target re-seeded to the spawn facing (otherwise
+-- every round opens with ten bots snapping back to a stale angle).
+--
 -- TEAM PLANS: every round opens with a CALL (Rush/Default/Split ×
 -- Standard/Stack/Aggro) — the seed of the M2 tactics board.
 --
@@ -161,11 +166,14 @@ end
 -- perception loops and death watchers riding them) are destroyed; Telemetry
 -- tracks survive because they re-read bot.model every tick. Per-round brain
 -- picks AND cover claims are cleared so the plan can reassign them.
+-- A clone inherits PARTS but not LOOPS: the walk swing restarts here, and
+-- AimAlign gets re-seeded to the spawn facing.
 local function resetBodies(ctx: Ctx)
 	for _, bot in ctx.roster do
 		bot.siteChoice = nil
 		bot.holdChoice = nil
 		bot.claimedCover = nil
+		bot.facePoint = nil -- last round's stare dies with the body
 		local old = bot.model :: Model?
 		local fresh = (bot.template :: Model):Clone()
 		if old then
@@ -179,6 +187,14 @@ local function resetBodies(ctx: Ctx)
 		end
 		fresh.Parent = workspace
 		bot.model = fresh
+		-- The clone's AimAlign still points wherever the template faced — re-seed
+		-- it so the round doesn't open with ten bots snapping around.
+		local root = fresh:FindFirstChild("HumanoidRootPart") :: BasePart?
+		local align = if root then root:FindFirstChild("AimAlign") :: AlignOrientation? else nil
+		if align then
+			align.CFrame = CFrame.new(Vector3.zero) * (bot.spawnPivot :: CFrame).Rotation
+		end
+		BotSpawner.startProceduralWalk(fresh) -- task loops don't survive a clone
 	end
 end
 
