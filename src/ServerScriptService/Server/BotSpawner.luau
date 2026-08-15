@@ -6,25 +6,26 @@
 -- Bots never body-block EACH OTHER: they live in a collision group that
 -- doesn't self-collide (the playtest #11 B-door jam).
 --
--- THE VISUAL LAYER (playtest #16):
+-- THE VISUAL LAYER (playtest #16 + #17):
 --   * RIG_STYLE is the single source for every cosmetic choice — body tint
 --     per side, visor color, gun color/lengths. The reskin pass touches this
 --     table and the part names (Visor / Gun / NameTag), nothing else.
---   * Team body tints: attackers warm, defenders cool. The "all black"
---     default rigs read as one identical crowd; sides must read at a glance.
---   * THE GUN is a real physical part (a block, deliberately) welded at the
---     right hand — named, attributed with the weapon's name, and sized by
---     class, because the "dropped gun" phase will detach exactly this part.
---     CanQuery=false: it adds zero hitbox.
---   * THE VISOR: a neon strip on the head's front face — which way a bot is
---     LOOKING is half the broadcast. CanQuery=false as well.
---   * AUTOROTATE IS OFF: the legs no longer own the eyes. The brain's facing
---     loop turns the root toward what matters (a contact, the watch line,
---     the route ahead) while the feet path independently — a bot can watch
---     the flank while it crosses the lane, like a player would.
---   * PROCEDURAL WALK: R6 shoulder/hip motors swing out of phase with speed
---     (arms counter the same-side leg). Cheap, reskin-safe, and enough to
---     read movement at spectator distance.
+--   * Team body tints: attackers warm, defenders cool.
+--   * AIM ALIGN (playtest #17's catastrophe): every rig carries an
+--     AlignOrientation ("AimAlign") on the root. Turning a WALKING bot by
+--     writing its CFrame stomps the humanoid mover (every walk went BLOCKED
+--     in #17); the constraint turns the body with torque at a capped angular
+--     velocity — the physics-safe facing channel. The brain's facing loop
+--     and Combat point it; nobody writes the root's CFrame anymore.
+--   * THE GUN rides the raised right hand: welded to the Right Arm, and the
+--     procedural loop holds the right shoulder up (a bot carries its gun
+--     like it means it) while the left arm and legs swing with ground speed.
+--     Gun is named/attributed (WeaponName) for the dropped-gun phase and
+--     CanQuery=false (zero hitbox).
+--   * PROCEDURAL WALK: starts AFTER the model is parented (starting it
+--     before parenting exited the loop instantly — the "they still slide"
+--     bug) and is PUBLIC: the round machine restarts it on every clone.
+--   * AUTOROTATE IS OFF: the legs no longer own the eyes.
 
 local Players = game:GetService("Players")
 local PhysicsService = game:GetService("PhysicsService")
@@ -50,6 +51,11 @@ local RIG_STYLE = {
 	Gun = Color3.fromRGB(35, 35, 40),
 	GunLength = { Pistol = 0.8, Rifle = 1.4, Sniper = 1.9 },
 }
+
+-- The raised gun-arm pose: the right shoulder held forward (~80°), with the
+-- walk swing layered small on top so the gun doesn't wave around.
+local GUN_ARM_RAISED = CFrame.Angles(math.rad(80), 0, 0)
+local GUN_ARM_SWING_SCALE = 0.25
 
 export type BotRecord = {
 	name: string,
@@ -144,11 +150,39 @@ local function addVisor(model: Model)
 	visor.Parent = model
 end
 
--- THE GUN: a block at the right hand, long axis forward, named and
--- attributed — the dropped-gun phase detaches exactly this part.
+-- AIM ALIGN: the physics-safe facing channel. One attachment on the root,
+-- one AlignOrientation — turnToward points it, torque turns the body, the
+-- humanoid mover is never touched. (Direct CFrame writes on a walking root
+-- were playtest #17's universal BLOCKED.)
+local function addAimAlign(model: Model)
+	local root = model:WaitForChild("HumanoidRootPart", 5) :: BasePart?
+	if not root then
+		return
+	end
+	local attachment = root:FindFirstChild("RootAttachment") :: Attachment?
+	if not attachment then
+		attachment = Instance.new("Attachment")
+		attachment.Name = "RootAttachment"
+		attachment.Parent = root
+	end
+	local align = Instance.new("AlignOrientation")
+	align.Name = "AimAlign"
+	align.Mode = Enum.OrientationAlignmentMode.OneAttachment
+	align.Attachment0 = attachment
+	align.RigidityEnabled = false
+	align.Responsiveness = 30
+	align.MaxAngularVelocity = math.rad(360)
+	-- Hold the spawn facing until the brain points somewhere.
+	align.CFrame = CFrame.new(Vector3.zero) * root.CFrame.Rotation
+	align.Parent = root
+end
+
+-- THE GUN: a block riding the raised right hand — long axis down the arm,
+-- so when the shoulder holds the arm forward, the muzzle leads. Named and
+-- attributed for the dropped-gun phase; CanQuery=false (zero hitbox).
 local function addGun(model: Model)
-	local torso = model:WaitForChild("Torso", 5) :: BasePart?
-	if not torso then
+	local arm = model:WaitForChild("Right Arm", 5) :: BasePart?
+	if not arm then
 		return
 	end
 	local gun = Instance.new("Part")
@@ -163,10 +197,12 @@ local function addGun(model: Model)
 	gun.Massless = true
 	gun.CollisionGroup = BOT_COLLISION_GROUP
 	gun:SetAttribute("WeaponName", "Sidearm")
-	gun.CFrame = torso.CFrame * CFrame.new(0.6, -0.7, -0.6)
+	-- Muzzle along the arm, just past the hand. At ease it reads as lowered;
+	-- with the shoulder raised it leads the way.
+	gun.CFrame = arm.CFrame * CFrame.new(0, -1.15, 0) * CFrame.Angles(math.rad(90), 0, 0)
 
 	local weld = Instance.new("WeldConstraint")
-	weld.Part0 = torso
+	weld.Part0 = arm
 	weld.Part1 = gun
 	weld.Parent = gun
 
@@ -184,11 +220,14 @@ function BotSpawner.styleGun(model: Model, weapon: any)
 	gun:SetAttribute("WeaponName", weapon.DisplayName)
 end
 
--- PROCEDURAL WALK: swing R6 shoulders/hips out of phase with ground speed.
--- Arms counter the same-side leg; amplitude follows velocity; idle relaxes.
-local function startProceduralWalk(model: Model)
-	local humanoid = model:WaitForChild("Humanoid", 5)
-	local torso = model:WaitForChild("Torso", 5)
+-- PROCEDURAL WALK. PUBLIC: the round machine restarts this on every cloned
+-- body (task loops don't survive a clone). Right shoulder holds the gun arm
+-- up (GUN_ARM_RAISED) with a small layered swing; left arm and both legs
+-- swing against it with ground speed. Call AFTER the model is parented —
+-- starting it earlier exited instantly (the "they still slide" bug).
+function BotSpawner.startProceduralWalk(model: Model)
+	local humanoid = model:FindFirstChildOfClass("Humanoid")
+	local torso = model:FindFirstChild("Torso")
 	if not humanoid or not torso then
 		return
 	end
@@ -199,7 +238,11 @@ local function startProceduralWalk(model: Model)
 
 	task.spawn(function()
 		local t = 0
-		while model.Parent and humanoid.Health > 0 do
+		while model.Parent do
+			local humanoidNow = model:FindFirstChildOfClass("Humanoid")
+			if not humanoidNow or humanoidNow.Health <= 0 then
+				break -- the dead stop mid-stride; the round machine retires the body
+			end
 			local dt = 0.05
 			t += dt
 			local root = model:FindFirstChild("HumanoidRootPart") :: BasePart?
@@ -210,7 +253,8 @@ local function startProceduralWalk(model: Model)
 				leftShoulder.Transform = leftShoulder.Transform:Lerp(CFrame.Angles(swing, 0, 0), 0.35)
 			end
 			if rightShoulder then
-				rightShoulder.Transform = rightShoulder.Transform:Lerp(CFrame.Angles(-swing, 0, 0), 0.35)
+				local target = GUN_ARM_RAISED * CFrame.Angles(-swing * GUN_ARM_SWING_SCALE, 0, 0)
+				rightShoulder.Transform = rightShoulder.Transform:Lerp(target, 0.35)
 			end
 			if leftHip then
 				leftHip.Transform = leftHip.Transform:Lerp(CFrame.Angles(-swing, 0, 0), 0.35)
@@ -259,7 +303,7 @@ function BotSpawner.spawnBot(
 	end
 
 	-- AUTOROTATE OFF: the legs no longer own the eyes. The brain's facing loop
-	-- decides what the bot looks at; the feet path independently.
+	-- (through AimAlign) decides what the bot looks at.
 	local humanoid = model:FindFirstChildOfClass("Humanoid")
 	if humanoid then
 		humanoid.AutoRotate = false
@@ -271,9 +315,11 @@ function BotSpawner.spawnBot(
 	addNameTag(model, name, tagColor)
 	addVisor(model)
 	addGun(model)
-	startProceduralWalk(model)
+	addAimAlign(model)
 
 	model.Parent = workspace
+	-- Walk swing starts AFTER parenting (starting earlier exited instantly).
+	BotSpawner.startProceduralWalk(model)
 	return {
 		name = name,
 		role = role,
