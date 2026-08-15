@@ -10,14 +10,18 @@
 --
 -- OUTCOME LOGGING + THE TUNER HOOK: every round prints a parseable
 -- ROUND_RESULT line, every match a MATCH_RESULT with the metrics the tuner
--- scores (win split, plant rate, round pace). With Scenario.TuningMode on,
--- Tuner.onMatchEnd feeds each match into the in-game CEM and the next match
--- plays under a perturbed BrainTuning set — self-play weight tuning against
--- live matches, no headless harness required yet.
+-- scores. With Scenario.TuningMode on, each match feeds the in-game CEM and
+-- the next plays under a perturbed BrainTuning set.
 --
 -- Deaths are FINAL inside a round and cost the victim its PRIMARY. THE DEAD
 -- LEAVE: corpses ghost instantly (no collision), linger one beat for the
--- kill feed, then are removed.
+-- kill feed, then are removed. THE CARRIER'S DEATH IS RADIO: the moment the
+-- carrier falls, every living attacker gets the spike mark where it dropped
+-- (they heard it happen). Defenders must EARN the mark with their eyes.
+--
+-- THE GUN READS ITS CLASS: after every buy, the welded block gun is restyled
+-- to the carried weapon (Sidearm stub, Falcon length, Longshot long) — the
+-- broadcast can show loadouts before the inventory line is read.
 --
 -- TEAM PLANS: every round opens with a CALL (Rush/Default/Split ×
 -- Standard/Stack/Aggro) — the seed of the M2 tactics board.
@@ -34,11 +38,13 @@ local Shared = ReplicatedStorage:WaitForChild("Shared")
 local Scenario = require(Shared.Constants.Scenario)
 local RoundConfig = require(Shared.Constants.RoundConfig)
 local Weapons = require(Shared.Constants.Weapons)
+local Zones = require(Shared.MapData.Zones)
 
 local Brain = require(script.Parent.Brain)
 local Objective = require(script.Parent.Objective)
 local MatchState = require(script.Parent.MatchState)
 local Tuner = require(script.Parent.Tuner)
+local BotSpawner = require(script.Parent.BotSpawner)
 
 local RoundMachine = {}
 
@@ -169,6 +175,7 @@ local function resetBodies(ctx: Ctx)
 		local humanoid = fresh:FindFirstChildOfClass("Humanoid")
 		if humanoid then
 			humanoid.BreakJointsOnDeath = false
+			humanoid.AutoRotate = false -- clones of an old template must not re-lock the eyes to the legs
 		end
 		fresh.Parent = workspace
 		bot.model = fresh
@@ -326,6 +333,17 @@ local function watchDeaths(ctx: Ctx, roundId: number)
 					end
 					if MatchState.spikeCarrier == bot then
 						Objective.dropSpike(bot)
+						-- THE CARRIER'S DEATH IS RADIO: every living attacker knew
+						-- where their teammate fell — the mark is free for the attack,
+						-- earned with eyes for the defense.
+						local spike = MatchState.spikePart
+						if spike then
+							MatchState.spikeMarkAtk = {
+								pos = spike.Position,
+								zoneKey = Zones.keyAt(spike.Position),
+								at = clock(),
+							}
+						end
 					end
 					return
 				end
@@ -393,10 +411,12 @@ function RoundMachine.start(ctx: Ctx)
 		for _, bot in ctx.attackers do
 			setFrozen(bot, true)
 			autoBuy(bot)
+			BotSpawner.styleGun(bot.model, bot.weapon)
 		end
 		for _, bot in ctx.defenders do
 			setFrozen(bot, false) -- free to deploy
 			autoBuy(bot)
+			BotSpawner.styleGun(bot.model, bot.weapon)
 			Brain.start(bot, "Defense", ctx.attackers, ctx.defenders, ctx.rng, clock, bot.weapon)
 		end
 		local buyEnds = clock() + RoundConfig.BuyPhaseSeconds
