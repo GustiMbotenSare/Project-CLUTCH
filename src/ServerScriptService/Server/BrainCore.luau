@@ -9,6 +9,12 @@
 -- per-bot runtime locals live here. Brain.luau requires this module; nothing
 -- here requires Brain (teamPressure takes the perceptions registry as an
 -- argument, which keeps the graph acyclic).
+--
+-- TURNING IS PHYSICS-SAFE (playtest #17): direct CFrame writes on a WALKING
+-- HumanoidRootPart stomp the humanoid mover — the v4.4 facing loop wrote at
+-- 12.5Hz mid-walk and every walk in the match went BLOCKED. Rigs now carry
+-- an AlignOrientation ("AimAlign"); turnToward points its target and caps
+-- its angular velocity. Torque turns the body; the feet keep walking.
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Shared = ReplicatedStorage:WaitForChild("Shared")
@@ -589,14 +595,25 @@ function BrainCore.pickCoverPoint(ctx: Context, allies: { any }): (any?, Vector3
 	return best, bestFace
 end
 
--- Smooth facing. Combat owns its own turn rate and accuracy coupling; this is
--- the watch-line / idle-settle version.
-function BrainCore.faceTowardSmooth(root: BasePart, dir: Vector3, dt: number)
+-- PHYSICS-SAFE TURNING. Point the rig's AlignOrientation at the target and
+-- cap its angular velocity — torque turns the body at a human rate while the
+-- feet keep walking. Returns the remaining angular error (radians) so a
+-- shooter pays for however far the body still has to swing.
+function BrainCore.turnToward(_bot: any, root: BasePart, targetPos: Vector3, maxRateDegPerSec: number): number
+	local flat = Vector3.new(targetPos.X, root.Position.Y, targetPos.Z)
+	local toTarget = flat - root.Position
+	if toTarget.Magnitude < 0.1 then
+		return 0
+	end
 	local currentYaw = math.atan2(-root.CFrame.LookVector.X, -root.CFrame.LookVector.Z)
-	local desiredYaw = math.atan2(-dir.X, -dir.Z)
+	local desiredYaw = math.atan2(-toTarget.X / toTarget.Magnitude, -toTarget.Z / toTarget.Magnitude)
+	local ao = root:FindFirstChild("AimAlign") :: AlignOrientation?
+	if ao then
+		ao.MaxAngularVelocity = math.rad(maxRateDegPerSec)
+		ao.CFrame = CFrame.Angles(0, desiredYaw, 0)
+	end
 	local delta = (desiredYaw - currentYaw + math.pi) % (math.pi * 2) - math.pi
-	local maxStep = math.rad(BrainCore.K.HOLD_TURN_DEG_PER_SEC) * dt
-	root.CFrame = CFrame.new(root.Position) * CFrame.Angles(0, currentYaw + math.clamp(delta, -maxStep, maxStep), 0)
+	return math.abs(delta)
 end
 
 -- Where should an idle bot LOOK? At the freshest contact if there is one,
