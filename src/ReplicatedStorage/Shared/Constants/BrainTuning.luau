@@ -7,13 +7,14 @@
 --     to this table changes behavior mid-match without a reload.
 --   * Server/Tuner.luau (the in-game CEM, active when Scenario.TuningMode is
 --     on) perturbs the scalar fields between matches, scores each candidate
---     against the objective metrics (attacker win rate near 50%, plant rate
---     near 30%, round duration in a watchable band), and refits toward the
---     elites. The defaults below are the hand-tuned playtest #1-#14 values;
---     the tuner searches around them.
+--     against the objective metrics, and refits toward the elites.
 --
--- Role tables are data too, but the CEM only perturbs scalars for now —
--- multi-dimensional role tuning comes after the scalar search converges.
+-- v4.3 additions (playtest #15): Rotate gains the confirmation gate weights
+-- (PressureBonus / BaitPenalty), Hold gains SpikeGuardBonus, and
+-- RetrieveBonus rose 0.20 -> 0.35 — the dropped spike is the round's real
+-- objective and must outscore the comfort of the site you're standing on.
+--
+-- Role tables are data too, but the CEM only perturbs scalars for now.
 
 return {
 	Hysteresis = 0.08, -- how much better a rival intent must be to win
@@ -25,6 +26,7 @@ return {
 		DecisivenessPenalty = -0.30,
 		NoContactBonus = 0.10,
 		HighGroundBonus = 0.14, -- standing on a site/heaven worth holding
+		SpikeGuardBonus = 0.20, -- sitting on the dropped spike IS defending
 		Role = { Anchor = 0.30, Sniper = 0.23, Support = 0.10, IGL = 0.07, Lurker = 0.03, Entry = 0.00 },
 	},
 
@@ -33,10 +35,10 @@ return {
 		AggressionBonus = 0.25,
 		AttackBonus = 0.15,
 		DecisivenessBonus = 0.30,
-		AtObjectivePenalty = -0.65, -- nothing left to push toward
+		AtObjectivePenalty = -0.65, -- nothing left to push toward (waived while the spike is down)
 		CarrierBonus = 0.15,
 		CarrierAloneHotPenalty = -0.40, -- the spike does not entry-frag alone
-		RetrieveBonus = 0.20,
+		RetrieveBonus = 0.35, -- the dropped spike is the real objective
 		RetrieveHotBonus = 0.05, -- a spike in a known-hot zone is a trap
 		Role = { Entry = 0.25, Support = 0.11, IGL = 0.08, Lurker = 0.06, Sniper = 0.03, Anchor = 0.00 },
 	},
@@ -47,6 +49,8 @@ return {
 		DistanceBonus = 0.15, -- scales with hops (farther = more worth rotating)
 		SoundPenalty = -0.10, -- footsteps are worth less than eyes
 		SiteBonus = 0.10, -- they're hitting a site — go
+		PressureBonus = 0.45, -- CONFIRMED hit: 2+ distinct fresh contacts there
+		BaitPenalty = -0.15, -- a single contact is a bait until proven otherwise
 	},
 
 	Lurk = {
