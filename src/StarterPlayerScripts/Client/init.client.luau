@@ -4,12 +4,15 @@
 -- sees, reduced to what the sim can honestly report right now.
 --
 --   * Top bar     — team names with alive counts, ROUND number, phase and
---                   clock, the score, and a SPIKE DOWN callout when planted.
---   * Player cards — name, role, INVENTORY (every weapon they own), live HP
---                    bar, current zone callout WITH walk/sprint mode (the
---                    shift-walk is a decision; show it), the bot's CURRENT
---                    INTENT, K / D / HS and credits. Attackers left,
---                    defenders right. Click a card to put the camera on it.
+--                   clock, the score, and the spike state — SPLIT correctly:
+--                   "SPIKE PLANTED" (red, fuse running) vs "SPIKE DOWN"
+--                   (orange, dropped on the ground, recoverable). The two
+--                   used to share one banner.
+--   * Player cards — name, role, INVENTORY, live HP bar, zone callout with
+--                    walk/sprint mode, CURRENT INTENT badge (incl. FallBack),
+--                    K / D / HS and credits. Click a card to spectate it.
+--                    The dead grey out; their models leave the world a beat
+--                    after the kill feed fires.
 --   * Kill feed   — killer, victim, headshot flag, distance, weapon.
 --
 -- Controls: click a card to spectate it · C releases the camera ·
@@ -18,9 +21,9 @@
 -- Data path: Telemetry stamps every bot model with replicated attributes at
 -- 4Hz (Zone, Intent, Alive, Kills, Deaths, Headshots, Credits, Inventory,
 -- Speed), RoundMachine mirrors match state as attributes on the CLUTCH folder
--- (Phase, TimeLeft, Round, AtkScore, DefScore, Planted), and KillFeed fires
--- per death. The client polls plain attributes — no per-frame remote traffic,
--- no desync.
+-- (Phase, TimeLeft, Round, AtkScore, DefScore, Planted, SpikeDown), and
+-- KillFeed fires per death. The client polls plain attributes — no per-frame
+-- remote traffic, no desync.
 
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -44,6 +47,7 @@ local SUBTEXT = Color3.fromRGB(150, 152, 162)
 local HP_GREEN = Color3.fromRGB(90, 210, 110)
 local HP_RED = Color3.fromRGB(235, 70, 70)
 local SPIKE_COLOR = Color3.fromRGB(255, 85, 85)
+local SPIKE_DOWN_COLOR = Color3.fromRGB(255, 170, 80)
 
 local INTENT_COLORS = {
 	Hold = Color3.fromRGB(120, 130, 150),
@@ -345,11 +349,8 @@ local function refresh()
 		card.hpFill.Size = UDim2.fromScale(frac, 1)
 		card.hpFill.BackgroundColor3 = HP_RED:Lerp(HP_GREEN, frac)
 		card.hpText.Text = tostring(math.floor(hp + 0.5))
-		-- Inventory lists everything they own; falls back to the carried weapon
-		-- for any session started before the round machine tracked inventories.
 		local inventory = tostring(model:GetAttribute("Inventory") or model:GetAttribute("Weapon") or "?")
 		card.sub.Text = ("%s · %s"):format(tostring(model:GetAttribute("Role") or "?"), inventory)
-		-- Zone plus the speed mode: shift-walking is a decision, so show it
 		local speed = tostring(model:GetAttribute("Speed") or "")
 		local zoneText = tostring(model:GetAttribute("Zone") or "")
 		if speed ~= "" then
@@ -390,14 +391,17 @@ local function refresh()
 	local atkScore = tonumber(remotes:GetAttribute("AtkScore")) or 0
 	local defScore = tonumber(remotes:GetAttribute("DefScore")) or 0
 	local planted = remotes:GetAttribute("Planted") == true
+	local spikeDown = remotes:GetAttribute("SpikeDown") == true
 
 	if phase ~= "" then
 		title.Text = ("ROUND %d · %s %s"):format(roundNumber, string.upper(phase), formatClock(timeLeft))
 	else
 		title.Text = "PROJECT CLUTCH"
 	end
-	subtitle.Text = ("ATK %d — %d DEF%s"):format(atkScore, defScore, if planted then "   ·   SPIKE DOWN" else "")
-	subtitle.TextColor3 = if planted then SPIKE_COLOR else SUBTEXT
+	-- Dropped and planted are different headlines
+	local spikeText = if planted then "   ·   SPIKE PLANTED" elseif spikeDown then "   ·   SPIKE DOWN" else ""
+	subtitle.Text = ("ATK %d — %d DEF%s"):format(atkScore, defScore, spikeText)
+	subtitle.TextColor3 = if planted then SPIKE_COLOR elseif spikeDown then SPIKE_DOWN_COLOR else SUBTEXT
 
 	-- Spectate cam: follow the chosen bot; release if it is gone or dead
 	if spectating then
