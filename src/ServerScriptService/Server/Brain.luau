@@ -1,42 +1,25 @@
 --!strict
--- Bot brain v4.1: score every intent, commit to the winner, act on it — with
--- team comms, a retake structure, and a rebuilt ground sampler.
+-- Bot brain v4.2: score every intent, commit to the winner, act on it — with
+-- team comms, a retake structure, and every weight on the tuning rack.
 --
--- Playtest #14 additions (the 5-round log + the user's list):
---   * THE BARRIER PHASE, brain side: defenders are live during Buy (their
---     brains start with the round and walk to their holds); attackers sleep
---     frozen until LIVE. phaseIsLive() is now side-aware everywhere.
---   * SAMPLER REBUILT. The clearance sphere could count the very ground part
---     a point stands on as an obstruction (float-graze roulette), and the
---     center-line fallback sampled phantom points at the DESTINATION's
---     height — y=5.5 over open floor for elevated targets. That's the
---     "via nil" STALL loop: silent, permanent, and now logged — a failed
---     sampler prints the rejecting part's name once per 10s per bot.
---   * PERSONAL SPACE: sampled destinations must sit 6+ studs from every
---     living teammate. No physics collision (that jammed doors); spacing by
---     decision instead. With cover claims, two bots never stack an angle.
---   * RETAKE STRUCTURE: the plant is LOUD — every defender gets a standing
---     sound contact at the planted site (drives Rotate), and only the TWO
---     CLOSEST defenders take Defuse; the rest rotate in as the trade wave
---     instead of five bodies rushing one doorway.
---   * POST-PLANT POSITIONING: attackers settle across the post-plant web
---     (site + its heaven + its short) and take its cover — no more standing
---     in the open on the site they just took.
---   * SWINGS: 25% of cover peeks are wide swings (9 studs) instead of
---     jiggles — the Valorant wide-peek, as an occasional peek flavor, not a
---     lifestyle.
---   * THE INFO DOCTRINE: no fresh contact → sprint, check corners (one cover
---     peek before crossing a choke); fresh info → walk, approach-peek toward
---     it; contact close → fight. Approach peeks now also fire on decaying
---     memory, not just fresh contacts.
---   * CALLOUT FIXES: radio'd contacts carry the RECEIVER's distance (a 41-
---     stud fight assessed as "0 studs Optimal" last run) and never clobber a
---     teammate's fresher own-eyes sighting.
+-- v4.2 (the pre-rerun batch):
+--   * ALL SCORING WEIGHTS now read from Shared/Constants/BrainTuning.luau,
+--     live, at score time. That table is what the in-game CEM (Tuner.luau,
+--     Scenario.TuningMode) perturbs between matches — the brain's judgment
+--     is data now, not constants buried in code.
+--   * ROLE-BASED POSITIONING: within an assigned site/zone, the role biases
+--     WHICH angle gets held — Snipers gravitate to heaven rails, Lurkers to
+--     connector/choke watches, Anchors to site cover, Entries to choke-side
+--     partials. The plan says WHERE; the role says HOW it stands there.
+--   * Angle-hold facing turns smoothly (360°/s cap) instead of snapping.
+--     Combat owns its own turn rate + accuracy coupling.
 --
--- Still carrying: FallBack fight-or-flight, safe routing, carrier discipline,
--- spike recovery, phase-interrupted walks, corridor sampling, stall
--- diagnostics, bots-never-veto-ground, the interrupt-storm threshold, and
--- ground-only validation for authored cover points. (History in the git log.)
+-- v4.1 carried: the barrier phase (defenders live during Buy), the rebuilt
+-- sampler (ground-part exclusion, local-height center-line, named rejection
+-- diagnostics), personal space (6 studs), the retake structure (two closest
+-- defuse, the rest rotate on the loud plant contact), the post-plant site
+-- web, swings, the info doctrine, callout range/honesty fixes. v4.0: team
+-- callouts, cover claims, approach peeks. Earlier history in the git log.
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Shared = ReplicatedStorage:WaitForChild("Shared")
@@ -45,6 +28,7 @@ local SimConfig = require(Shared.Constants.SimConfig)
 local Scenario = require(Shared.Constants.Scenario)
 local Zones = require(Shared.MapData.Zones)
 local Greybox = require(Shared.MapData.Greybox)
+local Tuning = require(Shared.Constants.BrainTuning)
 
 local Pathing = require(script.Parent.Pathing)
 local Perception = require(script.Parent.Perception)
@@ -59,7 +43,6 @@ local Brain = {}
 -- brains read their own.
 Brain.perceptions = {} :: { [string]: any }
 
-local HYSTERESIS = 0.08
 local CANDIDATES = 6
 local CLEARANCE_RADIUS = 2.6
 local GROUND_TOLERANCE = 2.5
@@ -78,12 +61,7 @@ local CALLOUT_COOLDOWN = 4
 local APPROACH_PEEK_COOLDOWN = 6
 local APPROACH_PEEK_HOPS = 2
 local SAMPLE_DIAG_SECONDS = 10
-
--- Role priors. A role biases a decision, never decides it outright.
-local HOLD_ROLE = { Anchor = 0.30, Sniper = 0.23, Support = 0.10, IGL = 0.07, Lurker = 0.03, Entry = 0.00 }
-local PUSH_ROLE = { Entry = 0.25, Support = 0.11, IGL = 0.08, Lurker = 0.06, Sniper = 0.03, Anchor = 0.00 }
-local LURK_ROLE = { Lurker = 0.30, Sniper = 0.09, Support = 0.03, IGL = 0.03, Entry = 0.00, Anchor = 0.00 }
-local FALLBACK_ROLE = { Anchor = 0.15, Sniper = 0.10, IGL = 0.05, Support = 0.00, Lurker = -0.05, Entry = -0.20 }
+local HOLD_TURN_DEG_PER_SEC = 360 -- angle-hold facing cap (combat has its own)
 
 local SITES = { "A_SITE", "B_SITE" }
 
@@ -105,6 +83,17 @@ local SAFE_ZONES = {
 	Defense = { "DEF_LOBBY", "DEF_SPAWN" },
 }
 
+-- Role-based positioning: within an assigned zone, which KIND of angle the
+-- role gravitates to (matched against the point's zone tags).
+local ROLE_ZONE_AFFINITY = {
+	Sniper = { heaven = 0.25 },
+	Lurker = { connector = 0.25, choke = 0.15 },
+	Entry = { site = 0.15, choke = 0.10 },
+	Anchor = { site = 0.20 },
+	Support = { site = 0.10, heaven = 0.10 },
+	IGL = { mid = 0.20, choke = 0.10 },
+}
+
 local INTENTS = { "Hold", "Push", "Rotate", "Lurk", "FallBack", "Engage", "Plant", "Defuse" }
 
 type Context = {
@@ -122,8 +111,8 @@ type Context = {
 	onAnchor: boolean,
 	alliesNear: number,
 	enemiesNear: number,
-	closerToSite: number, -- living teammates closer to the planted site than me
-	coverZoneSet: { string }?, -- post-plant attacker web: site + heaven + short
+	closerToSite: number,
+	coverZoneSet: { string }?,
 }
 
 local function clamp01(n: number): number
@@ -225,45 +214,51 @@ local function wantsWalk(intent: string, side: string, currentKey: string, route
 	return false -- no info, no threat: run
 end
 
+-- ---------------------------------------------------------------------------
+-- SCORERS. Every weight reads BrainTuning LIVE — the tuner perturbs the
+-- table between matches and the next tick plays by the new numbers.
+-- ---------------------------------------------------------------------------
 local function scoreHold(ctx: Context): number
-	local score = 0.30 + (HOLD_ROLE[ctx.role] or 0.10)
+	local T = Tuning.Hold
+	local score = T.Base + (T.Role[ctx.role] or 0.10)
 	if ctx.side == "Defense" then
-		score += 0.18
+		score += T.DefenseBonus
 	end
-	score -= ctx.aggression * 0.22
-	score -= ctx.decisiveness * 0.30
+	score += ctx.aggression * T.AggressionPenalty
+	score += ctx.decisiveness * T.DecisivenessPenalty
 	if not ctx.contact then
-		score += 0.10
+		score += T.NoContactBonus
 	end
 	if Zones.hasTag(ctx.zoneKey, "site") or Zones.hasTag(ctx.zoneKey, "heaven") then
-		score += 0.14
+		score += T.HighGroundBonus
 	end
 	return score
 end
 
 local function scorePush(ctx: Context): number
-	local score = 0.20 + (PUSH_ROLE[ctx.role] or 0.08)
-	score += ctx.aggression * 0.25
+	local T = Tuning.Push
+	local score = T.Base + (T.Role[ctx.role] or 0.08)
+	score += ctx.aggression * T.AggressionBonus
 	if ctx.side == "Attack" then
-		score += 0.15
+		score += T.AttackBonus
 	end
-	score += ctx.decisiveness * 0.30
+	score += ctx.decisiveness * T.DecisivenessBonus
 	if ctx.atObjective then
-		score -= 0.65
+		score += T.AtObjectivePenalty
 	end
 	if ctx.side == "Attack" and not MatchState.planted then
 		if MatchState.spikeCarrier == ctx.bot then
-			score += 0.15
+			score += T.CarrierBonus
 			-- CARRIER DISCIPLINE: alone with a fresh nearby contact, the spike
 			-- does not entry-frag. Let the team catch up.
 			if ctx.alliesNear == 0 and ctx.contact and Zones.hops(ctx.zoneKey, ctx.contact.zoneKey) <= ENEMY_NEAR_HOPS then
-				score -= 0.40
+				score += T.CarrierAloneHotPenalty
 			end
 		elseif MatchState.spikeCarrier == nil and MatchState.spikePart then
 			-- Recovery — but cautiously: a spike in a known-hot zone is a trap.
 			local spikeZone = Zones.keyAt(MatchState.spikePart.Position)
 			local hot = ctx.contact and ctx.contact.zoneKey == spikeZone and ctx.contact.source == "sight"
-			score += if hot then 0.05 else 0.20
+			score += if hot then T.RetrieveHotBonus else T.RetrieveBonus
 		end
 	end
 	return score
@@ -277,23 +272,25 @@ local function scoreRotate(ctx: Context): number
 	if hops == 0 or hops == math.huge then
 		return -1
 	end
-	local score = 0.25 + ctx.gameSense * 0.30
-	score += clamp01(hops / 6) * 0.15
+	local T = Tuning.Rotate
+	local score = T.Base + ctx.gameSense * T.GameSenseBonus
+	score += clamp01(hops / 6) * T.DistanceBonus
 	if ctx.contact.source == "sound" then
-		score -= 0.10
+		score += T.SoundPenalty
 	end
 	if Zones.hasTag(ctx.contact.zoneKey, "site") then
-		score += 0.10 -- they're hitting a site — go
+		score += T.SiteBonus
 	end
 	return score
 end
 
 local function scoreLurk(ctx: Context): number
-	local score = 0.10 + (LURK_ROLE[ctx.role] or 0.02)
-	score += (1 - ctx.aggression) * 0.18
-	score -= ctx.decisiveness * 0.20
+	local T = Tuning.Lurk
+	local score = T.Base + (T.Role[ctx.role] or 0.02)
+	score += (1 - ctx.aggression) * T.CalmBonus
+	score += ctx.decisiveness * T.DecisivenessPenalty
 	if ctx.alliesNear >= 1 then
-		score -= 0.12
+		score += T.CrowdPenalty
 	end
 	return score
 end
@@ -309,9 +306,10 @@ local function scoreFallBack(ctx: Context): number
 	if MatchState.spikeCarrier == ctx.bot and Zones.hasTag(ctx.zoneKey, "plant") then
 		return -1
 	end
-	local score = 0.30 + (ctx.enemiesNear - 1) * 0.25
-	score += FALLBACK_ROLE[ctx.role] or 0
-	score -= ctx.aggression * 0.30
+	local T = Tuning.FallBack
+	local score = T.Base + (ctx.enemiesNear - 1) * T.PerExtraEnemy
+	score += T.Role[ctx.role] or 0
+	score += ctx.aggression * T.AggressionPenalty
 	return score
 end
 
@@ -329,16 +327,17 @@ local function scorePlant(ctx: Context): number
 	if MatchState.spikeCarrier ~= ctx.bot then
 		return -1
 	end
-	local score = 0.45 + ctx.decisiveness * 0.20
+	local T = Tuning.Plant
+	local score = T.Base + ctx.decisiveness * T.DecisivenessBonus
 	if Zones.hasTag(ctx.zoneKey, "plant") then
-		score += 0.55
+		score += T.OnSiteBonus
 	end
 	if ctx.contact then
 		local hops = Zones.hops(ctx.zoneKey, ctx.contact.zoneKey)
 		if hops <= 2 then
-			score -= 0.45
+			score += T.HotSitePenalty
 		else
-			score -= 0.15
+			score += T.ContactPenalty
 		end
 	end
 	return score
@@ -350,12 +349,13 @@ local function scoreDefuse(ctx: Context): number
 	if ctx.side ~= "Defense" or not MatchState.planted then
 		return -1
 	end
-	local score = 0.75 + ctx.gameSense * 0.15
+	local T = Tuning.Defuse
+	local score = T.Base + ctx.gameSense * T.GameSenseBonus
 	if ctx.closerToSite >= 2 then
-		score -= 0.75
+		score += T.SupportWavePenalty
 	end
 	if ctx.zoneKey == MatchState.plantedZoneKey then
-		score += 0.50
+		score += T.OnSiteBonus
 	end
 	return score
 end
@@ -377,14 +377,9 @@ local function isBotPart(part: BasePart): boolean
 end
 
 -- ---------------------------------------------------------------------------
--- SAMPLER, REBUILT. Three rules that were each once a multi-day bug:
---   1. The ground a point stands on is never an obstruction (exclude
---      hit.Instance from the clearance check — float-graze roulette rejected
---      random floor/deck points and silently stalled whole teams).
---   2. Bots never veto ground for bots — but sampled destinations must sit
---      PERSONAL_SPACE studs from every living teammate (spacing by decision,
---      not by physics jams).
---   3. Failure must SPEAK: the rejecting part's name goes to the log.
+-- SAMPLER. 1. The ground a point stands on is never an obstruction. 2. Bots
+-- never veto ground for bots — but destinations keep PERSONAL_SPACE from
+-- living teammates. 3. Failure speaks: the rejecting part's name is logged.
 -- ---------------------------------------------------------------------------
 local function standableReason(point: Vector3, ignore: Model): (boolean, string?)
 	local params = RaycastParams.new()
@@ -449,10 +444,8 @@ local function hasGround(point: Vector3, ignore: Model): boolean
 	return hit ~= nil and math.abs(hit.Position.Y + 0.5 - point.Y) <= GROUND_TOLERANCE
 end
 
--- Random samples, then center-LINE samples at the LOCAL ground height (the
--- old version sampled phantom points at the destination's height — y=5.5
--- over open floor for elevated targets), then the zone center. Returns the
--- point, or nil plus the last rejection reason for the SAMPLE diagnostic.
+-- Random samples, then center-LINE samples at the LOCAL ground height, then
+-- the zone center. Returns the point, or nil plus the last rejection reason.
 local function standablePointIn(
 	key: string,
 	rng: Random,
@@ -526,10 +519,12 @@ local function pickLurkZone(ctx: Context, allyZones: { string }): string?
 end
 
 -- COVER. Pick the declared cover point whose watch direction best matches the
--- threat, across the bot's cover zone set (post-plant attackers use the whole
--- site web), skipping points claimed by a living teammate.
+-- threat, across the bot's cover zone set, skipping points claimed by a
+-- living teammate — with a role affinity bump (the plan says WHERE, the role
+-- says how it stands there).
 local function pickCoverPoint(ctx: Context, allies: { any }): (any?, Vector3?)
 	local zones = ctx.coverZoneSet or { ctx.zoneKey }
+	local affinity = ROLE_ZONE_AFFINITY[ctx.role]
 	local best: any = nil
 	local bestFace: Vector3? = nil
 	local bestScore = -0.2
@@ -565,6 +560,13 @@ local function pickCoverPoint(ctx: Context, allies: { any }): (any?, Vector3?)
 			threatDir = if ctx.side == "Defense" then Vector3.zAxis else -Vector3.zAxis
 		end
 		local score = face:Dot(threatDir) + (if point.kind == "partial" then 0.10 else 0)
+		if affinity then
+			for tag, bonus in affinity do
+				if Zones.hasTag(point.zone, tag) then
+					score += bonus
+				end
+			end
+		end
 		if score > bestScore then
 			best = point
 			bestFace = face
@@ -574,8 +576,18 @@ local function pickCoverPoint(ctx: Context, allies: { any }): (any?, Vector3?)
 	return best, bestFace
 end
 
--- HOLD THE ANGLE. Walk to the point, face the watch line, then jiggle-peek —
--- or occasionally SWING wide (the Valorant wide peek, as a peek flavor).
+-- Smooth facing for angle holds. Combat owns its own turn rate and its
+-- accuracy coupling; this is the watch-line version.
+local function faceTowardSmooth(root: BasePart, dir: Vector3, dt: number)
+	local currentYaw = math.atan2(-root.CFrame.LookVector.X, -root.CFrame.LookVector.Z)
+	local desiredYaw = math.atan2(-dir.X, -dir.Z)
+	local delta = (desiredYaw - currentYaw + math.pi) % (math.pi * 2) - math.pi
+	local maxStep = math.rad(HOLD_TURN_DEG_PER_SEC) * dt
+	root.CFrame = CFrame.new(root.Position) * CFrame.Angles(0, currentYaw + math.clamp(delta, -maxStep, maxStep), 0)
+end
+
+-- HOLD THE ANGLE. Walk to the point, turn onto the watch line smoothly, then
+-- jiggle-peek — or occasionally SWING wide.
 local function holdAngle(
 	bot: any,
 	model: Model,
@@ -618,7 +630,7 @@ local function holdAngle(
 				return true -- contact: the main loop owns the fight
 			end
 			if root then
-				root.CFrame = CFrame.lookAt(root.Position, root.Position + faceDir)
+				faceTowardSmooth(root, faceDir, 0.25)
 			end
 			task.wait(0.25)
 		end
@@ -997,7 +1009,7 @@ function Brain.start(bot: any, side: string, enemies: { any }, allies: { any }, 
 			local winner = intent
 			local winnerScore = scores[intent]
 			for _, name in INTENTS do
-				local margin = if name == "Engage" then 0 else HYSTERESIS
+				local margin = if name == "Engage" then 0 else Tuning.Hysteresis
 				if name ~= intent and scores[name] > winnerScore + margin then
 					winner = name
 					winnerScore = scores[name]
