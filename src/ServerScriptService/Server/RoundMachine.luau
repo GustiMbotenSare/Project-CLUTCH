@@ -1,33 +1,27 @@
 --!strict
 -- Round machine: turns the sandbox into a match.
 --
--- Buy (frozen, bots auto-spend) → Live (100s, brains on) → resolution by
--- elimination, explosion, defuse or clock → PostRound (score, credits) →
--- again. Deaths are FINAL inside a round: no respawns, so a kill costs the
--- victim the round, not three seconds. Death also costs the victim its
--- PRIMARY: die and you come back on the free Sidearm, like every tac shooter
--- ever. Weapon drops on death are the tracked follow-up.
+-- Buy → Live (100s, brains on) → resolution by elimination, explosion, defuse
+-- or clock → PostRound (score, credits) → again.
 --
--- TEAM PLANS: every round opens with a CALL. Attack rolls Rush / Default /
--- Split against a called site; defense rolls Standard / Stack / Aggro. Plans
--- set each bot's siteChoice/holdChoice before brains wake up. Today the coin
--- calls it — this is the seed of the M2 tactics board, where the manager
--- makes the call and the same machinery executes it.
+-- THE BARRIER PHASE (playtest #14): Valorant's crucial timing detail we were
+-- missing — during Buy, ATTACKERS are barrier-frozen while DEFENDERS are
+-- free and their brains are already running: they walk to their holds and
+-- arrive before the attack can possibly get there. Defenders standing frozen
+-- at spawn until LIVE was both unrealistic and the visible "defenders never
+-- move at round start" symptom.
 --
--- THE DEAD LEAVE. A corpse ghosts instantly (no collision, anchored so it
--- can't sink), reads on the kill feed for a beat, then is REMOVED — a
--- standing name-tagged corpse read as a living player on the broadcast. A
--- ragdoll flourish replaces the removal when the animation pass lands.
+-- Deaths are FINAL inside a round. Death also costs the victim its PRIMARY.
+-- THE DEAD LEAVE: corpses ghost instantly (no collision), linger one beat for
+-- the kill feed, then are removed. Ragdoll flourish comes with the animation
+-- pass.
 --
--- FUSE WATCHDOG: if the planted phase ever runs past the fuse without a
--- resolution, the round machine declares the spike itself the winner rather
--- than letting a match hang (playtest #12's 130-second soft-lock).
+-- TEAM PLANS: every round opens with a CALL (Rush/Default/Split ×
+-- Standard/Stack/Aggro). Today the coin calls it — this is the seed of the
+-- M2 tactics board, where the manager makes the call.
 --
--- Also owns: the economy (win/loss ladders, kill rewards, plant bonus), the
--- body swapper (pristine rigs each round, brain picks and cover claims
--- cleared so the plan can reassign them), each bot's INVENTORY string, the
--- random spike carrier, and the SpikeDown publish (dropped ≠ planted — the
--- dashboard conflated them).
+-- FUSE WATCHDOG: a planted phase running past the fuse resolves to the spike
+-- rather than hanging the match (playtest #12's soft-lock).
 --
 -- Deliberately NOT here: halftime side swaps (needs team identity), overtime,
 -- armor/shields, weapon drops on death. All tracked in the build doc.
@@ -378,13 +372,21 @@ function RoundMachine.start(ctx: Ctx)
 		end
 		rollTeamPlans(ctx) -- writes bot.siteChoice / bot.holdChoice before brains wake
 
-		-- BUY
+		-- BUY — the barrier phase. Attackers are frozen; DEFENDERS are free and
+		-- their brains start NOW so they reach their holds before the barrier
+		-- drops. Valorant's head start, and the fix for defenders standing in
+		-- spawn at the start of every round.
 		MatchState.phase = "Buy"
 		MatchState.timeLeft = RoundConfig.BuyPhaseSeconds
 		print(("[CLUTCH] ===== ROUND %d ====="):format(roundId))
-		for _, bot in ctx.roster do
+		for _, bot in ctx.attackers do
 			setFrozen(bot, true)
 			autoBuy(bot)
+		end
+		for _, bot in ctx.defenders do
+			setFrozen(bot, false) -- free to deploy
+			autoBuy(bot)
+			Brain.start(bot, "Defense", ctx.attackers, ctx.defenders, ctx.rng, clock, bot.weapon)
 		end
 		local buyEnds = clock() + RoundConfig.BuyPhaseSeconds
 		while clock() < buyEnds do
@@ -393,17 +395,15 @@ function RoundMachine.start(ctx: Ctx)
 			task.wait(0.25)
 		end
 
-		-- LIVE
+		-- LIVE — the barrier drops
 		MatchState.phase = "Live"
 		print(("[CLUTCH] LIVE — %ds on the clock"):format(RoundConfig.RoundSeconds))
-		for _, bot in ctx.roster do
-			setFrozen(bot, false)
-		end
 		for _, bot in ctx.attackers do
+			setFrozen(bot, false)
 			Brain.start(bot, "Attack", ctx.defenders, ctx.attackers, ctx.rng, clock, bot.weapon)
 		end
 		for _, bot in ctx.defenders do
-			Brain.start(bot, "Defense", ctx.attackers, ctx.defenders, ctx.rng, clock, bot.weapon)
+			setFrozen(bot, false) -- idempotent; brains already running
 		end
 		watchDeaths(ctx, roundId)
 
