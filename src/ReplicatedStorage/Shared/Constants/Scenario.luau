@@ -30,6 +30,16 @@ return {
 	-- the distances this map produces, so range discipline gets exercised.
 	DuelWeapon = "Sidearm",
 
+	-- SELF-PLAY TUNING (the in-game CEM). OFF by default: with this on, the
+	-- Tuner perturbs BrainTuning's scalar weights between matches — each match
+	-- plays under one candidate set, gets scored (attacker win rate -> 50%,
+	-- plant rate -> 30%, round pace -> 75s), and every 4 matches the search
+	-- refits toward the elites. Leave Studio running and harvest the TUNING
+	-- lines; paste the best-ever values back into BrainTuning.luau when a
+	-- generation converges. Keep it OFF for playtests — you want to judge ONE
+	-- behavior build at a time.
+	TuningMode = false,
+
 	-- CONTROLLED EXPERIMENT. With this on, every bot gets identical attributes,
 	-- so any behavioural difference must come from role, side or situation — not
 	-- from a stat roll. Turn it off to watch attributes reassert themselves.
