@@ -11,6 +11,12 @@
 -- taking damage, and on SPOTTING AN ENEMY. Planting while someone is visibly
 -- swinging you is how bots die doing nothing.
 --
+-- THE DEFUSE IS A SOLO JOB (playtest #16): one channel, ever. The brain's
+-- scoring already names the single closest defender as the defuser and turns
+-- everyone else into the guard ring; this lock is the belt-and-braces for
+-- the tie-break case. Plants never needed it — there's only ever one
+-- carrier.
+--
 -- Pickup radius is a generous 7 studs: recovery should not require
 -- centimeter routing.
 --
@@ -38,6 +44,7 @@ local EXPLOSION_RADIUS = 30
 local EXPLOSION_DAMAGE = 500
 
 local fuseThread: thread? = nil
+local defusingBot: any = nil -- the defuse is a solo job; everyone else guards
 
 local function planarDistance(a: Vector3, b: Vector3): number
 	local dx = a.X - b.X
@@ -58,7 +65,7 @@ local function cancelFuse()
 	fuseThread = nil
 end
 
--- Round reset: no spike, no fuse, no planted state.
+-- Round reset: no spike, no fuse, no planted state, no marks, no channel.
 function Objective.reset()
 	cancelFuse()
 	if MatchState.spikePart then
@@ -71,6 +78,9 @@ function Objective.reset()
 	MatchState.plantedAt = 0
 	MatchState.defused = false
 	MatchState.exploded = false
+	MatchState.spikeMarkAtk = nil
+	MatchState.spikeMarkDef = nil
+	defusingBot = nil
 end
 
 local function makeSpike(): Part
@@ -288,10 +298,14 @@ function Objective.tryStartPlant(bot: any, clock: () -> number, shouldAbort: (()
 	return true
 end
 
--- Defender next to a planted spike commits to the full 7 seconds.
+-- Defender next to a planted spike commits to the full 7 seconds. SOLO JOB:
+-- if a teammate is already on the channel, you are the guard ring instead.
 function Objective.tryStartDefuse(bot: any, clock: () -> number, shouldAbort: (() -> boolean)?): boolean
 	if not MatchState.planted then
 		return false
+	end
+	if defusingBot ~= nil and defusingBot ~= bot then
+		return false -- one pair of hands on the spike; the rest watch the doors
 	end
 	local spike = MatchState.spikePart
 	local root = rootOf(bot.model)
@@ -301,7 +315,10 @@ function Objective.tryStartDefuse(bot: any, clock: () -> number, shouldAbort: ((
 
 	print(("[CLUTCH] %6.1fs  DEFUSE %s is defusing…"):format(clock(), bot.name))
 
-	if not channel(bot, RoundConfig.DefuseSeconds, "defuse", clock, shouldAbort) then
+	defusingBot = bot
+	local ok = channel(bot, RoundConfig.DefuseSeconds, "defuse", clock, shouldAbort)
+	defusingBot = nil
+	if not ok then
 		return false
 	end
 	if not MatchState.planted then
