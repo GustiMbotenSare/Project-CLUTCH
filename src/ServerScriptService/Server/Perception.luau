@@ -23,7 +23,8 @@
 -- run logged twenty SPOT/LOST pairs during a single continuous sighting, some
 -- 0.2s apart, which made the log useless and starved the brain of stable input.
 -- We now try several aim points and require a run of failures before a bot
--- admits it lost someone.
+-- admits it lost someone. v4 map note: partial-cover duels graze LOS on every
+-- peek, so the tolerance grew 4 -> 6 sweeps (~0.9s).
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Shared = ReplicatedStorage:WaitForChild("Shared")
@@ -34,7 +35,7 @@ local Zones = require(Shared.MapData.Zones)
 
 local MatchState = require(script.Parent.MatchState)
 
-local LOS_MISS_TOLERANCE = 4 -- failed sweeps before a sighting counts as lost
+local LOS_MISS_TOLERANCE = 6 -- failed sweeps before a sighting counts as lost
 local AIM_PARTS = { "Head", "HumanoidRootPart", "UpperTorso", "Torso" }
 
 export type Source = "sight" | "sound"
