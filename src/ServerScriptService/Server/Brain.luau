@@ -4,13 +4,19 @@
 -- this module owns what the bot DOES about it each tick: comms, facing,
 -- walks, holds, channels, diagnostics.
 --
+-- v4.4.1 (playtest #17): THE FACING LOOP IS PHYSICS-SAFE. Direct CFrame
+-- writes on a WALKING HumanoidRootPart stomp the humanoid mover — the v4.4
+-- loop wrote at 12.5Hz mid-walk and every walk in the match went BLOCKED.
+-- The loop now points the rig's AimAlign constraint (BrainCore.turnToward);
+-- torque turns the body at a capped rate while the feet keep walking.
+--
 -- v4.4 (playtest #16):
 --   * THE FACING LOOP. AutoRotate is off — the legs no longer own the eyes.
 --     The brain leaves a facePoint every tick (a visible enemy, a fresh
 --     contact, the waypoint, the watch line, the threat direction) and a
---     dedicated loop turns toward it at the hold rate. Combat owns facing
---     mid-burst (faster, accuracy-coupled). A bot can now watch the flank
---     while it crosses the lane.
+--     dedicated loop turns toward it. Combat owns facing mid-burst (the
+--     0.4s after a shot). A bot can now watch the flank while it crosses
+--     the lane.
 --   * SUPPRESSION RIDES THE RADIO: getting pinned by near-misses (Combat
 --     stamps it) produces a callout like taking damage does.
 --   * HONEST SPIKE MARKS (joined memory): the drop's FACT is public, its
@@ -196,8 +202,9 @@ function Brain.start(bot: any, side: string, enemies: { any }, allies: { any }, 
 	Combat.states[bot.name] = combatState -- incoming fire stamps suppression here
 
 	-- THE FACING LOOP. The brain leaves a facePoint every tick; this loop
-	-- turns toward it at the hold rate. Combat owns facing mid-burst (the
-	-- 0.4s after a shot); the rest of the time the eyes are the brain's.
+	-- turns toward it THROUGH THE AIM ALIGN — torque, never a CFrame write on
+	-- a walking root (playtest #17: those writes stomped the mover and every
+	-- walk in the match went BLOCKED). Combat owns facing mid-burst.
 	bot.facePoint = nil :: Vector3?
 	task.spawn(function()
 		while model.Parent do
@@ -210,7 +217,7 @@ function Brain.start(bot: any, side: string, enemies: { any }, allies: { any }, 
 			if root and target and clock() - combatState.lastShotAt > 0.4 then
 				local dir = (target - root.Position) * Vector3.new(1, 0, 1)
 				if dir.Magnitude > 0.5 then
-					BrainCore.faceTowardSmooth(root, dir.Unit, 0.08)
+					BrainCore.turnToward(bot, root, target, K.HOLD_TURN_DEG_PER_SEC)
 				end
 			end
 			task.wait(0.08)
@@ -654,7 +661,7 @@ function Brain.start(bot: any, side: string, enemies: { any }, allies: { any }, 
 				end
 
 				if targetModel then
-					local root = model:FindFirstChildOfClass("HumanoidRootPart") :: BasePart?
+					local root = model:FindFirstChild("HumanoidRootPart") :: BasePart?
 					if root and alive then
 						alive:MoveTo(root.Position)
 					end
