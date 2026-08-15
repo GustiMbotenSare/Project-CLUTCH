@@ -4,24 +4,26 @@
 -- Buy → Live (100s, brains on) → resolution by elimination, explosion, defuse
 -- or clock → PostRound (score, credits) → again.
 --
--- THE BARRIER PHASE (playtest #14): Valorant's crucial timing detail we were
--- missing — during Buy, ATTACKERS are barrier-frozen while DEFENDERS are
--- free and their brains are already running: they walk to their holds and
--- arrive before the attack can possibly get there. Defenders standing frozen
--- at spawn until LIVE was both unrealistic and the visible "defenders never
--- move at round start" symptom.
+-- THE BARRIER PHASE: during Buy, ATTACKERS are barrier-frozen while
+-- DEFENDERS are free and their brains are already running — they walk to
+-- their holds before the attack can start (Valorant's head start).
 --
--- Deaths are FINAL inside a round. Death also costs the victim its PRIMARY.
--- THE DEAD LEAVE: corpses ghost instantly (no collision), linger one beat for
--- the kill feed, then are removed. Ragdoll flourish comes with the animation
--- pass.
+-- OUTCOME LOGGING + THE TUNER HOOK: every round prints a parseable
+-- ROUND_RESULT line, every match a MATCH_RESULT with the metrics the tuner
+-- scores (win split, plant rate, round pace). With Scenario.TuningMode on,
+-- Tuner.onMatchEnd feeds each match into the in-game CEM and the next match
+-- plays under a perturbed BrainTuning set — self-play weight tuning against
+-- live matches, no headless harness required yet.
+--
+-- Deaths are FINAL inside a round and cost the victim its PRIMARY. THE DEAD
+-- LEAVE: corpses ghost instantly (no collision), linger one beat for the
+-- kill feed, then are removed.
 --
 -- TEAM PLANS: every round opens with a CALL (Rush/Default/Split ×
--- Standard/Stack/Aggro). Today the coin calls it — this is the seed of the
--- M2 tactics board, where the manager makes the call.
+-- Standard/Stack/Aggro) — the seed of the M2 tactics board.
 --
 -- FUSE WATCHDOG: a planted phase running past the fuse resolves to the spike
--- rather than hanging the match (playtest #12's soft-lock).
+-- rather than hanging the match.
 --
 -- Deliberately NOT here: halftime side swaps (needs team identity), overtime,
 -- armor/shields, weapon drops on death. All tracked in the build doc.
@@ -36,6 +38,7 @@ local Weapons = require(Shared.Constants.Weapons)
 local Brain = require(script.Parent.Brain)
 local Objective = require(script.Parent.Objective)
 local MatchState = require(script.Parent.MatchState)
+local Tuner = require(script.Parent.Tuner)
 
 local RoundMachine = {}
 
@@ -179,8 +182,6 @@ local function publish(ctx: Ctx)
 	ctx.remotes:SetAttribute("AtkScore", MatchState.atkScore)
 	ctx.remotes:SetAttribute("DefScore", MatchState.defScore)
 	ctx.remotes:SetAttribute("Planted", MatchState.planted)
-	-- Dropped and planted are different headlines; the dashboard used to show
-	-- "SPIKE DOWN" for both.
 	ctx.remotes:SetAttribute(
 		"SpikeDown",
 		MatchState.spikePart ~= nil and MatchState.spikeCarrier == nil and not MatchState.planted
@@ -346,6 +347,14 @@ function RoundMachine.start(ctx: Ctx)
 	local atkLossStreak = 0
 	local defLossStreak = 0
 
+	-- Match-level accumulators: what the tuner scores, and the parseable
+	-- record of how this meta actually plays.
+	local matchRounds = 0
+	local matchAtkWins = 0
+	local matchDefWins = 0
+	local matchPlants = 0
+	local matchRoundSeconds = 0
+
 	print(("[CLUTCH] round machine online — %d to win, %d rounds max, %ds buy / %ds round / %ds fuse"):format(
 		RoundConfig.WinsNeeded,
 		RoundConfig.MaxRoundsRegulation,
@@ -353,6 +362,9 @@ function RoundMachine.start(ctx: Ctx)
 		RoundConfig.RoundSeconds,
 		RoundConfig.SpikeFuseSeconds
 	))
+	if Scenario.TuningMode then
+		print("[CLUTCH] TUNING MODE — each match plays under one candidate weight set; TUNING lines track the search")
+	end
 
 	while true do
 		MatchState.roundNumber += 1
@@ -374,8 +386,7 @@ function RoundMachine.start(ctx: Ctx)
 
 		-- BUY — the barrier phase. Attackers are frozen; DEFENDERS are free and
 		-- their brains start NOW so they reach their holds before the barrier
-		-- drops. Valorant's head start, and the fix for defenders standing in
-		-- spawn at the start of every round.
+		-- drops.
 		MatchState.phase = "Buy"
 		MatchState.timeLeft = RoundConfig.BuyPhaseSeconds
 		print(("[CLUTCH] ===== ROUND %d ====="):format(roundId))
@@ -407,7 +418,8 @@ function RoundMachine.start(ctx: Ctx)
 		end
 		watchDeaths(ctx, roundId)
 
-		local liveEnds = clock() + RoundConfig.RoundSeconds
+		local liveStartedAt = clock()
+		local liveEnds = liveStartedAt + RoundConfig.RoundSeconds
 		local sawPlant = false
 		local winner: string? = nil
 		local reason = ""
@@ -444,6 +456,10 @@ function RoundMachine.start(ctx: Ctx)
 		end
 
 		-- RESOLUTION
+		local roundSeconds = clock() - liveStartedAt
+		local atkAlive = aliveCount(ctx.attackers)
+		local defAlive = aliveCount(ctx.defenders)
+
 		local winners = if winner == "Attack" then ctx.attackers else ctx.defenders
 		local losers = if winner == "Attack" then ctx.defenders else ctx.attackers
 		local loserStreak: number
@@ -480,6 +496,27 @@ function RoundMachine.start(ctx: Ctx)
 			MatchState.atkScore,
 			MatchState.defScore
 		))
+		-- Parseable one-liner for the log-mining toolchain and the tuner
+		print(("[CLUTCH] ROUND_RESULT | r%d | %s | %s | plant=%s | %.1fs | alive %dv%d"):format(
+			roundId,
+			string.upper(winner),
+			reason,
+			tostring(sawPlant),
+			roundSeconds,
+			atkAlive,
+			defAlive
+		))
+
+		matchRounds += 1
+		matchRoundSeconds += roundSeconds
+		if sawPlant then
+			matchPlants += 1
+		end
+		if winner == "Attack" then
+			matchAtkWins += 1
+		else
+			matchDefWins += 1
+		end
 
 		-- POST ROUND
 		MatchState.phase = "PostRound"
@@ -513,6 +550,25 @@ function RoundMachine.start(ctx: Ctx)
 				MatchState.atkScore,
 				MatchState.defScore
 			))
+			print(("[CLUTCH] MATCH_RESULT | %s %d-%d | rounds %d | plants %d | avgRound %.1fs"):format(
+				champion,
+				MatchState.atkScore,
+				MatchState.defScore,
+				matchRounds,
+				matchPlants,
+				if matchRounds > 0 then matchRoundSeconds / matchRounds else 0
+			))
+
+			if Scenario.TuningMode then
+				Tuner.onMatchEnd({
+					rounds = matchRounds,
+					atkWins = matchAtkWins,
+					defWins = matchDefWins,
+					plants = matchPlants,
+					avgRoundSeconds = if matchRounds > 0 then matchRoundSeconds / matchRounds else 0,
+				})
+			end
+
 			MatchState.atkScore = 0
 			MatchState.defScore = 0
 			MatchState.roundNumber = 0
@@ -521,6 +577,11 @@ function RoundMachine.start(ctx: Ctx)
 			end
 			atkLossStreak = 0
 			defLossStreak = 0
+			matchRounds = 0
+			matchAtkWins = 0
+			matchDefWins = 0
+			matchPlants = 0
+			matchRoundSeconds = 0
 		end
 	end
 end
