@@ -12,6 +12,13 @@
 -- "Standard"|"Stack"|"Aggro", the called site, and per-bot assignments. This
 -- is the seed of the player-chosen tactics board — today the coin calls it,
 -- later the manager does.
+--
+-- spikeMarkAtk / spikeMarkDef are the HONEST-intel layer about the dropped
+-- spike (playtest #16's joined memory): { pos, zoneKey, at } or nil.
+-- Attackers get the mark free — they heard their carrier die on the radio.
+-- Defenders must EARN it: a mark exists only once a defender has eyes on the
+-- dropped spike (or saw it fall). Neither side acts on a drop it doesn't
+-- know about — that honesty is what makes rotations readable.
 
 local MatchState = {
 	-- "Buy" | "Live" | "Planted" | "PostRound"
@@ -30,6 +37,10 @@ local MatchState = {
 	spikeCarrier = nil :: any, -- bot record while carried; nil while dropped
 	defused = false,
 	exploded = false,
+
+	-- Per-side honest intel about the dropped spike (see header)
+	spikeMarkAtk = nil :: any,
+	spikeMarkDef = nil :: any,
 
 	-- Most recent gunfire: { by = shooter name, pos = Vector3, at = clock() }
 	lastShot = nil :: any,
