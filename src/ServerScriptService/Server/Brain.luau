@@ -1,31 +1,27 @@
 --!strict
--- Bot brain v3.5: score every intent, commit to the winner, act on it.
+-- Bot brain v4.0: score every intent, commit to the winner, act on it — and
+-- now bots TALK.
 --
--- Playtest #12 (first team-planned 5v5) findings, all fixed here:
---   * isStandable counted LIVING BOTS as obstructions. Five attackers
---     holding B Site after the plant made the whole site un-destination-able
---     for the retaking defenders — the "BLOCKED en route to 71, 1, -31"
---     cluster. Bots never veto ground for bots; the map vetoes ground.
---   * THE INTERRUPT STORM. A defender en route to defuse who glimpsed an
---     attacker 30+ studs out scored Engage ~0.86 vs Defuse 0.87 — kept Defuse
---     in the brain, but the walk's interrupt predicate still fired on that
---     glimpse, aborting the walk every 0.3s. Walk, abort, re-walk — the
---     post-plant crawl (Onyx took 24s to cross his own lobby). Combat now
---     interrupts a walk only when the fight is FORCED (seen, contested, under
---     fire) or genuinely close.
---   * COVER HOLDS NEVER FIRED. Cover points stand ~2 studs behind their own
---     crate — inside the 2.6-stud clearance radius, so every holdAngle call
---     returned before printing a single ANGLE line. Cover positions now use a
---     ground-only check: the author of the map data vouches for the stand.
---   * STALL DIAGNOSTICS. A bot with a movement target that hasn't changed
---     zones in 8s now prints exactly where it stands and what it believes
---     it's doing — mystery stalls become data instead of folklore.
+-- Playtest #13 additions:
+--   * TEAM CALLOUTS. A fresh sighting (or taking fire with a known suspect)
+--     is radio'd to living teammates after the human callout delay. Teammates
+--     receive it as a SOUND-class contact — a zone and a rough position, not
+--     wallhacks (injected contacts never count as "visible", so they can't
+--     trigger shots). This is the awareness depth the user asked for, and the
+--     seed of the comms feed the caster will narrate.
+--   * COVER CLAIMS. The first bot to hold an angle claims it; teammates pick
+--     a different point. Two anchors stacking the same crate was playtest
+--     #13's doorway traffic jam.
+--   * APPROACH PEEKS. Pushing/rotating toward a fresh contact within 2 hops,
+--     a bot first snaps to the current zone's cover facing the threat for one
+--     peek cycle — the "take cover and check the angle before walking in"
+--     behavior the site approaches were missing. Cooldown-gated so it can't
+--     stall a rotation forever.
 --
--- v3.4 added: FallBack (fight-or-flight when alone and outnumbered), safe
--- routing (enemy spawn lobbies are never corridors), carrier discipline,
--- spike recovery to the spike itself. v3.3: cover points / jiggle peek.
--- v3.2: walk-sprint, objective interrupts. v3.1: engage hysteresis, sticky
--- picks, hot-site plants. v3: plant/defuse. Full history in the git log.
+-- Still carrying: FallBack fight-or-flight, safe routing, carrier discipline,
+-- spike recovery, phase-interrupted walks, corridor sampling, stall
+-- diagnostics, bots-never-veto-ground, the interrupt-storm threshold, and
+-- ground-only validation for authored cover points. (History in the git log.)
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Shared = ReplicatedStorage:WaitForChild("Shared")
@@ -44,6 +40,10 @@ local MatchState = require(script.Parent.MatchState)
 
 local Brain = {}
 
+-- Every living brain's perception, keyed by name. Callouts write into these;
+-- brains read their own. Cleared by model teardown, refilled by Brain.start.
+Brain.perceptions = {} :: { [string]: any }
+
 local HYSTERESIS = 0.08 -- how much better a rival intent must be to win
 local CANDIDATES = 6 -- standable-point attempts per destination
 local CLEARANCE_RADIUS = 2.6
@@ -56,6 +56,9 @@ local MAX_PEEKS = 3 -- jiggle-peeks per cover hold before re-deciding
 local ENEMY_NEAR_HOPS = 2 -- "in my area" for the fallback math
 local INTERRUPT_COMBAT_RANGE = 30 -- a glimpse farther than this never aborts a walk
 local STALL_LOG_SECONDS = 8 -- zone unchanged with a live target this long = report
+local CALLOUT_COOLDOWN = 4 -- seconds between one bot re-calling the same enemy
+local APPROACH_PEEK_COOLDOWN = 6 -- seconds between pre-push cover checks
+local APPROACH_PEEK_HOPS = 2 -- only peek when the contact is this close
 
 -- Role priors. A role biases a decision, never decides it outright.
 local HOLD_ROLE = { Anchor = 0.30, Sniper = 0.23, Support = 0.10, IGL = 0.07, Lurker = 0.03, Entry = 0.00 }
@@ -342,8 +345,7 @@ local function isBotPart(part: BasePart): boolean
 end
 
 -- Can a humanoid actually stand here? Clearance checks the MAP, never other
--- bots — five attackers holding a site used to make the whole site
--- un-destination-able for the retaking defense (playtest #12).
+-- bots.
 local function isStandable(point: Vector3, ignore: Model): boolean
 	local params = RaycastParams.new()
 	params.FilterType = Enum.RaycastFilterType.Exclude
@@ -428,13 +430,28 @@ local function pickLurkZone(ctx: Context, allyZones: { string }): string?
 end
 
 -- COVER. Pick the declared cover point in this zone whose watch direction best
--- matches the threat. Attackers post-plant flip the declared face.
-local function pickCoverPoint(ctx: Context): (any?, Vector3?)
+-- matches the threat — skipping points a living teammate has already claimed
+-- (two bots one crate was the doorway traffic jam). Attackers post-plant flip
+-- the declared face.
+local function pickCoverPoint(ctx: Context, allies: { any }): (any?, Vector3?)
 	local best: any = nil
 	local bestFace: Vector3? = nil
 	local bestScore = -0.2
 	for _, point in Greybox.coverPoints do
 		if point.zone ~= ctx.zoneKey then
+			continue
+		end
+		local taken = false
+		for _, ally in allies do
+			if ally ~= ctx.bot and ally.claimedCover == point.name then
+				local allyHumanoid = ally.model and ally.model:FindFirstChildOfClass("Humanoid")
+				if allyHumanoid and allyHumanoid.Health > 0 then
+					taken = true
+					break
+				end
+			end
+		end
+		if taken then
 			continue
 		end
 		local face = if ctx.side == "Attack" and MatchState.planted then -point.face else point.face
@@ -471,7 +488,8 @@ local function holdAngle(
 	shouldInterrupt: () -> boolean,
 	perception: any,
 	rng: Random,
-	clock: () -> number
+	clock: () -> number,
+	maxPeeks: number?
 ): boolean
 	if not hasGround(cover.pos, model) then
 		return false
@@ -500,7 +518,7 @@ local function holdAngle(
 		))
 	end
 
-	for _ = 1, MAX_PEEKS do
+	for _ = 1, (maxPeeks or MAX_PEEKS) do
 		local holdUntil = clock() + rng:NextNumber(2.5, 4)
 		while clock() < holdUntil do
 			if shouldInterrupt() then
@@ -602,6 +620,7 @@ function Brain.start(bot: any, side: string, enemies: { any }, allies: { any }, 
 	local model = bot.model :: Model
 	local perception = Perception.new()
 	Perception.startLoop(perception, bot, enemies, clock)
+	Brain.perceptions[bot.name] = perception -- teammates' callouts land here
 
 	local humanoid = model:FindFirstChildOfClass("Humanoid")
 	local combatState = Combat.newState(if humanoid then humanoid.Health else 100)
@@ -614,15 +633,51 @@ function Brain.start(bot: any, side: string, enemies: { any }, allies: { any }, 
 		local lastThinkLogAt = -math.huge
 		local routeKey: string? = nil
 
-		-- Stall diagnostics: a bot that WANTS to move but hasn't changed zones
-		-- in 8s reports exactly where it stands and what it believes.
+		-- Diagnostics + comms state
 		local prevZoneKey = Zones.VOID
 		local zoneSince = clock()
 		local lastStallLogAt = -math.huge
+		local lastCalloutAt: { [string]: number } = {}
+		local lastDamageSeen = combatState.lastDamagedAt or 0
+		local lastApproachPeekAt = -math.huge
+
+		-- Radio a contact to every living teammate. They receive it as a
+		-- SOUND-class memory — a zone and a rough position, never a wallhack
+		-- (injected contacts aren't "visible", so they can't trigger shots).
+		local function shareContact(contact: any, verb: string, now: number)
+			local lastCall = lastCalloutAt[contact.name] or -math.huge
+			if now - lastCall < CALLOUT_COOLDOWN then
+				return
+			end
+			lastCalloutAt[contact.name] = now
+			if Scenario.VerboseBrain then
+				print(("[CLUTCH] %6.1fs  CALLOUT %s: "%s — %s""):format(now, bot.name, verb, contact.zoneCallout))
+			end
+			task.delay(SimConfig.CalloutDelaySeconds, function()
+				for _, ally in allies do
+					if ally == bot then
+						continue
+					end
+					local allyPerception = Brain.perceptions[ally.name]
+					local allyHumanoid = ally.model and ally.model:FindFirstChildOfClass("Humanoid")
+					if allyPerception and allyHumanoid and allyHumanoid.Health > 0 then
+						allyPerception.memory[contact.name] = {
+							name = contact.name,
+							pos = contact.pos,
+							zoneKey = contact.zoneKey,
+							zoneCallout = contact.zoneCallout,
+							seenAt = clock(),
+							source = "sound", -- the radio is approximate, deliberately
+							distance = 0,
+						}
+						allyPerception.lastContactAt = clock()
+					end
+				end
+			end)
+		end
 
 		-- Cached interrupt predicate. Combat only aborts a walk when the fight
-		-- is forced or close — a 35-stud glimpse used to abort a defuse walk
-		-- every 0.3s while the brain kept Defuse (the post-plant crawl).
+		-- is forced or close.
 		local interruptCheckedAt = -math.huge
 		local interruptAnswer = false
 		local function shouldInterrupt(): boolean
@@ -696,6 +751,20 @@ function Brain.start(bot: any, side: string, enemies: { any }, allies: { any }, 
 			local contact = Perception.bestContact(perception, now)
 			if not visible then
 				Combat.disengage(combatState)
+			end
+
+			-- CALLOUTS. A fresh sighting goes out on the radio; so does taking
+			-- fire from a suspect we already know about. Cooldown per enemy.
+			if visible then
+				shareContact(visible, ("Contact: %s"):format(visible.name), now)
+			else
+				local damagedAt = combatState.lastDamagedAt or 0
+				if damagedAt > lastDamageSeen then
+					lastDamageSeen = damagedAt
+					if contact then
+						shareContact(contact, ("Under fire — %s"):format(contact.name), now)
+					end
+				end
 			end
 
 			if side == "Attack" and not MatchState.planted then
@@ -889,12 +958,16 @@ function Brain.start(bot: any, side: string, enemies: { any }, allies: { any }, 
 				lastProgressAt = clock()
 			elseif intent ~= "Engage" then
 				if targetKey == nil or targetKey == currentKey then
+					-- Settle the zone. Claim the angle first — two bots on one crate
+					-- was the doorway traffic jam.
 					routeKey = nil
-					local cover, faceDir = pickCoverPoint(ctx)
+					local cover, faceDir = pickCoverPoint(ctx, allies)
 					if cover and faceDir then
+						bot.claimedCover = cover.name
 						if holdAngle(bot, model, cover, faceDir, shouldInterrupt, perception, rng, clock) then
 							lastProgressAt = clock()
 						end
+						bot.claimedCover = nil
 					else
 						local spot = standablePointIn(currentKey, rng, model, ground)
 						if spot then
@@ -903,6 +976,23 @@ function Brain.start(bot: any, side: string, enemies: { any }, allies: { any }, 
 						task.wait(rng:NextNumber(0.6, 1.4))
 					end
 				else
+					-- APPROACH PEEK: about to walk toward a fresh, close contact?
+					-- Snap to this zone's cover facing the threat for one peek first.
+					if (intent == "Push" or intent == "Rotate" or intent == "Lurk")
+						and contact
+						and now - contact.seenAt < FRESH_CONTACT_SECONDS
+						and hopsSafe(currentKey, contact.zoneKey, side) <= APPROACH_PEEK_HOPS
+						and now - lastApproachPeekAt > APPROACH_PEEK_COOLDOWN
+					then
+						local cover, faceDir = pickCoverPoint(ctx, allies)
+						if cover and faceDir then
+							lastApproachPeekAt = now
+							bot.claimedCover = cover.name
+							holdAngle(bot, model, cover, faceDir, shouldInterrupt, perception, rng, clock, 1)
+							bot.claimedCover = nil
+						end
+					end
+
 					if routeKey == nil then
 						local hops = hopsSafe(currentKey, targetKey, side)
 						routeKey = if hops > DIRECT_WALK_MAX_HOPS
@@ -947,8 +1037,7 @@ function Brain.start(bot: any, side: string, enemies: { any }, allies: { any }, 
 			end
 
 			-- Stall diagnostics: a bot that wants to move but hasn't changed
-			-- zones in 8s reports its exact situation. This is how the next log
-			-- names the stall instead of us guessing.
+			-- zones in 8s reports its exact situation.
 			if targetKey ~= nil
 				and targetKey ~= currentKey
 				and now - zoneSince > STALL_LOG_SECONDS
@@ -971,6 +1060,9 @@ function Brain.start(bot: any, side: string, enemies: { any }, allies: { any }, 
 		end
 
 		perception.running = false
+		if Brain.perceptions[bot.name] == perception then
+			Brain.perceptions[bot.name] = nil
+		end
 		if onStop then
 			task.defer(onStop)
 		end
