@@ -8,6 +8,11 @@
 -- like players in a doorway, except bots can't negotiate it — that jam was
 -- the playtest #11 BLOCKED cluster at the B door throat. Bots still collide
 -- with the map, the spike, and the player.
+--
+-- THE VISOR (playtest #15): a neon strip welded to the head's front face.
+-- The all-black rigs were unreadable — which way a bot is LOOKING is half
+-- the broadcast. CanQuery is false: enemy raycasts skip it, so the visor
+-- adds zero hitbox. Purely a facing indicator.
 
 local Players = game:GetService("Players")
 local PhysicsService = game:GetService("PhysicsService")
@@ -87,6 +92,35 @@ local function addNameTag(model: Model, text: string, color: Color3)
 	billboard.Parent = head
 end
 
+-- A bright strip on the head's FRONT face (−Z is look direction). Welded,
+-- massless, and CanQuery=false so it never widens a hitbox. The round
+-- machine's per-round clones inherit it like everything else on the rig.
+local function addVisor(model: Model)
+	local head = model:WaitForChild("Head", 5) :: BasePart?
+	if not head then
+		return
+	end
+	local visor = Instance.new("Part")
+	visor.Name = "Visor"
+	visor.Size = Vector3.new(head.Size.X * 0.7, head.Size.Y * 0.35, 0.12)
+	visor.Color = Color3.fromRGB(255, 230, 120)
+	visor.Material = Enum.Material.Neon
+	visor.CanCollide = false
+	visor.CanQuery = false -- enemy aim raycasts pass straight through it
+	visor.CanTouch = false
+	visor.CastShadow = false
+	visor.Massless = true
+	visor.CollisionGroup = BOT_COLLISION_GROUP
+	visor.CFrame = head.CFrame * CFrame.new(0, 0, -(head.Size.Z / 2 + 0.06))
+
+	local weld = Instance.new("WeldConstraint")
+	weld.Part0 = head
+	weld.Part1 = visor
+	weld.Parent = visor
+
+	visor.Parent = model
+end
+
 function BotSpawner.spawnBot(
 	name: string,
 	role: string,
@@ -111,6 +145,7 @@ function BotSpawner.spawnBot(
 		then Color3.fromRGB(255, 150, 60)
 		else Color3.fromRGB(80, 200, 255)
 	addNameTag(model, name, tagColor)
+	addVisor(model)
 
 	model.Parent = workspace
 	return {
