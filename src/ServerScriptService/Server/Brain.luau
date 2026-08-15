@@ -20,6 +20,9 @@
 -- defuse, the rest rotate on the loud plant contact), the post-plant site
 -- web, swings, the info doctrine, callout range/honesty fixes. v4.0: team
 -- callouts, cover claims, approach peeks. Earlier history in the git log.
+--
+-- STYLE RULE (burned twice): never nest escaped double-quotes inside a
+-- double-quoted log string. Drop the inner quotes instead.
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Shared = ReplicatedStorage:WaitForChild("Shared")
@@ -769,7 +772,8 @@ function Brain.start(bot: any, side: string, enemies: { any }, allies: { any }, 
 			end
 			lastCalloutAt[contact.name] = now
 			if Scenario.VerboseBrain then
-				print(("[CLUTCH] %6.1fs  CALLOUT %s: "%s — %s""):format(now, bot.name, verb, contact.zoneCallout))
+				-- No inner quotes in log strings. Ever. (Brain:772, 2026-08-15.)
+				print(("[CLUTCH] %6.1fs  CALLOUT %s: %s — %s"):format(now, bot.name, verb, contact.zoneCallout))
 			end
 			task.delay(SimConfig.CalloutDelaySeconds, function()
 				for _, ally in allies do
