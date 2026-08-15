@@ -1,28 +1,34 @@
 --!strict
--- Bot brain v4.2: score every intent, commit to the winner, act on it — with
--- team comms, a retake structure, and every weight on the tuning rack.
+-- Bot brain v4.3: team intel is real now — bots rotate on CONFIRMED hits,
+-- guard the dropped spike, and retrieve it like the round depends on it.
 --
--- v4.2 (the pre-rerun batch):
---   * ALL SCORING WEIGHTS now read from Shared/Constants/BrainTuning.luau,
---     live, at score time. That table is what the in-game CEM (Tuner.luau,
---     Scenario.TuningMode) perturbs between matches — the brain's judgment
---     is data now, not constants buried in code.
---   * ROLE-BASED POSITIONING: within an assigned site/zone, the role biases
---     WHICH angle gets held — Snipers gravitate to heaven rails, Lurkers to
---     connector/choke watches, Anchors to site cover, Entries to choke-side
---     partials. The plan says WHERE; the role says HOW it stands there.
---   * Angle-hold facing turns smoothly (360°/s cap) instead of snapping.
---     Combat owns its own turn rate + accuracy coupling.
+-- v4.3 (playtest #15, the match-4 autopsy):
+--   * TEAM PRESSURE MODEL: each tick, a side pools every living bot's fresh
+--     memory into a per-zone count of DISTINCT confirmed enemies. Defender
+--     rotation runs on it: 2+ contacts at an area is a hit (Rotate +
+--     PressureBonus), a lone contact is a bait until proven otherwise
+--     (BaitPenalty). The B-anchor no longer sprints cross-map because one
+--     lurker showed a shoulder — and no longer SITS there while four
+--     attackers execute (zero defender rotations in five rounds, #15).
+--   * THE DROPPED SPIKE IS THE ROUND: while the spike is down, attackers
+--     waive the at-objective penalty entirely (a site without the spike is
+--     not an objective) and RetrieveBonus is 0.35 — #15 round 4: Rook held
+--     an empty B Site for 70 seconds, 0.04 short of the hysteresis margin
+--     forever, and the clock won. Never again.
+--   * SPIKE GUARD: a dropped spike is a third site. The two closest living
+--     defenders are assigned to sit on it; it unpicks itself the moment an
+--     attacker picks the spike up.
+--   * DELIBERATE FACING: bots idle-facing now turn onto the threat direction
+--     (or their side's watch direction) instead of contemplating walls. The
+--     visor on the rig (BotSpawner) makes it visible.
+--   * ANTI-TRAIN: the approach peek is skipped when a living teammate is
+--     already in the zone ahead — the first bot checks the corner, the rest
+--     trade off the information instead of queueing for the same window.
 --
--- v4.1 carried: the barrier phase (defenders live during Buy), the rebuilt
--- sampler (ground-part exclusion, local-height center-line, named rejection
--- diagnostics), personal space (6 studs), the retake structure (two closest
--- defuse, the rest rotate on the loud plant contact), the post-plant site
--- web, swings, the info doctrine, callout range/honesty fixes. v4.0: team
--- callouts, cover claims, approach peeks. Earlier history in the git log.
---
--- STYLE RULE (burned twice): never nest escaped double-quotes inside a
--- double-quoted log string. Drop the inner quotes instead.
+-- v4.2 carried: BrainTuning rack, role-affinity positioning, smooth hold
+-- facing. v4.1: barrier phase, sampler rebuild, personal space, retake
+-- structure, post-plant web, swings. v4.0: callouts, claims, approach peeks.
+-- Earlier history in the git log. Style rule: no inner quotes in log strings.
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Shared = ReplicatedStorage:WaitForChild("Shared")
@@ -43,7 +49,7 @@ local MatchState = require(script.Parent.MatchState)
 local Brain = {}
 
 -- Every living brain's perception, keyed by name. Callouts write into these;
--- brains read their own.
+-- brains read their own — and the TEAM PRESSURE model reads all of them.
 Brain.perceptions = {} :: { [string]: any }
 
 local CANDIDATES = 6
@@ -65,6 +71,7 @@ local APPROACH_PEEK_COOLDOWN = 6
 local APPROACH_PEEK_HOPS = 2
 local SAMPLE_DIAG_SECONDS = 10
 local HOLD_TURN_DEG_PER_SEC = 360 -- angle-hold facing cap (combat has its own)
+local PRESSURE_FRESH_SECONDS = 5 -- a contact older than this is not pressure
 
 local SITES = { "A_SITE", "B_SITE" }
 
@@ -99,6 +106,8 @@ local ROLE_ZONE_AFFINITY = {
 
 local INTENTS = { "Hold", "Push", "Rotate", "Lurk", "FallBack", "Engage", "Plant", "Defuse" }
 
+type Pressure = { [string]: { [string]: boolean } }
+
 type Context = {
 	bot: any,
 	side: string,
@@ -116,6 +125,10 @@ type Context = {
 	enemiesNear: number,
 	closerToSite: number,
 	coverZoneSet: { string }?,
+	pressure: Pressure,
+	spikeDown: boolean,
+	spikeZoneKey: string?,
+	guardRank: number,
 }
 
 local function clamp01(n: number): number
@@ -128,6 +141,44 @@ local function phaseIsLive(side: string): boolean
 	return MatchState.phase == "Live"
 		or MatchState.phase == "Planted"
 		or (MatchState.phase == "Buy" and side == "Defense")
+end
+
+-- ---------------------------------------------------------------------------
+-- TEAM PRESSURE. Pool every living teammate's fresh memory into a per-zone
+-- set of DISTINCT confirmed enemies. One shoulder is a bait; two is a hit.
+-- ---------------------------------------------------------------------------
+local function teamPressure(allies: { any }, now: number): Pressure
+	local pressure: Pressure = {}
+	for _, ally in allies do
+		local allyPerception = Brain.perceptions[ally.name]
+		local allyHumanoid = ally.model and ally.model:FindFirstChildOfClass("Humanoid")
+		if not allyPerception or not allyHumanoid or allyHumanoid.Health <= 0 then
+			continue
+		end
+		for enemyName, memoryContact in allyPerception.memory do
+			if enemyName ~= "the spike" and now - memoryContact.seenAt <= PRESSURE_FRESH_SECONDS then
+				local atZone = pressure[memoryContact.zoneKey]
+				if not atZone then
+					atZone = {}
+					pressure[memoryContact.zoneKey] = atZone
+				end
+				atZone[enemyName] = true
+			end
+		end
+	end
+	return pressure
+end
+
+local function pressureCount(pressure: Pressure, zoneKey: string): number
+	local names = pressure[zoneKey]
+	if not names then
+		return 0
+	end
+	local count = 0
+	for _ in names do
+		count += 1
+	end
+	return count
 end
 
 -- ---------------------------------------------------------------------------
@@ -235,6 +286,10 @@ local function scoreHold(ctx: Context): number
 	if Zones.hasTag(ctx.zoneKey, "site") or Zones.hasTag(ctx.zoneKey, "heaven") then
 		score += T.HighGroundBonus
 	end
+	-- Guarding the dropped spike IS defending it.
+	if ctx.spikeDown and ctx.spikeZoneKey and ctx.zoneKey == ctx.spikeZoneKey then
+		score += T.SpikeGuardBonus
+	end
 	return score
 end
 
@@ -246,7 +301,9 @@ local function scorePush(ctx: Context): number
 		score += T.AttackBonus
 	end
 	score += ctx.decisiveness * T.DecisivenessBonus
-	if ctx.atObjective then
+	-- A site WITHOUT the spike is not an objective. The at-objective penalty
+	-- is waived while the spike is down — #15 round 4's 70-second freeze.
+	if ctx.atObjective and not ctx.spikeDown then
 		score += T.AtObjectivePenalty
 	end
 	if ctx.side == "Attack" and not MatchState.planted then
@@ -259,8 +316,7 @@ local function scorePush(ctx: Context): number
 			end
 		elseif MatchState.spikeCarrier == nil and MatchState.spikePart then
 			-- Recovery — but cautiously: a spike in a known-hot zone is a trap.
-			local spikeZone = Zones.keyAt(MatchState.spikePart.Position)
-			local hot = ctx.contact and ctx.contact.zoneKey == spikeZone and ctx.contact.source == "sight"
+			local hot = ctx.contact and ctx.contact.zoneKey == ctx.spikeZoneKey and ctx.contact.source == "sight"
 			score += if hot then T.RetrieveHotBonus else T.RetrieveBonus
 		end
 	end
@@ -283,6 +339,17 @@ local function scoreRotate(ctx: Context): number
 	end
 	if Zones.hasTag(ctx.contact.zoneKey, "site") then
 		score += T.SiteBonus
+	end
+	-- CONFIRMATION GATE (defense): rotate on a confirmed hit — 2+ distinct
+	-- fresh contacts at the area — not on a one-man bait. Post-plant the
+	-- objective itself is confirmation enough.
+	if ctx.side == "Defense" and not MatchState.planted then
+		local count = pressureCount(ctx.pressure, ctx.contact.zoneKey)
+		if count >= 2 then
+			score += T.PressureBonus
+		elseif count <= 1 then
+			score += T.BaitPenalty
+		end
 	end
 	return score
 end
@@ -579,14 +646,26 @@ local function pickCoverPoint(ctx: Context, allies: { any }): (any?, Vector3?)
 	return best, bestFace
 end
 
--- Smooth facing for angle holds. Combat owns its own turn rate and its
--- accuracy coupling; this is the watch-line version.
+-- Smooth facing. Combat owns its own turn rate and accuracy coupling; this is
+-- the watch-line / idle-settle version.
 local function faceTowardSmooth(root: BasePart, dir: Vector3, dt: number)
 	local currentYaw = math.atan2(-root.CFrame.LookVector.X, -root.CFrame.LookVector.Z)
 	local desiredYaw = math.atan2(-dir.X, -dir.Z)
 	local delta = (desiredYaw - currentYaw + math.pi) % (math.pi * 2) - math.pi
 	local maxStep = math.rad(HOLD_TURN_DEG_PER_SEC) * dt
 	root.CFrame = CFrame.new(root.Position) * CFrame.Angles(0, currentYaw + math.clamp(delta, -maxStep, maxStep), 0)
+end
+
+-- Where should an idle bot LOOK? At the freshest contact if there is one,
+-- else toward the enemy's half. Never the wall.
+local function threatFaceDir(side: string, contact: any, fromPos: Vector3): Vector3
+	if contact then
+		local dir = (contact.pos - fromPos) * Vector3.new(1, 0, 1)
+		if dir.Magnitude > 0.1 then
+			return dir.Unit
+		end
+	end
+	return if side == "Defense" then Vector3.zAxis else -Vector3.zAxis
 end
 
 -- HOLD THE ANGLE. Walk to the point, turn onto the watch line smoothly, then
@@ -685,8 +764,10 @@ local function resolveTarget(intent: string, ctx: Context, allyZones: { string }
 		return if ctx.contact then ctx.contact.zoneKey else nil
 	elseif intent == "Push" then
 		if ctx.side == "Attack" then
+			-- The dropped spike outranks any site assignment: the round is
+			-- un-winnable without it.
 			if not MatchState.planted and MatchState.spikeCarrier == nil and MatchState.spikePart then
-				return Zones.keyAt(MatchState.spikePart.Position)
+				return ctx.spikeZoneKey
 			end
 			return ctx.bot.siteChoice or nearestOf(SITES, ctx.zoneKey, ctx.side)
 		end
@@ -697,6 +778,16 @@ local function resolveTarget(intent: string, ctx: Context, allyZones: { string }
 
 	-- Hold
 	if ctx.side == "Defense" then
+		-- GUARD THE DROP: a dropped spike is a third site. The two closest
+		-- living defenders sit on it; everyone else keeps their assignments.
+		if ctx.spikeDown and ctx.spikeZoneKey then
+			if ctx.zoneKey == ctx.spikeZoneKey then
+				return nil -- on guard
+			end
+			if ctx.guardRank < 2 then
+				return ctx.spikeZoneKey
+			end
+		end
 		if ctx.onAnchor then
 			return nil
 		end
@@ -922,6 +1013,18 @@ function Brain.start(bot: any, side: string, enemies: { any }, allies: { any }, 
 				end
 			end
 
+			-- The dropped spike is a live map fact for both sides: attackers must
+			-- retrieve it, defenders guard it.
+			local spikeDown = not MatchState.planted and MatchState.spikeCarrier == nil and MatchState.spikePart ~= nil
+			local spikeZoneKey: string? = nil
+			if spikeDown and MatchState.spikePart then
+				spikeZoneKey = Zones.keyAt(MatchState.spikePart.Position)
+			end
+
+			-- Team intel pool: distinct fresh enemies per zone, across the whole
+			-- side's combined senses. The confirmation gate runs on this.
+			local pressure = teamPressure(allies, now)
+
 			local assessment = nil
 			if visible then
 				assessment = Combat.assess(bot, weapon, visible, enemies, currentKey, combatState, now)
@@ -930,9 +1033,14 @@ function Brain.start(bot: any, side: string, enemies: { any }, allies: { any }, 
 			local allyZones = {}
 			local alliesNear = 0
 			local closerToSite = 0
+			local guardRank = 0
 			local myHopsToSite = math.huge
 			if side == "Defense" and MatchState.planted and MatchState.plantedZoneKey then
 				myHopsToSite = hopsSafe(currentKey, MatchState.plantedZoneKey, side)
+			end
+			local myHopsToSpike = math.huge
+			if spikeDown and spikeZoneKey and side == "Defense" then
+				myHopsToSpike = hopsSafe(currentKey, spikeZoneKey, side)
 			end
 			for _, ally in allies do
 				if ally == bot or not ally.model.Parent then
@@ -951,6 +1059,11 @@ function Brain.start(bot: any, side: string, enemies: { any }, allies: { any }, 
 				if myHopsToSite ~= math.huge then
 					if hopsSafe(allyKey, MatchState.plantedZoneKey, side) < myHopsToSite then
 						closerToSite += 1
+					end
+				end
+				if myHopsToSpike ~= math.huge then
+					if hopsSafe(allyKey, spikeZoneKey :: string, side) < myHopsToSpike then
+						guardRank += 1
 					end
 				end
 			end
@@ -1003,6 +1116,10 @@ function Brain.start(bot: any, side: string, enemies: { any }, allies: { any }, 
 				enemiesNear = enemiesNear,
 				closerToSite = closerToSite,
 				coverZoneSet = coverZoneSet,
+				pressure = pressure,
+				spikeDown = spikeDown,
+				spikeZoneKey = spikeZoneKey,
+				guardRank = guardRank,
 			}
 
 			local scores: { [string]: number } = {}
@@ -1152,19 +1269,32 @@ function Brain.start(bot: any, side: string, enemies: { any }, allies: { any }, 
 						if spot then
 							Pathing.walkToWithResult(model, spot, shouldInterrupt)
 						end
+						-- Face the threat, never the wall: idle settles turn onto the
+						-- contact direction (or their side's watch direction).
+						local root = model:FindFirstChild("HumanoidRootPart") :: BasePart?
+						if root then
+							local faceDirNow = threatFaceDir(side, contact, root.Position)
+							for _ = 1, 4 do
+								faceTowardSmooth(root, faceDirNow, 0.15)
+								task.wait(0.1)
+							end
+						end
 						task.wait(rng:NextNumber(0.6, 1.4))
 					end
 				else
 					-- THE INFO DOCTRINE, approach half: check the angle before you
 					-- cross it. Fires on decaying contacts within 2 hops, or simply
-					-- because the next zone is a choke (check corners). Cooldown-
-					-- gated so a rotation can't stall.
+					-- because the next zone is a choke (check corners) — but never
+					-- when a living teammate is ALREADY in that zone: the first bot
+					-- checks the corner, the rest trade off the information.
 					local contactClose = contact ~= nil
 						and now - contact.seenAt < SimConfig.MemoryDecaySeconds
 						and hopsSafe(currentKey, contact.zoneKey, side) <= APPROACH_PEEK_HOPS
 					local chokeAhead = routeKey ~= nil and Zones.hasTag(routeKey, "choke")
+					local allyAhead = routeKey ~= nil and table.find(allyZones, routeKey) ~= nil
 					if (intent == "Push" or intent == "Rotate" or intent == "Lurk")
 						and (contactClose or chokeAhead)
+						and not allyAhead
 						and now - lastApproachPeekAt > APPROACH_PEEK_COOLDOWN
 					then
 						local cover, faceDir = pickCoverPoint(ctx, allies)
@@ -1190,12 +1320,10 @@ function Brain.start(bot: any, side: string, enemies: { any }, allies: { any }, 
 						routeKey = nil
 					else
 						local retrieving = side == "Attack"
-							and not MatchState.planted
-							and MatchState.spikeCarrier == nil
-							and MatchState.spikePart ~= nil
-							and routeKey == Zones.keyAt(MatchState.spikePart.Position)
+							and spikeDown
+							and routeKey == spikeZoneKey
 						local spot, sampleReason
-						if retrieving then
+						if retrieving and MatchState.spikePart then
 							local spikePos = MatchState.spikePart.Position
 							spot = Vector3.new(spikePos.X, 1, spikePos.Z)
 							local ok, reason = standableReason(spot, model)
@@ -1231,7 +1359,8 @@ function Brain.start(bot: any, side: string, enemies: { any }, allies: { any }, 
 			end
 
 			-- Stall diagnostics: a bot that wants to move but hasn't changed
-			-- zones in 8s reports its exact situation.
+			-- zones in 8s reports its exact situation. (Cross-map rotates trip
+			-- this legitimately; read them as pace, not guilt.)
 			if targetKey ~= nil
 				and targetKey ~= currentKey
 				and now - zoneSince > STALL_LOG_SECONDS
