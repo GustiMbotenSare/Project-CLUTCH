@@ -12,13 +12,13 @@
 -- skull is information even when it doesn't hit; near-misses stamp the
 -- victim's combat state, and suppression forces a response like damage does).
 --
--- SMOOTH AIM, ROUND TWO (playtest #16's "stop, pan randomly, flick" report):
--- the reaction window is no longer dead time — the bot TURNS toward the
--- target for the whole delay, eyes before the finger. The model's facing
--- rotates at a Reactions-driven rate, remaining angular error widens the
--- cone, and headshots require a settled crosshair. Combined with the brain's
--- facing loop (AutoRotate is off; the legs no longer own the eyes), a bot
--- can watch the flank while it crosses the lane.
+-- SMOOTH AIM, ROUND THREE (playtest #17): turning is PHYSICS-SAFE now —
+-- AimAlign (an AlignOrientation on the root) carries the rotation at a
+-- capped angular velocity; nobody writes a root CFrame anymore. Direct
+-- CFrame writes on a WALKING root stomped the humanoid mover: every walk in
+-- the match went BLOCKED. The shooter still pays for the turn: the measured
+-- remaining angular error widens the cone, and headshots require a settled
+-- crosshair. The reaction window still turns first — eyes before the finger.
 --
 -- GUNFIRE IS HEARD: every burst stamps MatchState.lastShot; Perception turns
 -- it into a SOUND contact for every enemy.
@@ -35,6 +35,7 @@ local Scenario = require(Shared.Constants.Scenario)
 local Zones = require(Shared.MapData.Zones)
 local Perception = require(script.Parent.Perception)
 local MatchState = require(script.Parent.MatchState)
+local BrainCore = require(script.Parent.BrainCore)
 
 local Combat = {}
 
@@ -264,32 +265,16 @@ local function hitSpark(at: Vector3)
 	Debris:AddItem(spark, 0.12)
 end
 
--- SMOOTH AIM. Rotate the model toward the target, yaw-limited by Reactions,
--- and return the angular error REMAINING after this step (radians) — the
--- shooter pays for it in spread. A 90° swing at Reactions 70 takes ~0.3s.
-local function yawOf(look: Vector3): number
-	return math.atan2(-look.X, -look.Z)
-end
-
-local function shortestAngle(from: number, to: number): number
-	return (to - from + math.pi) % (math.pi * 2) - math.pi
-end
-
-function Combat.faceTargetSmooth(bot: any, root: BasePart, targetPos: Vector3, dt: number): number
-	local flat = Vector3.new(targetPos.X, root.Position.Y, targetPos.Z)
-	local toTarget = flat - root.Position
-	if toTarget.Magnitude < 0.1 then
-		return 0
-	end
-	local currentYaw = yawOf(root.CFrame.LookVector)
-	local desiredYaw = yawOf(toTarget.Unit)
-	local delta = shortestAngle(currentYaw, desiredYaw)
-
-	local rateDeg = TURN_BASE_DEG_PER_SEC + bot.attributes.Reactions * TURN_REACTION_DEG_PER_SEC
-	local maxStep = math.rad(rateDeg) * math.clamp(dt, 0, 0.5)
-	local step = math.clamp(delta, -maxStep, maxStep)
-	root.CFrame = CFrame.new(root.Position) * CFrame.Angles(0, currentYaw + step, 0)
-	return math.abs(delta - step)
+-- SMOOTH AIM, PHYSICS-SAFE. AimAlign carries the rotation at the combat turn
+-- rate (Reactions-driven); the shooter just pays the measured remaining
+-- error in spread. No CFrame writes — a moving root is the humanoid's job.
+function Combat.faceTargetSmooth(bot: any, root: BasePart, targetPos: Vector3, _dt: number): number
+	return BrainCore.turnToward(
+		bot,
+		root,
+		targetPos,
+		TURN_BASE_DEG_PER_SEC + bot.attributes.Reactions * TURN_REACTION_DEG_PER_SEC
+	)
 end
 
 -- Fires one burst. Returns true if the target died.
