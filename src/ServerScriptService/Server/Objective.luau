@@ -33,6 +33,9 @@
 --
 -- PLANTS AND DEFUSES FEED MATCH MEMORY (batch C): the ledger learns which
 -- site the attack actually wants, and the plan roller reads it next round.
+--
+-- Round-scoped intel dies with the round (playtest #19): reset() also wipes
+-- the area-clear marks — last round's "clear" means nothing now.
 
 local Debris = game:GetService("Debris")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -74,7 +77,8 @@ local function cancelFuse()
 	fuseThread = nil
 end
 
--- Round reset: no spike, no fuse, no planted state, no marks, no channel.
+-- Round reset: no spike, no fuse, no planted state, no marks, no channel,
+-- and no area-clear intel — last round's "clear" means nothing now.
 function Objective.reset()
 	cancelFuse()
 	if MatchState.spikePart then
@@ -89,6 +93,7 @@ function Objective.reset()
 	MatchState.exploded = false
 	MatchState.spikeMarkAtk = nil
 	MatchState.spikeMarkDef = nil
+	MatchState.clearMarks = { Attack = {}, Defense = {} }
 	defusingBot = nil
 end
 
