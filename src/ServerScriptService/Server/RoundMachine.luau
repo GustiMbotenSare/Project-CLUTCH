@@ -4,9 +4,12 @@
 -- Buy → Live (100s, brains on) → resolution by elimination, explosion, defuse
 -- or clock → PostRound (score, credits) → again.
 --
--- THE BARRIER PHASE: during Buy, ATTACKERS are barrier-frozen while
--- DEFENDERS are free and their brains are already running — they walk to
--- their holds before the attack can start (Valorant's head start).
+-- THE BARRIER PHASE (batch E, playtest #21): during Buy the barrier line is
+-- UP and BOTH sides' brains run — Valorant's rule, replacing the old
+-- attacker freeze. Defenders deploy to their holds; attackers stage behind
+-- the barriers in their own half (BrainCore caps their targets). Nobody
+-- sees or touches the attacker spawn before the whistle; at LIVE the line
+-- drops. Round 5's 3.2-second spawn-camp wipe is the bug this buries.
 --
 -- OUTCOME LOGGING + THE TUNER HOOK: every round prints a parseable
 -- ROUND_RESULT line, every match a MATCH_RESULT with the metrics the tuner
@@ -33,9 +36,9 @@
 -- broadcast can show loadouts before the inventory line is read.
 --
 -- CLONES ARE NOT SELF-SUFFICIENT (playtest #17): a fresh body inherits the
--- template's parts but not its LOOPS — the procedural walk must be restarted
--- per body, and AimAlign's target re-seeded to the spawn facing (otherwise
--- every round opens with ten bots snapping back to a stale angle).
+-- template's parts but not its LOOPS — the ANIMATOR re-attaches per body
+-- (batch D; playing tracks don't survive Clone), and AimAlign's target
+-- re-seeds to the spawn facing.
 --
 -- TEAM PLANS: every round opens with a CALL (Rush/Default/Split ×
 -- Standard/Stack/Aggro) — the seed of the M2 tactics board.
@@ -44,9 +47,8 @@
 -- rather than hanging the match.
 --
 -- PLAYTEST #19: publish the LIVE HEADCOUNTS on MatchState every publish tick
--- (the ALL-CLEAR read — attackers wiped with the spike ticking means the
--- defense sprints, not creeps), and reset the held-item/dry flags on every
--- fresh body (they live on the bot RECORD, which survives the body swap).
+-- (the ALL-CLEAR read), and reset the held-item/dry flags on every fresh
+-- body (they live on the bot RECORD, which survives the body swap).
 --
 -- (Also: a from-memory rewrite of this file once renamed start→run and the
 -- bootstrap died at the handoff — this module's interface IS its callers.
@@ -69,6 +71,8 @@ local MatchState = require(script.Parent.MatchState)
 local MatchMemory = require(script.Parent.MatchMemory)
 local Tuner = require(script.Parent.Tuner)
 local BotSpawner = require(script.Parent.BotSpawner)
+local MapBuilder = require(script.Parent.MapBuilder)
+local Animations = require(script.Parent.Animations)
 
 local RoundMachine = {}
 
@@ -185,9 +189,9 @@ end
 -- perception loops and death watchers riding them) are destroyed; Telemetry
 -- tracks survive because they re-read bot.model every tick. Per-round brain
 -- picks AND cover claims are cleared so the plan can reassign them.
--- A clone inherits PARTS but not LOOPS: the walk swing restarts here, and
--- AimAlign gets re-seeded to the spawn facing. The bot RECORD survives the
--- body swap — so the held-item and dry flags (playtest #19) reset HERE.
+-- A clone inherits PARTS but not LOOPS: the Animator re-attaches here
+-- (batch D), and AimAlign gets re-seeded to the spawn facing. The bot RECORD
+-- survives the body swap — so the held-item and dry flags reset HERE.
 local function resetBodies(ctx: Ctx)
 	for _, bot in ctx.roster do
 		bot.siteChoice = nil
@@ -195,6 +199,7 @@ local function resetBodies(ctx: Ctx)
 		bot.claimedCover = nil
 		bot.facePoint = nil -- last round's stare dies with the body
 		bot.moveDir = nil
+		bot.faceMode = nil
 		-- Held-item state lives on the record, not the body: gun out, both
 		-- weapons live, no dry flags carried into the new round.
 		bot.held = "Primary"
@@ -221,7 +226,7 @@ local function resetBodies(ctx: Ctx)
 		if align then
 			align.CFrame = CFrame.new(Vector3.zero) * (bot.spawnPivot :: CFrame).Rotation
 		end
-		BotSpawner.startProceduralWalk(fresh) -- task loops don't survive a clone
+		Animations.attach(fresh) -- playing tracks don't survive a clone
 	end
 end
 
@@ -481,23 +486,25 @@ function RoundMachine.start(ctx: Ctx)
 			markBot(bot, "Defense")
 		end
 		Objective.reset()
+		MapBuilder.setBarriersUp(true) -- the barrier line seals the attacker half
 		if #ctx.attackers > 0 then
 			-- A random attacker carries, not the same nameplate every round
 			Objective.assignCarrier(ctx.attackers[ctx.rng:NextInteger(1, #ctx.attackers)])
 		end
 		rollTeamPlans(ctx) -- writes bot.siteChoice / bot.holdChoice before brains wake
 
-		-- BUY — the barrier phase. Attackers are frozen; DEFENDERS are free and
-		-- their brains start NOW so they reach their holds before the barrier
-		-- drops.
+		-- BUY — THE BARRIER PHASE (batch E): nobody freezes. Defenders deploy
+		-- to their holds; attackers stage behind the barrier line in their own
+		-- half (their brains run too — BrainCore caps their targets).
 		MatchState.phase = "Buy"
 		MatchState.timeLeft = RoundConfig.BuyPhaseSeconds
 		print(("[CLUTCH] ===== ROUND %d ====="):format(roundId))
 		for _, bot in ctx.attackers do
-			setFrozen(bot, true)
+			setFrozen(bot, false)
 			autoBuy(bot)
 			BotSpawner.styleGun(bot.model, bot.weapon)
 			BotSpawner.styleHeld(bot.model, "Gun") -- the knife goes away at spawn
+			Brain.start(bot, "Attack", ctx.defenders, ctx.attackers, ctx.rng, clock, bot.weapon)
 		end
 		for _, bot in ctx.defenders do
 			setFrozen(bot, false) -- free to deploy
@@ -513,15 +520,15 @@ function RoundMachine.start(ctx: Ctx)
 			task.wait(0.25)
 		end
 
-		-- LIVE — the barrier drops
+		-- LIVE — the barrier drops, the round begins
 		MatchState.phase = "Live"
+		MapBuilder.setBarriersUp(false)
 		print(("[CLUTCH] LIVE — %ds on the clock"):format(RoundConfig.RoundSeconds))
 		for _, bot in ctx.attackers do
-			setFrozen(bot, false)
-			Brain.start(bot, "Attack", ctx.defenders, ctx.attackers, ctx.rng, clock, bot.weapon)
+			setFrozen(bot, false) -- idempotent; brains already running
 		end
 		for _, bot in ctx.defenders do
-			setFrozen(bot, false) -- idempotent; brains already running
+			setFrozen(bot, false)
 		end
 		watchDeaths(ctx, roundId)
 
