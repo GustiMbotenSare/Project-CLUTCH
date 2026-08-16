@@ -24,7 +24,10 @@
 -- a bot with dry guns can't score Engage.
 -- v4.7 (playtest #20): ANTI-GLUE — a bot that just glanced off a cover
 -- point and saw nothing doesn't re-pick the same crate for a few seconds.
--- Corners are checked, not camped.
+-- v4.8 (playtest #21): THE BARRIER PHASE CONFINES, IT DOESN'T FREEZE —
+-- both sides' brains run during Buy (Valorant's rule): defenders deploy,
+-- attackers stage behind the barrier line (lobby/spawn only). PostRound
+-- stays asleep.
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Shared = ReplicatedStorage:WaitForChild("Shared")
@@ -64,6 +67,9 @@ BrainCore.DEF_HOLDS = DEF_HOLDS
 local ATK_FORWARD = { "MID", "MID_LEDGE", "A_LOBBY", "B_LOBBY", "A_ELBOW", "B_ELBOW" }
 local DEF_FORWARD = { "MID", "MID_LEDGE", "MID_WINDOW", "A_SHORT", "B_SHORT" }
 local FLANKS = { "A_MAIN", "B_MAIN", "A_ELBOW", "B_ELBOW" }
+
+-- Buy-phase staging (batch E): the barrier line holds the attack here.
+local ATK_STAGING = { "ATK_LOBBY", "ATK_SPAWN" }
 
 -- Deep enemy territory: fine as a DESTINATION, never as a corridor.
 local ENEMY_DEEP = {
@@ -120,12 +126,11 @@ local function clamp01(n: number): number
 	return math.clamp(n, 0, 1)
 end
 
--- The barrier phase: defenders are live during Buy (deploying to their
--- holds); attackers sleep frozen until LIVE.
-function BrainCore.phaseIsLive(side: string): boolean
-	return MatchState.phase == "Live"
-		or MatchState.phase == "Planted"
-		or (MatchState.phase == "Buy" and side == "Defense")
+-- The barrier phase CONFINES, it doesn't freeze (batch E): both sides run
+-- their brains during Buy — defenders deploy to their holds, attackers stage
+-- behind the barrier line. Only PostRound sleeps.
+function BrainCore.phaseIsLive(_side: string): boolean
+	return MatchState.phase ~= "PostRound"
 end
 
 -- ---------------------------------------------------------------------------
@@ -674,6 +679,17 @@ end
 -- The target-zone decider. resolveTarget only maps an intent to a ZONE;
 -- the runtime loop owns the walking.
 function BrainCore.resolveTarget(intent: string, ctx: Context, allyZones: { string }, rng: Random): string?
+	-- BUY-PHASE STAGING (batch E): the barrier line holds the attack in its
+	-- own half — attackers wander the lobby and spawn, nothing more. The
+	-- barrier makes it physical; this cap keeps their DESTINATIONS honest so
+	-- nobody rubber-bands against the glow.
+	if MatchState.phase == "Buy" and ctx.side == "Attack" then
+		if table.find(ATK_STAGING, ctx.zoneKey) then
+			return nil -- already in staging: settle, shuffle, watch the line
+		end
+		return BrainCore.nearestOf(ATK_STAGING, ctx.zoneKey, ctx.side)
+	end
+
 	if intent == "Engage" then
 		return nil
 	elseif intent == "Plant" then
