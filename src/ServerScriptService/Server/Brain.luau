@@ -1,18 +1,21 @@
 --!strict
--- Bot brain v4.8: the RUNTIME half. BrainCore.luau owns the judgment
+-- Bot brain v4.9: the RUNTIME half. BrainCore.luau owns the judgment
 -- (scorers, routing, sampler, cover picks, team pressure, resolveTarget);
 -- this module owns what the bot DOES about it each tick: comms, facing,
 -- walks, holds, channels, diagnostics.
 --
--- v4.8 (playtest #22): THE GAZE PRIORITY LIST. A walking bot watches the
--- highest-priority thing, not its feet: the ROTATE target first (you walk
--- toward trouble eyes-up), then the corner or hot lane it's about to cross
--- (choke tag or match-memory heat), and only then the raw heading. The
--- random-looking wander stare is dead.
+-- v4.9 (playtest #23):
+--   * BUY-PHASE STAGING — the barrier phase is prep time, not a crumple:
+--     attackers form up at the barrier mouth their PLAN exits through
+--     (site mouths, mid for the sniper, corridor mouths for freelancers),
+--     with deterministic jitter so same-mouth bots don't stack.
+--   * THE PAD STEP — planting walks onto the glowing pad first (Objective
+--     enforces the pad; the brain steps there before asking for the channel).
 --
--- v4.7 (playtest #20): heading-tracked facing, glances not camps, spike
--- snap, the loud defuse tap. v4.6: knife discipline, all-clear, area-clear
--- callouts. Style rule: no inner quotes in log strings. Ever.
+-- v4.8 (playtest #22): the gaze priority list (rotate target > the corner
+-- you're crossing > heading). v4.7: heading-tracked facing, glances not
+-- camps, spike snap, the loud defuse tap. v4.6: knife discipline, all-clear,
+-- area-clear callouts. Style rule: no inner quotes in log strings. Ever.
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Shared = ReplicatedStorage:WaitForChild("Shared")
@@ -59,6 +62,37 @@ local K = BrainCore.K -- shared constants (freshness windows, hop budgets, spaci
 
 -- Zones defenders consider "forward" positions (for the at-objective read).
 local DEF_FORWARD = { "MID", "MID_LEDGE", "MID_WINDOW", "A_SHORT", "B_SHORT" }
+
+-- Buy-phase staging (playtest #23): the named barrier mouths, just inside
+-- the attacker half. A bot forms up at the mouth its PLAN exits through.
+local STAGE_MOUTH_A = Vector3.new(-53, 1, 36)
+local STAGE_MOUTH_B = Vector3.new(53, 1, 36)
+local STAGE_MOUTH_MID = Vector3.new(0, 1, 36)
+local STAGE_WEST = Vector3.new(-82, 1, 52) -- the outside-long barrier approach
+local STAGE_EAST = Vector3.new(82, 1, 52)
+
+local function stagingPointFor(bot: any): Vector3
+	local base: Vector3
+	if bot.siteChoice == "A_SITE" then
+		base = STAGE_MOUTH_A
+	elseif bot.siteChoice == "B_SITE" then
+		base = STAGE_MOUTH_B
+	elseif bot.role == "Sniper" then
+		base = STAGE_MOUTH_MID
+	elseif #bot.name % 2 == 0 then
+		base = STAGE_WEST
+	else
+		base = STAGE_EAST
+	end
+	-- deterministic per-bot jitter: two bots sharing a mouth must not stack
+	-- (per-bot collision is on — they can't occupy the same studs)
+	local hash = 0
+	for i = 1, #bot.name do
+		hash += string.byte(bot.name, i)
+	end
+	local jitter = (hash % 5 - 2) * 3 -- -6..6 studs along the mouth
+	return base + Vector3.new(jitter, 0, 0)
+end
 
 -- WALK OR SPRINT — the info doctrine's speed half, now with clear marks:
 -- a zone your side has proven safe is a zone you RUN through.
@@ -783,7 +817,14 @@ function Brain.start(bot: any, side: string, enemies: { any }, allies: { any }, 
 
 			if intent == "Plant" and Zones.hasTag(currentKey, "plant") then
 				bot.faceMode = "point" -- the planter watches the threat, not its feet
-				Objective.tryStartPlant(bot, clock, channelAbort, if contact then contact.pos else nil)
+				-- THE COLORED AREA IS THE RULE (playtest #23): step onto the glowing
+				-- pad first; the channel only opens there.
+				local pad, padDist = Objective.nearestPad(ground)
+				if pad and padDist > 4 then
+					Pathing.walkToWithResult(model, Vector3.new(pad.pos.X, 1, pad.pos.Z), shouldInterrupt)
+				else
+					Objective.tryStartPlant(bot, clock, channelAbort, if contact then contact.pos else nil)
+				end
 				lastProgressAt = clock()
 			elseif intent == "Defuse" and currentKey == MatchState.plantedZoneKey and MatchState.spikePart then
 				local result = Pathing.walkToWithResult(model, MatchState.spikePart.Position, shouldInterrupt)
@@ -813,45 +854,67 @@ function Brain.start(bot: any, side: string, enemies: { any }, allies: { any }, 
 				if snapped then
 					-- grabbed (or walking to grab): nothing else this tick
 				elseif targetKey == nil or targetKey == currentKey then
-					-- Settle the zone. GLANCE, don't camp: holds are short, the peek
-					-- count follows Game Sense, and a quiet hold earns a relocate
-					-- beat before the next angle (anti-glue, playtest #20).
 					routeKey = nil
-					bot.moveDir = nil -- standing: no heading to protect
-					local cover, faceDir = nil, nil
-					if not (bot.relocateUntil and now < bot.relocateUntil) then
-						cover, faceDir = BrainCore.pickCoverPoint(ctx, allies)
-					end
-					if cover and faceDir then
-						bot.claimedCover = cover.name
-						local gs = bot.attributes.GameSense / 100
-						local peeks = 1
-							+ (if rng:NextNumber() < gs * 0.6 then 1 else 0)
-							+ (if rng:NextNumber() < gs * 0.35 then 1 else 0)
-						if holdAngle(bot, model, cover, faceDir, shouldInterrupt, perception, rng, clock, peeks) then
-							lastProgressAt = clock()
-						end
-						bot.claimedCover = nil
-						if not Perception.visibleContact(perception) then
-							-- quiet hold: remember the crate (BrainCore skips it for a
-							-- beat) and force a relocation before the next angle
-							bot.lastHeldCover = cover.name
-							bot.lastHeldAt = os.clock()
-							bot.relocateUntil = clock() + RELOCATE_BEAT_SECONDS
-						end
-					else
-						local spot = BrainCore.standablePointIn(currentKey, rng, model, ground, allies, bot)
-						if spot then
+					if MatchState.phase == "Buy" and side == "Attack" then
+						-- STAGING (playtest #23): the barrier phase is prep time.
+						-- Form up at the mouth the plan exits through — not a
+						-- crumple around the spawn strip. Face the way you'll go.
+						local spot = stagingPointFor(bot)
+						local toSpot = (spot - ground) * Vector3.new(1, 0, 1)
+						if toSpot.Magnitude > 6 then
+							bot.moveDir = toSpot.Unit
+							if not contactOwnsEyes then
+								bot.faceMode = "heading"
+							end
 							Pathing.walkToWithResult(model, spot, shouldInterrupt)
 						end
-						-- Face the threat, never the wall: idle settles leave a
-						-- facePoint for the facing loop to turn onto.
+						bot.moveDir = nil -- arrived: stand and watch the line
 						local root = model:FindFirstChild("HumanoidRootPart") :: BasePart?
-						if root then
+						if root and not contactOwnsEyes then
 							bot.faceMode = "point"
-							bot.facePoint = root.Position + BrainCore.threatFaceDir(side, contact, root.Position) * 20
+							bot.facePoint = root.Position + Vector3.new(0, 0, -20)
 						end
-						task.wait(rng:NextNumber(0.6, 1.4))
+						task.wait(rng:NextNumber(0.4, 0.9))
+					else
+						-- Settle the zone. GLANCE, don't camp: holds are short, the
+						-- peek count follows Game Sense, and a quiet hold earns a
+						-- relocate beat before the next angle (anti-glue, #20).
+						bot.moveDir = nil -- standing: no heading to protect
+						local cover, faceDir = nil, nil
+						if not (bot.relocateUntil and now < bot.relocateUntil) then
+							cover, faceDir = BrainCore.pickCoverPoint(ctx, allies)
+						end
+						if cover and faceDir then
+							bot.claimedCover = cover.name
+							local gs = bot.attributes.GameSense / 100
+							local peeks = 1
+								+ (if rng:NextNumber() < gs * 0.6 then 1 else 0)
+								+ (if rng:NextNumber() < gs * 0.35 then 1 else 0)
+							if holdAngle(bot, model, cover, faceDir, shouldInterrupt, perception, rng, clock, peeks) then
+								lastProgressAt = clock()
+							end
+							bot.claimedCover = nil
+							if not Perception.visibleContact(perception) then
+								-- quiet hold: remember the crate (BrainCore skips it for a
+								-- beat) and force a relocation before the next angle
+								bot.lastHeldCover = cover.name
+								bot.lastHeldAt = os.clock()
+								bot.relocateUntil = clock() + RELOCATE_BEAT_SECONDS
+							end
+						else
+							local spot = BrainCore.standablePointIn(currentKey, rng, model, ground, allies, bot)
+							if spot then
+								Pathing.walkToWithResult(model, spot, shouldInterrupt)
+							end
+							-- Face the threat, never the wall: idle settles leave a
+							-- facePoint for the facing loop to turn onto.
+							local root = model:FindFirstChild("HumanoidRootPart") :: BasePart?
+							if root then
+								bot.faceMode = "point"
+								bot.facePoint = root.Position + BrainCore.threatFaceDir(side, contact, root.Position) * 20
+							end
+							task.wait(rng:NextNumber(0.6, 1.4))
+						end
 					end
 				else
 					-- THE INFO DOCTRINE, approach half: check the angle before you
