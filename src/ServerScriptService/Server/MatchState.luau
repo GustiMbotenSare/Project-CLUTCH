@@ -19,6 +19,15 @@
 -- Defenders must EARN it: a mark exists only once a defender has eyes on the
 -- dropped spike (or saw it fall). Neither side acts on a drop it doesn't
 -- know about — that honesty is what makes rotations readable.
+--
+-- atkAlive / defAlive (playtest #19): the round machine publishes the live
+-- headcounts so brains can read the ALL-CLEAR — attackers wiped with the
+-- spike down means defenders sprint the defuse, not creep.
+--
+-- clearMarks (playtest #19's "this area is clear"): per-side zone-keyed
+-- timestamps. A bot that stands a zone down with no contact marks it clear
+-- and calls it out; teammates sprint through proven-safe ground and the
+-- rotate bait-gate trusts a lone contact when the OTHER site reads clear.
 
 local MatchState = {
 	-- "Buy" | "Live" | "Planted" | "PostRound"
@@ -28,6 +37,10 @@ local MatchState = {
 
 	atkScore = 0,
 	defScore = 0,
+
+	-- Live headcounts, published by the round machine every tick
+	atkAlive = 5,
+	defAlive = 5,
 
 	-- Spike
 	planted = false,
@@ -41,6 +54,9 @@ local MatchState = {
 	-- Per-side honest intel about the dropped spike (see header)
 	spikeMarkAtk = nil :: any,
 	spikeMarkDef = nil :: any,
+
+	-- Per-side area-clear marks: zoneKey -> clock() when cleared (round-scoped)
+	clearMarks = { Attack = {} :: { [string]: number }, Defense = {} :: { [string]: number } },
 
 	-- Most recent gunfire: { by = shooter name, pos = Vector3, at = clock() }
 	lastShot = nil :: any,
