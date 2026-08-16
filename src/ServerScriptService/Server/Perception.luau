@@ -25,6 +25,14 @@
 -- We now try several aim points and require a run of failures before a bot
 -- admits it lost someone. v4 map note: partial-cover duels graze LOS on every
 -- peek, so the tolerance grew 4 -> 6 sweeps (~0.9s).
+--
+-- THE CONE IS YAW-ONLY (playtest #18): our facing has no pitch, so the cone
+-- tests the FLAT delta and the vertical gets its own allowance. The old 3D
+-- dot product made height differences eat the cone budget — a bot on heaven
+-- literally could not see the floor it was guarding.
+--
+-- FIRST SIGHTINGS GO TO MATCH MEMORY: every fresh spot is recorded by zone,
+-- so the plan roller and approach caution can read habits (batch C).
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Shared = ReplicatedStorage:WaitForChild("Shared")
@@ -34,9 +42,11 @@ local Scenario = require(Shared.Constants.Scenario)
 local Zones = require(Shared.MapData.Zones)
 
 local MatchState = require(script.Parent.MatchState)
+local MatchMemory = require(script.Parent.MatchMemory)
 
 local LOS_MISS_TOLERANCE = 6 -- failed sweeps before a sighting counts as lost
 local AIM_PARTS = { "Head", "HumanoidRootPart", "UpperTorso", "Torso" }
+local VISION_PITCH_LIMIT_DEG = 75 -- vertical allowance; the cone is yaw-only
 
 export type Source = "sight" | "sound"
 
@@ -85,6 +95,28 @@ local function eyesOf(model: Model, root: BasePart): Vector3
 	return if head then head.Position else root.Position
 end
 
+-- Yaw-only cone + a vertical allowance. The flat angle decides "in front of
+-- me"; pitch just has to stay inside a generous band. (The old 3D dot let
+-- height differences eat the cone budget — heaven couldn't see the floor.)
+local function coneAllows(facing: Vector3, delta: Vector3, distance: number): boolean
+	if distance < 0.1 then
+		return false
+	end
+	local pitchDeg = math.deg(math.asin(math.clamp(delta.Y / distance, -1, 1)))
+	if math.abs(pitchDeg) > VISION_PITCH_LIMIT_DEG then
+		return false -- nearly straight overhead/underfoot: outside any gaze
+	end
+	local flat = Vector3.new(delta.X, 0, delta.Z)
+	if flat.Magnitude < 0.5 then
+		return true -- directly above/below: yaw is meaningless, pitch passed
+	end
+	local flatFacing = Vector3.new(facing.X, 0, facing.Z)
+	if flatFacing.Magnitude < 0.1 then
+		return true
+	end
+	return flatFacing.Unit:Dot(flat.Unit) >= COS_HALF_CONE
+end
+
 -- Try several body parts. A single ray at one part clips geometry edges and
 -- limbs constantly at range, which is what caused the SPOT/LOST flapping.
 local function hasClearShot(fromPos: Vector3, targetModel: Model, selfModel: Model): boolean
@@ -120,7 +152,7 @@ function Perception.hasEyesOn(observer: Model, target: Model): boolean
 	if distance > SimConfig.VisionRangeStuds or distance < 0.1 then
 		return false
 	end
-	if observerRoot.CFrame.LookVector:Dot(delta.Unit) < COS_HALF_CONE then
+	if not coneAllows(observerRoot.CFrame.LookVector, delta, distance) then
 		return false
 	end
 	return hasClearShot(eyes, target, observer)
@@ -155,7 +187,7 @@ function Perception.sweep(state: State, bot: any, enemies: { any }, now: number)
 
 		local sighted = false
 		if distance <= SimConfig.VisionRangeStuds and distance > 0.1 then
-			if facing:Dot(delta.Unit) >= COS_HALF_CONE then
+			if coneAllows(facing, delta, distance) then
 				sighted = hasClearShot(eyePos, enemyModel, selfModel)
 			end
 		end
@@ -193,15 +225,21 @@ function Perception.sweep(state: State, bot: any, enemies: { any }, now: number)
 		if sighted then
 			state.missStreak[enemy.name] = 0
 			state.visible[enemy.name] = true
-			if Scenario.LogPerception and not wasVisible then
+			if not wasVisible then
+				-- First sighting: the match remembers where they keep showing up.
 				local contact = state.memory[enemy.name]
-				print(("[CLUTCH] %6.1fs  SPOT %s sees %s in %s (%.0f studs)"):format(
-					now,
-					bot.name,
-					enemy.name,
-					if contact then contact.zoneCallout else "?",
-					distance
-				))
+				if contact then
+					MatchMemory.recordSpot(bot.side, contact.zoneKey)
+				end
+				if Scenario.LogPerception then
+					print(("[CLUTCH] %6.1fs  SPOT %s sees %s in %s (%.0f studs)"):format(
+						now,
+						bot.name,
+						enemy.name,
+						if contact then contact.zoneCallout else "?",
+						distance
+					))
+				end
 			end
 		elseif wasVisible then
 			-- Grace period. Do not drop a sighting on a single clipped ray.
