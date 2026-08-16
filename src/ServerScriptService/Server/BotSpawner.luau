@@ -1,10 +1,13 @@
 --!strict
--- Spawns bot players as real humanoid rigs (no rig assets needed —
--- CreateHumanoidModelFromDescription gives us a clean R6 dummy per bot).
--- Each bot gets attributes rolled from its role's weight template.
+-- Spawns bot players as real humanoid rigs — now R15 (batch D, playtest
+-- #21). CreateHumanoidModelFromDescription gives us a clean dummy per bot;
+-- the Animator drives locomotion via runtime-built clips (Animations.luau),
+-- so the retired procedural Transform loop is gone for good.
 --
--- Bots never body-block EACH OTHER: they live in a collision group that
--- doesn't self-collide (the playtest #11 B-door jam).
+-- COLLISION (playtest #21): bots now BODY-BLOCK each other — the collision
+-- group self-collides again. The #11 B-door jam that made us disable it is
+-- covered by the brain's own spacing (personal-space destinations + cover
+-- claims), and corpses still ghost on death. Solid bodies = solid hitboxes.
 --
 -- THE VISUAL LAYER (playtest #16 + #17 + #19 + #20):
 --   * RIG_STYLE is the single source for every cosmetic choice — body tint
@@ -15,12 +18,10 @@
 --   * AIM ALIGN (playtest #17's catastrophe): every rig carries an
 --     AlignOrientation ("AimAlign") on the root — the physics-safe facing
 --     channel. Nobody writes a walking root's CFrame.
---   * THE GUN rides the raised right hand; THE KNIFE (#19) shares that hand —
---     a stub blade, hidden while the gun is out. styleHeld swaps which prop
---     reads — and stamps the replicated Held attribute so the DASHBOARD can
---     say "knife out" without watching the rig (playtest #20).
---   * PROCEDURAL WALK: starts AFTER the model is parented and is PUBLIC:
---     the round machine restarts it on every clone.
+--   * THE GUN and THE KNIFE ride the right HAND (R15: RightHand); the aim
+--     clip (Action priority) holds the arm up over any locomotion.
+--     styleHeld swaps which prop reads and stamps the replicated Held
+--     attribute so the dashboard says KNIFE OUT (playtest #20).
 --   * AUTOROTATE IS OFF: the legs no longer own the eyes.
 
 local Players = game:GetService("Players")
@@ -30,11 +31,16 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Shared = ReplicatedStorage:WaitForChild("Shared")
 local Attributes = require(Shared.Constants.Attributes)
 
+local Animations = require(script.Parent.Animations)
+
 local BOT_COLLISION_GROUP = "ClutchBots"
 pcall(function()
 	PhysicsService:RegisterCollisionGroup(BOT_COLLISION_GROUP)
 end)
-PhysicsService:CollisionGroupSetCollidable(BOT_COLLISION_GROUP, BOT_COLLISION_GROUP, false)
+-- Playtest #21: bots collide with each other again — real body-blocking and
+-- solid hitboxes. Doorway jams are the BRAIN's problem now (spacing + cover
+-- claims), which is where they were always supposed to be solved.
+PhysicsService:CollisionGroupSetCollidable(BOT_COLLISION_GROUP, BOT_COLLISION_GROUP, true)
 
 -- THE RESKIN CONTRACT. Every cosmetic choice lives here; every cosmetic part
 -- is named (Visor, Gun, Knife, NameTag). Polish phase = edit this table.
@@ -49,11 +55,6 @@ local RIG_STYLE = {
 	Knife = Color3.fromRGB(200, 200, 215),
 	KnifeLength = 0.6,
 }
-
--- The raised gun-arm pose: the right shoulder held forward (~80°), with the
--- walk swing layered small on top so the gun doesn't wave around.
-local GUN_ARM_RAISED = CFrame.Angles(math.rad(80), 0, 0)
-local GUN_ARM_SWING_SCALE = 0.25
 
 export type BotRecord = {
 	name: string,
@@ -174,10 +175,11 @@ local function addAimAlign(model: Model)
 	align.Parent = root
 end
 
--- A hand prop welded to the raised right hand, long axis down the arm.
+-- A hand prop welded into the R15 RightHand, long axis down the arm — with
+-- the aim clip holding the arm forward, the prop reads as shouldered.
 local function addHandProp(model: Model, name: string, length: number, color: Color3, visible: boolean): BasePart?
-	local arm = model:WaitForChild("Right Arm", 5) :: BasePart?
-	if not arm then
+	local hand = model:WaitForChild("RightHand", 5) :: BasePart?
+	if not hand then
 		return nil
 	end
 	local prop = Instance.new("Part")
@@ -192,10 +194,10 @@ local function addHandProp(model: Model, name: string, length: number, color: Co
 	prop.Massless = true
 	prop.Transparency = if visible then 0 else 1
 	prop.CollisionGroup = BOT_COLLISION_GROUP
-	prop.CFrame = arm.CFrame * CFrame.new(0, -1.15, 0) * CFrame.Angles(math.rad(90), 0, 0)
+	prop.CFrame = hand.CFrame * CFrame.new(0, -0.4, -0.25) * CFrame.Angles(math.rad(90), 0, 0)
 
 	local weld = Instance.new("WeldConstraint")
-	weld.Part0 = arm
+	weld.Part0 = hand
 	weld.Part1 = prop
 	weld.Parent = prop
 
@@ -240,53 +242,6 @@ function BotSpawner.styleHeld(model: Model, holding: string)
 	model:SetAttribute("Held", holding)
 end
 
--- PROCEDURAL WALK. PUBLIC: the round machine restarts this on every cloned
--- body (task loops don't survive a clone). Right shoulder holds the gun arm
--- up (GUN_ARM_RAISED) with a small layered swing; left arm and both legs
--- swing against it with ground speed. Call AFTER the model is parented —
--- starting it earlier exited instantly (the "they still slide" bug).
-function BotSpawner.startProceduralWalk(model: Model)
-	local humanoid = model:FindFirstChildOfClass("Humanoid")
-	local torso = model:FindFirstChild("Torso")
-	if not humanoid or not torso then
-		return
-	end
-	local leftShoulder = torso:FindFirstChild("Left Shoulder") :: Motor6D?
-	local rightShoulder = torso:FindFirstChild("Right Shoulder") :: Motor6D?
-	local leftHip = torso:FindFirstChild("Left Hip") :: Motor6D?
-	local rightHip = torso:FindFirstChild("Right Hip") :: Motor6D?
-
-	task.spawn(function()
-		local t = 0
-		while model.Parent do
-			local humanoidNow = model:FindFirstChildOfClass("Humanoid")
-			if not humanoidNow or humanoidNow.Health <= 0 then
-				break -- the dead stop mid-stride; the round machine retires the body
-			end
-			local dt = 0.05
-			t += dt
-			local root = model:FindFirstChild("HumanoidRootPart") :: BasePart?
-			local speed = if root then root.AssemblyLinearVelocity.Magnitude else 0
-			local amp = math.clamp(speed / 16, 0, 1) * 0.7
-			local swing = math.sin(t * 11) * amp
-			if leftShoulder then
-				leftShoulder.Transform = leftShoulder.Transform:Lerp(CFrame.Angles(swing, 0, 0), 0.35)
-			end
-			if rightShoulder then
-				local target = GUN_ARM_RAISED * CFrame.Angles(-swing * GUN_ARM_SWING_SCALE, 0, 0)
-				rightShoulder.Transform = rightShoulder.Transform:Lerp(target, 0.35)
-			end
-			if leftHip then
-				leftHip.Transform = leftHip.Transform:Lerp(CFrame.Angles(-swing, 0, 0), 0.35)
-			end
-			if rightHip then
-				rightHip.Transform = rightHip.Transform:Lerp(CFrame.Angles(swing, 0, 0), 0.35)
-			end
-			task.wait(dt)
-		end
-	end)
-end
-
 function BotSpawner.spawnBot(
 	name: string,
 	role: string,
@@ -304,7 +259,9 @@ function BotSpawner.spawnBot(
 	description.LeftLegColor = body
 	description.RightLegColor = body
 
-	local model = Players:CreateHumanoidModelFromDescription(description, Enum.HumanoidRigType.R6)
+	-- BATCH D: R15 rigs. The Animator (Animations.luau) drives the joints;
+	-- real joints, real clips, no Transform fights.
+	local model = Players:CreateHumanoidModelFromDescription(description, Enum.HumanoidRigType.R15)
 	model.Name = name
 	-- Face the map, not the wall behind you: attackers spawn south facing −z,
 	-- defenders spawn north facing +z.
@@ -314,8 +271,8 @@ function BotSpawner.spawnBot(
 		model:PivotTo(CFrame.lookAt(position, position + Vector3.zAxis))
 	end
 
-	-- No bot-on-bot collision (see header). Clones made by the round machine
-	-- inherit the group.
+	-- Bots body-block each other (playtest #21); the group only matters for
+	-- other tags. Corpses ghost via the round machine's ghostCorpse.
 	for _, inst in model:GetDescendants() do
 		if inst:IsA("BasePart") then
 			inst.CollisionGroup = BOT_COLLISION_GROUP
@@ -339,8 +296,8 @@ function BotSpawner.spawnBot(
 	addAimAlign(model)
 
 	model.Parent = workspace
-	-- Walk swing starts AFTER parenting (starting earlier exited instantly).
-	BotSpawner.startProceduralWalk(model)
+	-- The Animator attaches AFTER parenting (and again on every round clone).
+	Animations.attach(model)
 	return {
 		name = name,
 		role = role,
