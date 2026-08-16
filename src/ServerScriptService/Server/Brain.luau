@@ -1,31 +1,26 @@
 --!strict
--- Bot brain v4.6: the RUNTIME half. BrainCore.luau owns the judgment
+-- Bot brain v4.7: the RUNTIME half. BrainCore.luau owns the judgment
 -- (scorers, routing, sampler, cover picks, team pressure, resolveTarget);
 -- this module owns what the bot DOES about it each tick: comms, facing,
 -- walks, holds, channels, diagnostics.
 --
--- v4.6 (playtest #19):
---   * FACING DISCIPLINE: a walking bot watches its HEADING, not a spot it
---     is passing — and a contact only owns the eyes while it's CLOSE or in
---     front. (Staring backwards while sprinting away from stale news read
---     as insane, because it was.)
---   * SPIKE SNAP: the drop within arm's reach and nobody around — grab it
---     NOW, whatever the plan said.
---   * AREA CLEAR CALLOUTS: standing a zone down with no contact marks it
---     clear and radios it; teammates sprint through proven-safe ground and
---     the rotate bait-gate trusts a lone contact when the other site reads
---     clear (BrainCore).
---   * ALL-CLEAR: attackers wiped with the spike ticking — defenders sprint
---     the defuse, no peeks, no caution theater.
---   * KNIFE DISCIPLINE: knife out on safe sprints (faster), gun out the
---     moment anything is real — and the draw costs EquipSeconds before it
---     can fire, so greed is priced.
---   * Ammo wiring: calm bots top off light magazines (Combat.maybeReload);
---     the ACTIVE weapon (not the bought one) drives assess/fireBurst.
+-- v4.7 (playtest #20):
+--   * HEADING-TRACKED FACING: v4.6 set facePoint to a spot 30 studs ahead
+--     ONCE per walk — walk past it and the head flips 180° (the backwards-
+--     rushing read). Now walking bots run faceMode "heading": the facing
+--     loop derives the look target from the live position every 80ms.
+--   * GLANCES, NOT CAMPS: holds check a corner for 0.7–1.8s (was 2.5–4s),
+--     the peek COUNT scales with Game Sense, and a quiet hold earns a
+--     relocate beat before re-picking an angle (BrainCore also skips the
+--     crate you just glanced off). Approach peeks are a GS-scaled chance.
+--   * SPIKE SNAP, WIDER + QUICKER: 40 studs (was 28), freshness gate 3s
+--     (was 6s). Anyone near a known drop just goes and takes it.
+--   * THE DEFUSE TAP IS LOUD: attackers within earshot of a defuse channel
+--     get a sound contact at the spike — hunt the hands.
 --
--- v4.5: quiet marks, honest peek steps, memory-driven caution. v4.4.1:
--- physics-safe facing (AimAlign). v4.4: the facing loop, suppression radio,
--- honest spike marks. Style rule: no inner quotes in log strings. Ever.
+-- v4.6 (playtest #19): facing discipline, spike snap, area-clear callouts,
+-- all-clear urgency, knife discipline, ammo wiring. Style rule: no inner
+-- quotes in log strings. Ever.
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Shared = ReplicatedStorage:WaitForChild("Shared")
@@ -63,7 +58,9 @@ local APPROACH_PEEK_HOPS = 2
 local SAMPLE_DIAG_SECONDS = 10
 local HOT_ROUTE_HEAT = 3 -- MatchMemory heat that earns a habit peek
 local KNIFE_SPRINT_SPEED = 18.5 -- the oldest tac-shooter truth: knife = faster
-local SPIKE_SNAP_RADIUS = 28 -- a drop this close with nobody around: grab it
+local SPIKE_SNAP_RADIUS = 40 -- a marked drop this close with nobody around: grab it
+local DEFUSE_HEAR_RADIUS = 55 -- the tap is audible across the site web
+local RELOCATE_BEAT_SECONDS = 2.5 -- after a quiet hold: move, then look again
 
 local K = BrainCore.K -- shared constants (freshness windows, hop budgets, spacing)
 
@@ -99,8 +96,9 @@ local function wantsWalk(intent: string, side: string, currentKey: string, route
 	return false -- no info, no threat: run
 end
 
--- HOLD THE ANGLE. Walk to the point, leave the watch line as a facePoint
--- (the facing loop owns the turn), then jiggle-peek — or occasionally SWING.
+-- HOLD THE ANGLE, v4.7-style: walk to the point, GLANCE (0.7–1.8s — corners
+-- are checked, not camped), then jiggle-peek — or occasionally SWING. The
+-- caller decides how many peeks the bot's Game Sense buys.
 local function holdAngle(
 	bot: any,
 	model: Model,
@@ -121,6 +119,7 @@ local function holdAngle(
 	end
 
 	local perp = Vector3.new(-faceDir.Z, 0, faceDir.X)
+	bot.faceMode = "point"
 	bot.facePoint = cover.pos + faceDir * 20
 
 	if Scenario.VerboseBrain then
@@ -134,7 +133,7 @@ local function holdAngle(
 	end
 
 	for _ = 1, (maxPeeks or MAX_PEEKS) do
-		local holdUntil = clock() + rng:NextNumber(2.5, 4)
+		local holdUntil = clock() + rng:NextNumber(0.7, 1.8) -- a glance, not a camp
 		while clock() < holdUntil do
 			if shouldInterrupt() then
 				return true
@@ -210,12 +209,13 @@ function Brain.start(bot: any, side: string, enemies: { any }, allies: { any }, 
 	bot.combatState = combatState
 	Combat.states[bot.name] = combatState -- incoming fire stamps suppression here
 
-	-- THE FACING LOOP. The brain leaves a facePoint every tick; this loop
-	-- turns toward it THROUGH THE AIM ALIGN — torque, never a CFrame write on
-	-- a walking root (playtest #17: those writes stomped the mover and every
-	-- walk in the match went BLOCKED). Combat owns facing mid-burst.
+	-- THE FACING LOOP. The brain leaves either a facePoint (a spot worth
+	-- watching) or a faceMode "heading" + moveDir (a walking bot watches where
+	-- it's GOING — derived from the live position every tick, so it can never
+	-- be passed and flipped). Combat owns facing mid-burst.
 	bot.facePoint = nil :: Vector3?
 	bot.moveDir = nil :: Vector3?
+	bot.faceMode = "point" :: string -- "point" watches facePoint; "heading" watches the walk direction
 	task.spawn(function()
 		while model.Parent do
 			local humanoidNow = model:FindFirstChildOfClass("Humanoid")
@@ -224,6 +224,11 @@ function Brain.start(bot: any, side: string, enemies: { any }, allies: { any }, 
 			end
 			local root = model:FindFirstChild("HumanoidRootPart") :: BasePart?
 			local target = bot.facePoint :: Vector3?
+			if root and bot.faceMode == "heading" and bot.moveDir then
+				-- TRACK ahead of the feet: 30 studs out, recomputed every tick —
+				-- a fixed point gets walked past and reads as staring backwards.
+				target = root.Position + bot.moveDir * 30
+			end
 			if root and target and clock() - combatState.lastShotAt > 0.4 then
 				local dir = (target - root.Position) * Vector3.new(1, 0, 1)
 				if dir.Magnitude > 0.5 then
@@ -453,6 +458,26 @@ function Brain.start(bot: any, side: string, enemies: { any }, allies: { any }, 
 				end
 			end
 
+			-- THE DEFUSE TAP IS LOUD (playtest #20): a defusing defender within
+			-- earshot is a sound contact at the spike for every attacker.
+			if side == "Attack" and MatchState.defusing and MatchState.plantedZoneKey then
+				local tapPos = MatchState.defusing.pos
+				local tapDist = (tapPos - ground).Magnitude
+				if tapDist <= DEFUSE_HEAR_RADIUS then
+					local spikeZone = Zones.byKey[MatchState.plantedZoneKey]
+					perception.memory["the defuse"] = {
+						name = "the defuse",
+						pos = tapPos,
+						zoneKey = MatchState.plantedZoneKey,
+						zoneCallout = if spikeZone then spikeZone.callout else "the site",
+						seenAt = now,
+						source = "sound",
+						distance = tapDist,
+					}
+					perception.lastContactAt = now
+				end
+			end
+
 			-- THE DROPPED SPIKE, honestly. The FACT is public (a carrier died);
 			-- WHERE it lies is per-side intel: attackers heard it on the radio,
 			-- defenders must put eyes on the drop to mark it.
@@ -496,11 +521,13 @@ function Brain.start(bot: any, side: string, enemies: { any }, allies: { any }, 
 			local mySpikeMark = if side == "Attack" then MatchState.spikeMarkAtk else MatchState.spikeMarkDef
 			local mySpikeZoneKey: string? = if spikeDown and mySpikeMark then mySpikeMark.zoneKey else nil
 
-			-- FACING DISCIPLINE (playtest #19): a contact owns the eyes only while
-			-- it's CLOSE or in front of the walk direction — a bot sprinting away
-			-- from distant stale news watches where it's GOING, not backwards.
+			-- FACING DISCIPLINE: a contact owns the eyes only while it's CLOSE or
+			-- in front of the walk direction — a bot sprinting away from distant
+			-- stale news watches where it's GOING, not backwards. Owning the eyes
+			-- means faceMode "point"; a free bot mid-walk runs "heading".
 			local contactOwnsEyes = false
 			if visible then
+				bot.faceMode = "point"
 				bot.facePoint = visible.pos
 				contactOwnsEyes = true
 			elseif contact and now - contact.seenAt < K.FRESH_CONTACT_SECONDS then
@@ -510,6 +537,7 @@ function Brain.start(bot: any, side: string, enemies: { any }, allies: { any }, 
 					and toContact.Unit:Dot(bot.moveDir) < -0.5
 				local far = toContact.Magnitude > 25
 				if not (behind and far) then
+					bot.faceMode = "point"
 					bot.facePoint = contact.pos
 					contactOwnsEyes = true
 				end
@@ -564,7 +592,7 @@ function Brain.start(bot: any, side: string, enemies: { any }, allies: { any }, 
 
 			local enemiesNear = 0
 			for _, memoryContact in perception.memory do
-				if memoryContact.name == "the spike" then
+				if memoryContact.name == "the spike" or memoryContact.name == "the defuse" then
 					continue -- the objective is not a threat count
 				end
 				if now - memoryContact.seenAt < K.FRESH_CONTACT_SECONDS
@@ -682,8 +710,8 @@ function Brain.start(bot: any, side: string, enemies: { any }, allies: { any }, 
 			local walking = wantsWalk(intent, side, currentKey, routeKey, contact, now)
 
 			-- KNIFE DISCIPLINE: knife out on safe sprints, gun out the moment
-			-- anything is real. The draw costs EquipSeconds before it can fire —
-			-- greed is priced, so the condition is honest about danger.
+			-- anything is real. The draw costs the ACTIVE weapon's EquipSeconds
+			-- before it can fire — greed is priced per gun.
 			local danger = visible ~= nil
 				or (contact ~= nil and now - contact.seenAt < K.FRESH_CONTACT_SECONDS
 					and BrainCore.hopsSafe(currentKey, contact.zoneKey, side) <= K.ENEMY_NEAR_HOPS)
@@ -760,6 +788,7 @@ function Brain.start(bot: any, side: string, enemies: { any }, allies: { any }, 
 			end
 
 			if intent == "Plant" and Zones.hasTag(currentKey, "plant") then
+				bot.faceMode = "point" -- the planter watches the threat, not its feet
 				Objective.tryStartPlant(bot, clock, channelAbort, if contact then contact.pos else nil)
 				lastProgressAt = clock()
 			elseif intent == "Defuse" and currentKey == MatchState.plantedZoneKey and MatchState.spikePart then
@@ -769,13 +798,14 @@ function Brain.start(bot: any, side: string, enemies: { any }, allies: { any }, 
 				end
 				lastProgressAt = clock()
 			elseif intent ~= "Engage" then
-				-- SPIKE SNAP: the drop within arm's reach and nobody around — grab
-				-- it NOW, whatever the plan said (playtest #19's reaction ask).
+				-- SPIKE SNAP: a marked drop within arm's reach and nobody fresh
+				-- around — grab it NOW, whatever the plan said. Wider and quicker
+				-- in v4.7: 40 studs, 3s freshness gate (playtest #20).
 				local snapped = false
 				if side == "Attack" and spikeDown and mySpikeMark then
 					local toMark = mySpikeMark.pos - ground
 					if toMark.Magnitude <= SPIKE_SNAP_RADIUS
-						and (contact == nil or now - contact.seenAt > K.FRESH_CONTACT_SECONDS)
+						and (contact == nil or now - contact.seenAt > 3)
 					then
 						local snapSpot = Vector3.new(mySpikeMark.pos.X, 1, mySpikeMark.pos.Z)
 						if BrainCore.standableReason(snapSpot, model) then
@@ -789,17 +819,32 @@ function Brain.start(bot: any, side: string, enemies: { any }, allies: { any }, 
 				if snapped then
 					-- grabbed (or walking to grab): nothing else this tick
 				elseif targetKey == nil or targetKey == currentKey then
-					-- Settle the zone. Claim the angle first — two bots on one crate
-					-- was the doorway traffic jam.
+					-- Settle the zone. GLANCE, don't camp: holds are short, the peek
+					-- count follows Game Sense, and a quiet hold earns a relocate
+					-- beat before the next angle (anti-glue, playtest #20).
 					routeKey = nil
 					bot.moveDir = nil -- standing: no heading to protect
-					local cover, faceDir = BrainCore.pickCoverPoint(ctx, allies)
+					local cover, faceDir = nil, nil
+					if not (bot.relocateUntil and now < bot.relocateUntil) then
+						cover, faceDir = BrainCore.pickCoverPoint(ctx, allies)
+					end
 					if cover and faceDir then
 						bot.claimedCover = cover.name
-						if holdAngle(bot, model, cover, faceDir, shouldInterrupt, perception, rng, clock) then
+						local gs = bot.attributes.GameSense / 100
+						local peeks = 1
+							+ (if rng:NextNumber() < gs * 0.6 then 1 else 0)
+							+ (if rng:NextNumber() < gs * 0.35 then 1 else 0)
+						if holdAngle(bot, model, cover, faceDir, shouldInterrupt, perception, rng, clock, peeks) then
 							lastProgressAt = clock()
 						end
 						bot.claimedCover = nil
+						if not Perception.visibleContact(perception) then
+							-- quiet hold: remember the crate (BrainCore skips it for a
+							-- beat) and force a relocation before the next angle
+							bot.lastHeldCover = cover.name
+							bot.lastHeldAt = os.clock()
+							bot.relocateUntil = clock() + RELOCATE_BEAT_SECONDS
+						end
 					else
 						local spot = BrainCore.standablePointIn(currentKey, rng, model, ground, allies, bot)
 						if spot then
@@ -809,15 +854,17 @@ function Brain.start(bot: any, side: string, enemies: { any }, allies: { any }, 
 						-- facePoint for the facing loop to turn onto.
 						local root = model:FindFirstChild("HumanoidRootPart") :: BasePart?
 						if root then
+							bot.faceMode = "point"
 							bot.facePoint = root.Position + BrainCore.threatFaceDir(side, contact, root.Position) * 20
 						end
 						task.wait(rng:NextNumber(0.6, 1.4))
 					end
 				else
 					-- THE INFO DOCTRINE, approach half: check the angle before you
-					-- cross it — never when a living teammate is ALREADY in that
-					-- zone, never on an all-clear, and — batch C — when MATCH MEMORY
-					-- says the enemy keeps owning the route you're about to walk.
+					-- cross it — as a Game-Sense-scaled CHANCE (playtest #20), never
+					-- when a living teammate is ALREADY in that zone, never on an
+					-- all-clear, and — batch C — when MATCH MEMORY says the enemy
+					-- keeps owning the route you're about to walk.
 					local contactClose = contact ~= nil
 						and now - contact.seenAt < SimConfig.MemoryDecaySeconds
 						and BrainCore.hopsSafe(currentKey, contact.zoneKey, side) <= APPROACH_PEEK_HOPS
@@ -830,6 +877,7 @@ function Brain.start(bot: any, side: string, enemies: { any }, allies: { any }, 
 						and not allyAhead
 						and not allClear
 						and now - lastApproachPeekAt > APPROACH_PEEK_COOLDOWN
+						and rng:NextNumber() < 0.3 + ctx.gameSense * 0.55 -- the careful check more
 					then
 						local cover, faceDir = BrainCore.pickCoverPoint(ctx, allies)
 						if cover and faceDir then
@@ -871,14 +919,14 @@ function Brain.start(bot: any, side: string, enemies: { any }, allies: { any }, 
 						end
 
 						if spot then
-							-- Watch the HEADING, not the waypoint you're passing: a
-							-- fixed near point makes the head swing as you walk past it
-							-- (the playtest #19 locked-onto-a-spot read).
+							-- HEADING facing: the facing loop derives the look target
+							-- from the live position every tick — never a fixed point
+							-- the bot walks past (the backwards-stare bug, #20).
 							local moveVec = (spot - ground) * Vector3.new(1, 0, 1)
 							if moveVec.Magnitude > 1 then
 								bot.moveDir = moveVec.Unit
 								if not contactOwnsEyes then
-									bot.facePoint = ground + bot.moveDir * 30
+									bot.faceMode = "heading"
 								end
 							end
 							local result = Pathing.walkToWithResult(model, spot, shouldInterrupt)
