@@ -28,6 +28,10 @@
 -- timestamps. A bot that stands a zone down with no contact marks it clear
 -- and calls it out; teammates sprint through proven-safe ground and the
 -- rotate bait-gate trusts a lone contact when the OTHER site reads clear.
+--
+-- defusing (playtest #20): while a defuse channel runs, this is { pos, at }.
+-- THE DEFUSE IS LOUD — attackers close enough to hear it get a sound
+-- contact at the spike, exactly like the original game's tap.
 
 local MatchState = {
 	-- "Buy" | "Live" | "Planted" | "PostRound"
@@ -57,6 +61,9 @@ local MatchState = {
 
 	-- Per-side area-clear marks: zoneKey -> clock() when cleared (round-scoped)
 	clearMarks = { Attack = {} :: { [string]: number }, Defense = {} :: { [string]: number } },
+
+	-- While a defuse channel runs: { pos = Vector3, at = number }. LOUD.
+	defusing = nil :: any,
 
 	-- Most recent gunfire: { by = shooter name, pos = Vector3, at = clock() }
 	lastShot = nil :: any,
