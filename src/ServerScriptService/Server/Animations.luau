@@ -4,23 +4,22 @@
 -- KeyframeSequenceProvider:RegisterKeyframeSequence — the ids it returns are
 -- session-local, which is fine: the sim lives and dies in one session.
 --
--- This is batch D phase 1 (playtest #21's "walk animation not to be found").
--- The old procedural Motor6D.Transform loop is RETIRED.
---
---   idle   (Movement, loop)  — a subtle breathe.
---   walk   (Movement, loop)  — legs/arms swing; playback speed scales with
---                              ground speed.
+--   idle   (Idle, loop)      — a subtle breathe. LOWEST priority: walk owns
+--                              Movement, so idle never fights it for joints.
+--   walk   (Movement, loop)  — legs/left arm swing; playback speed scales
+--                              with ground speed.
 --   crouch (Movement, hold)  — knees bent, torso forward; Combat toggles it
 --                              alongside the HipHeight drop.
---   aim    (Action, hold)    — the gun arm held forward. ACTION priority rides
---                              OVER locomotion, so the arm never swings wild.
+--   aim    (Action, hold)    — the gun arm held forward, over everything.
 --
--- THE PHASE-1 BUG (playtest #22's "still gliding"): the aim clip's keyframe
--- originally built the FULL pose tree — every joint at identity — and at
--- Action priority that stomped walk/idle on EVERY joint. A permanent bind
--- pose is exactly what "still gliding" looks like. The aim clip now carries
--- a SPARSE pose chain (root → torso chain → right arm only); joints a clip
--- doesn't pose are joints it doesn't own.
+-- THE SPARSE RULE (playtest #22 → #23): EVERY clip poses only the joints it
+-- means to move. The phase-1 bug was the aim clip's FULL pose tree stomping
+-- locomotion at Action priority; #23's "still rigid" showed the mirror
+-- failure — full-tree Movement clips (idle AND walk both posing every joint
+-- at the same priority) left the legs' ownership ambiguous. Now: sparse
+-- chains everywhere, and priorities are a ladder (Idle < Movement < Action)
+-- instead of a fistfight. The aim clip (proven: the arms went up in #23) is
+-- the shape every clip follows.
 --
 -- attach(model) per body — playing tracks don't survive a Clone, so the
 -- round machine re-attaches every round. The default Animate script is
@@ -67,29 +66,10 @@ local function makePose(name: string, cf: CFrame?): Pose
 	return p
 end
 
--- FULL keyframe: every joint posed (identity where unset) — locomotion clips
--- own the whole rig while they play.
-local function keyframe(time: number, joints: { [string]: CFrame }): Keyframe
-	local kf = Instance.new("Keyframe")
-	kf.Time = time
-	local poses: { [string]: Pose } = {}
-	for name in R15_TREE do
-		poses[name] = makePose(name, joints[name])
-	end
-	for name, parentName in R15_TREE do
-		if parentName then
-			poses[name].Parent = poses[parentName]
-		else
-			poses[name].Parent = kf -- the root pose rides the keyframe
-		end
-	end
-	return kf
-end
-
--- SPARSE keyframe (the phase-1 fix): pose ONLY the listed joints plus the
--- ancestor chain needed to connect them to the root. A high-priority track
--- built this way overrides the joints it poses and leaves everything else
--- to whatever is playing underneath.
+-- SPARSE keyframes ONLY: pose the listed joints plus the ancestor chain
+-- needed to connect them to the root. A track overrides exactly the joints
+-- it poses — nothing more. (The full-tree keyframe builder is gone: it was
+-- the source of both the bind-pose glide and the joint-ownership ambiguity.)
 local function keyframeSparse(time: number, joints: { [string]: CFrame }): Keyframe
 	local kf = Instance.new("Keyframe")
 	kf.Time = time
@@ -120,7 +100,6 @@ local function buildClip(name: string, looped: boolean, frames: { Keyframe }): A
 	local sequence = Instance.new("KeyframeSequence")
 	sequence.Name = name
 	sequence.Loop = looped
-	sequence.Priority = Enum.AnimationPriority.Movement -- fallback; the TRACK carries the real priority
 	for _, kf in frames do
 		kf.Parent = sequence
 	end
@@ -140,51 +119,51 @@ end
 -- ---------------------------------------------------------------- CLIPS
 -- Sign convention: +X on a limb joint pitches it forward/down (matches the
 -- old GUN_ARM_RAISED shoulder pose that already read correctly).
-local LEG_SWING = 32
-local ARM_SWING = 22
+local LEG_SWING = 40 -- big enough to read at spectator distance
+local ARM_SWING = 25
 
 local clips: { [string]: Animation? } = {}
 do
 	clips.walk = buildClip("ClutchWalk", true, {
-		keyframe(0, {
+		keyframeSparse(0, {
 			LeftUpperLeg = deg(-LEG_SWING),
 			RightUpperLeg = deg(LEG_SWING),
-			LeftLowerLeg = deg(24), -- the trailing knee bends
-			RightLowerLeg = deg(6),
+			LeftLowerLeg = deg(28), -- the trailing knee bends
+			RightLowerLeg = deg(8),
 			LeftUpperArm = deg(ARM_SWING),
-			RightUpperArm = deg(-ARM_SWING),
-			UpperTorso = deg(2),
+			LeftLowerArm = deg(-6),
+			UpperTorso = deg(3),
 		}),
-		keyframe(0.25, {
+		keyframeSparse(0.25, {
 			LeftUpperLeg = deg(LEG_SWING),
 			RightUpperLeg = deg(-LEG_SWING),
-			LeftLowerLeg = deg(6),
-			RightLowerLeg = deg(24),
+			LeftLowerLeg = deg(8),
+			RightLowerLeg = deg(28),
 			LeftUpperArm = deg(-ARM_SWING),
-			RightUpperArm = deg(ARM_SWING),
-			UpperTorso = deg(2),
+			LeftLowerArm = deg(-6),
+			UpperTorso = deg(3),
 		}),
-		keyframe(0.5, {
+		keyframeSparse(0.5, {
 			LeftUpperLeg = deg(-LEG_SWING),
 			RightUpperLeg = deg(LEG_SWING),
-			LeftLowerLeg = deg(24),
-			RightLowerLeg = deg(6),
+			LeftLowerLeg = deg(28),
+			RightLowerLeg = deg(8),
 			LeftUpperArm = deg(ARM_SWING),
-			RightUpperArm = deg(-ARM_SWING),
-			UpperTorso = deg(2),
+			LeftLowerArm = deg(-6),
+			UpperTorso = deg(3),
 		}),
 	})
 
 	clips.idle = buildClip("ClutchIdle", true, {
-		keyframe(0, { UpperTorso = deg(1.5), LeftUpperArm = deg(1), LeftLowerArm = deg(-3) }),
-		keyframe(1.1, { UpperTorso = deg(-1), LeftUpperArm = deg(-1), LeftLowerArm = deg(-5) }),
-		keyframe(2.2, { UpperTorso = deg(1.5), LeftUpperArm = deg(1), LeftLowerArm = deg(-3) }),
+		keyframeSparse(0, { UpperTorso = deg(1.5), LeftUpperArm = deg(1), LeftLowerArm = deg(-3) }),
+		keyframeSparse(1.1, { UpperTorso = deg(-1), LeftUpperArm = deg(-1), LeftLowerArm = deg(-5) }),
+		keyframeSparse(2.2, { UpperTorso = deg(1.5), LeftUpperArm = deg(1), LeftLowerArm = deg(-3) }),
 	})
 
 	-- The crouch is a HELD pose: one keyframe, looped. Combat's HipHeight
 	-- drop lowers the rig; this bends the legs so it READS as a crouch.
 	clips.crouch = buildClip("ClutchCrouch", true, {
-		keyframe(0, {
+		keyframeSparse(0, {
 			LeftUpperLeg = deg(-52),
 			RightUpperLeg = deg(-52),
 			LeftLowerLeg = deg(74),
@@ -193,15 +172,24 @@ do
 		}),
 	})
 
-	-- The gun-carry pose at ACTION priority, SPARSE (phase-1 fix): only the
-	-- right-arm chain is posed, so it rides over walk/idle/crouch instead of
-	-- freezing the whole rig at bind pose.
+	-- The gun-carry pose at ACTION priority: only the right-arm chain, so it
+	-- rides over walk/idle/crouch instead of freezing the rig (proven in #23).
 	clips.aim = buildClip("ClutchAim", true, {
 		keyframeSparse(0, {
 			RightUpperArm = deg(78), -- shoulder: arm forward
 			RightLowerArm = deg(-12), -- slight elbow bend
 		}),
 	})
+
+	-- Boot-log truth: which clips actually registered this session.
+	local registered = {}
+	for name, clip in clips do
+		if clip then
+			table.insert(registered, name)
+		end
+	end
+	table.sort(registered)
+	print(("[CLUTCH] animations registered: %s"):format(table.concat(registered, " ")))
 end
 
 -- ------------------------------------------------------------- PLAYBACK
@@ -224,6 +212,7 @@ local function loadTrack(animator: Animator, clip: Animation?, priority: Enum.An
 		return animator:LoadAnimation(clip)
 	end)
 	if not ok then
+		warn(("[CLUTCH] animation track failed to load: %s"):format(clip.Name))
 		return nil
 	end
 	track.Priority = priority
@@ -249,10 +238,11 @@ function Animations.attach(model: Model)
 		animator.Parent = humanoid
 	end
 
+	-- The priority ladder: Idle (lowest) < Movement (walk/crouch) < Action (aim).
 	local rig: Rig = {
 		animator = animator,
 		walk = loadTrack(animator, clips.walk, Enum.AnimationPriority.Movement),
-		idle = loadTrack(animator, clips.idle, Enum.AnimationPriority.Movement),
+		idle = loadTrack(animator, clips.idle, Enum.AnimationPriority.Idle),
 		crouch = loadTrack(animator, clips.crouch, Enum.AnimationPriority.Movement),
 		aim = loadTrack(animator, clips.aim, Enum.AnimationPriority.Action),
 		crouched = false,
