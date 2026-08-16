@@ -1,6 +1,5 @@
 --!strict
--- Weapon definitions. M0 ships a pistol, a rifle and a sniper.
--- Fictional names — Valorant-flavored balance, IP-safe.
+-- Weapon definitions. Fictional names — Valorant-flavored balance, IP-safe.
 --
 -- RANGE BANDS are the important addition. Every weapon declares where it is
 -- comfortable and where it stops being useful:
@@ -13,25 +12,34 @@
 -- 51 studs is making a genuinely different decision from one holding a rifle at
 -- the same distance, and Game Sense is what decides whether it respects that.
 --
--- v2 (playtest #19): the loadout layer deepens —
---   * AMMO IS REAL: Magazine already existed; ReserveMags joins it, and the
---     brain now owns reload-vs-switch decisions.
---   * CROUCH AFFINITY: how much a weapon wants to be sprayed from a crouch.
---   * THE KNIFE: equipping it is the sprint modifier. No melee combat yet.
+-- v2 (playtest #19): the loadout layer deepens — real ammo (Magazine +
+-- ReserveMags), CROUCH AFFINITY (spray weapons crouch to hold the pattern),
+-- THE KNIFE (a movement tool: out = sprint faster, no trigger).
 --
--- v2.1 (playtest #20): DRAW TIMES PER WEAPON, the way tac shooters price
--- them — the knife snaps out (0.2s), the pistol is quick (0.5s), the rifle
--- is a commitment (1.0s), the sniper is a ritual (1.25s). The price of a
--- switch is what makes switch-vs-reload a real decision instead of a reflex.
+-- v2.1 (playtest #20): per-weapon DRAW TIMES — knife 0.2 / pistol 0.5 /
+-- rifle 1.0 / sniper 1.25. The price of a switch is what makes
+-- switch-vs-reload a real decision.
+--
+-- v3 (playtest #23): THE ARSENAL OPENS — three new classes, each a
+-- personality the behavior layer already knows how to read:
+--   * BANDIT (SMG): the eco sprayer. Fast, cheap, high spray growth, HIGH
+--     crouch affinity — the crouch-sprayer. Dies past midrange.
+--   * JUDGE (Shotgun): pellets, not a bullet — the first multi-ray weapon.
+--     Point-blank identity, CrouchAffinity ZERO (no spray, no crouch — the
+--     playtester's own rule), pump cadence. Bots holding it should start
+--     valuing corners.
+--   * HAVOC (Heavy/LMG): the anchor. A 60-round magazine, a slow draw,
+--     sustained spray — a hold's silhouette.
 
-export type WeaponClass = "Pistol" | "Rifle" | "Sniper" | "Melee"
+export type WeaponClass = "Pistol" | "Rifle" | "Sniper" | "SMG" | "Shotgun" | "Heavy" | "Melee"
 
 export type WeaponDef = {
 	Id: string,
 	DisplayName: string,
 	Class: WeaponClass,
 	Price: number,
-	DamageBody: number,
+	DamageBody: number, -- per bullet, or PER PELLET for shotguns
+	Pellets: number?, -- shotgun: rays per trigger pull (nil = 1 bullet)
 	HeadshotMultiplier: number,
 	FireInterval: number, -- seconds between shots
 	Magazine: number,
@@ -41,7 +49,7 @@ export type WeaponDef = {
 	FirstBulletSpreadDeg: number, -- standing, unscoped where applicable
 	SprayErrorGrowthDeg: number, -- added spread per consecutive shot
 	MaxSprayErrorDeg: number,
-	BurstShots: number, -- how many rounds a bot commits per trigger pull
+	BurstShots: number, -- how many trigger pulls a bot commits per engagement tick
 	CrouchAffinity: number, -- 0..1: how much this weapon wants spray-crouching
 
 	-- Range model
@@ -60,6 +68,7 @@ local Weapons: { [string]: WeaponDef } = {
 		Class = "Pistol",
 		Price = 400,
 		DamageBody = 26, -- 4 body shots to kill an unarmored 100hp bot
+		Pellets = nil,
 		HeadshotMultiplier = 3.0, -- 78: two taps to the head
 		FireInterval = 0.18,
 		Magazine = 12,
@@ -73,7 +82,7 @@ local Weapons: { [string]: WeaponDef } = {
 		CrouchAffinity = 0.10, -- a pistol is a tap weapon; crouching is rare
 		OptimalRangeStuds = 40,
 		MaxEffectiveRangeStuds = 90,
-		MinDamageMultiplier = 0.55, -- 14 damage per body shot at the far edge
+		MinDamageMultiplier = 0.55,
 		RangeSpreadPer10Studs = 0.35,
 	},
 
@@ -84,12 +93,13 @@ local Weapons: { [string]: WeaponDef } = {
 		Class = "Rifle",
 		Price = 2900,
 		DamageBody = 40,
+		Pellets = nil,
 		HeadshotMultiplier = 4.0, -- 160 to the head: one-tap fantasy lives here
 		FireInterval = 0.1, -- ~10 rounds/sec full auto
 		Magazine = 25,
 		ReserveMags = 3,
 		ReloadSeconds = 2.5,
-		EquipSeconds = 1.0, -- a full second: switching TO the rifle is a commitment
+		EquipSeconds = 1.0,
 		FirstBulletSpreadDeg = 0.2,
 		SprayErrorGrowthDeg = 0.25,
 		MaxSprayErrorDeg = 4.0,
@@ -108,6 +118,7 @@ local Weapons: { [string]: WeaponDef } = {
 		Class = "Sniper",
 		Price = 4700,
 		DamageBody = 150, -- one-shot body kill
+		Pellets = nil,
 		HeadshotMultiplier = 1.7, -- 255: overkill, on purpose
 		FireInterval = 1.4,
 		Magazine = 5,
@@ -125,6 +136,87 @@ local Weapons: { [string]: WeaponDef } = {
 		RangeSpreadPer10Studs = 0.0,
 	},
 
+	-- THE ARSENAL (v3) ------------------------------------------------------------
+
+	-- BANDIT: the eco sprayer. Buys when the Falcon is out of reach. Fast
+	-- hands, fast fire, big pattern — crouch and hose, then die past 60.
+	BanditSMG = {
+		Id = "BanditSMG",
+		DisplayName = "Bandit SMG",
+		Class = "SMG",
+		Price = 1600,
+		DamageBody = 22, -- 5 to the body
+		Pellets = nil,
+		HeadshotMultiplier = 2.5, -- 55: two taps up close
+		FireInterval = 0.075, -- ~13 rounds/sec
+		Magazine = 30,
+		ReserveMags = 4,
+		ReloadSeconds = 2.0,
+		EquipSeconds = 0.8,
+		FirstBulletSpreadDeg = 0.5,
+		SprayErrorGrowthDeg = 0.35,
+		MaxSprayErrorDeg = 6.5,
+		BurstShots = 6,
+		CrouchAffinity = 0.80, -- THE spray-croucher
+		OptimalRangeStuds = 30,
+		MaxEffectiveRangeStuds = 80,
+		MinDamageMultiplier = 0.45,
+		RangeSpreadPer10Studs = 0.5,
+	},
+
+	-- JUDGE: pellets, not a bullet. Eight rays per trigger pull inside one
+	-- cone; each pellet is its own truth. Point-blank identity — and per the
+	-- playtester's rule, no spray means NO crouch: the Judge never squats.
+	JudgeSG = {
+		Id = "JudgeSG",
+		DisplayName = "Judge SG",
+		Class = "Shotgun",
+		Price = 1100,
+		DamageBody = 12, -- PER PELLET: 96 point-blank, enough to fear
+		Pellets = 8,
+		HeadshotMultiplier = 1.5, -- pellet headshots sting but rarely delete
+		FireInterval = 0.9, -- the pump
+		Magazine = 5,
+		ReserveMags = 4,
+		ReloadSeconds = 3.0,
+		EquipSeconds = 1.0,
+		FirstBulletSpreadDeg = 4.0, -- the pellet cone, not inaccuracy
+		SprayErrorGrowthDeg = 0.0, -- a pump gun has no pattern to walk
+		MaxSprayErrorDeg = 4.0,
+		BurstShots = 1,
+		CrouchAffinity = 0.0, -- no spray → no crouch (the house rule)
+		OptimalRangeStuds = 12,
+		MaxEffectiveRangeStuds = 30,
+		MinDamageMultiplier = 0.25,
+		RangeSpreadPer10Studs = 0.8, -- the cone stops mattering fast
+	},
+
+	-- HAVOC: the anchor's LMG. A 60-round belt and the patience to use it.
+	-- Slow to draw, slow to reload, impossible to run out mid-hold.
+	HavocLMG = {
+		Id = "HavocLMG",
+		DisplayName = "Havoc LMG",
+		Class = "Heavy",
+		Price = 3200,
+		DamageBody = 34,
+		Pellets = nil,
+		HeadshotMultiplier = 3.0,
+		FireInterval = 0.13,
+		Magazine = 60,
+		ReserveMags = 2,
+		ReloadSeconds = 4.0, -- the belt change is an event
+		EquipSeconds = 1.4, -- heaviest draw in the arsenal
+		FirstBulletSpreadDeg = 0.5,
+		SprayErrorGrowthDeg = 0.30,
+		MaxSprayErrorDeg = 5.0,
+		BurstShots = 8,
+		CrouchAffinity = 0.70, -- plant it and lean on the trigger
+		OptimalRangeStuds = 60,
+		MaxEffectiveRangeStuds = 120,
+		MinDamageMultiplier = 0.70,
+		RangeSpreadPer10Studs = 0.15,
+	},
+
 	-- THE KNIFE. Not a weapon yet — a movement tool. Equipping it is the
 	-- sprint modifier; drawing a real gun back out costs THAT gun's
 	-- EquipSeconds (Combat gates on the active weapon's draw time).
@@ -134,6 +226,7 @@ local Weapons: { [string]: WeaponDef } = {
 		Class = "Melee",
 		Price = 0,
 		DamageBody = 0,
+		Pellets = nil,
 		HeadshotMultiplier = 1.0,
 		FireInterval = 0.5,
 		Magazine = 0,
