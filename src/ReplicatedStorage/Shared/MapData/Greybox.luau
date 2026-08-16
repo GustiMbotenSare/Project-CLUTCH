@@ -17,6 +17,13 @@
 --   * Heavens stay — the overlook decks are our signature, not the
 --     reference's. So do both ledge ramps.
 --
+-- v5.1 (batch E, playtest #21): THE BARRIER LINE. Five energy walls seal
+-- the attacker half during the Buy phase — the three gaps in the z=32
+-- spawn-screen line plus both corridor south mouths. They block movement
+-- AND sightlines while they're up (Valorant's barrier rule: defenders roam
+-- their own half freely, but nobody sees or touches the attacker spawn
+-- before the whistle). Round machine drops them at LIVE.
+--
 -- v4 lineage: de-labyrinth boulevards (v4), spawn sight seals (v4.1),
 -- both-ways ledge (v4.2). Coordinates: y up. Attackers south (+z),
 -- defenders north (-z). Site A west (-x), Site B east (+x). Floor top y = 1.
@@ -51,6 +58,7 @@ export type CoverPoint = {
 
 export type MapSpec = {
 	parts: { PartSpec },
+	barriers: { PartSpec }, -- buy-phase energy walls: solid only during Buy
 	attackSpawns: { Vector3 },
 	defenseSpawns: { Vector3 },
 	plantZones: { PlantZone },
@@ -66,6 +74,7 @@ local RAMP = Color3.fromRGB(120, 120, 132)
 local SITE_A = Color3.fromRGB(255, 170, 60)
 local SITE_B = Color3.fromRGB(60, 200, 200)
 local COVER_FULL = Color3.fromRGB(70, 78, 92)
+local BARRIER = Color3.fromRGB(255, 190, 80) -- amber energy, attacker side
 
 local RAMP_ANGLE = 15.95
 local RAMP_Y = 2.35
@@ -210,6 +219,17 @@ local parts: { PartSpec } = {
 
 local Greybox: MapSpec = {
 	parts = parts,
+
+	-- THE BARRIER LINE (batch E). Up during Buy: nobody enters — or SEES —
+	-- the attacker half before the whistle. The three z=32 screen gaps plus
+	-- both corridor south mouths; everything else on that line is wall.
+	barriers = {
+		{ name = "BarrierALobby", pos = Vector3.new(-53, 6, 32), size = Vector3.new(14, 12, 1), color = BARRIER },
+		{ name = "BarrierMid", pos = Vector3.new(0, 6, 32), size = Vector3.new(32, 12, 1), color = BARRIER },
+		{ name = "BarrierBLobby", pos = Vector3.new(53, 6, 32), size = Vector3.new(14, 12, 1), color = BARRIER },
+		{ name = "BarrierLong", pos = Vector3.new(-87.5, 6, 55), size = Vector3.new(35, 12, 1), color = BARRIER },
+		{ name = "BarrierTuns", pos = Vector3.new(87.5, 6, 55), size = Vector3.new(35, 12, 1), color = BARRIER },
+	},
 
 	attackSpawns = {
 		Vector3.new(24, 3, 64),
