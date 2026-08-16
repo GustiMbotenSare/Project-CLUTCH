@@ -1,35 +1,22 @@
 --!strict
--- Bot brain v4.4: the RUNTIME half. BrainCore.luau owns the judgment
+-- Bot brain v4.5: the RUNTIME half. BrainCore.luau owns the judgment
 -- (scorers, routing, sampler, cover picks, team pressure, resolveTarget);
 -- this module owns what the bot DOES about it each tick: comms, facing,
 -- walks, holds, channels, diagnostics.
 --
--- v4.4.1 (playtest #17): THE FACING LOOP IS PHYSICS-SAFE. Direct CFrame
--- writes on a WALKING HumanoidRootPart stomp the humanoid mover — the v4.4
--- loop wrote at 12.5Hz mid-walk and every walk in the match went BLOCKED.
--- The loop now points the rig's AimAlign constraint (BrainCore.turnToward);
--- torque turns the body at a capped rate while the feet keep walking.
+-- v4.5 (playtest #18):
+--   * Spike-mark callouts print only when the mark CHANGES (the 3s refresh
+--     throttle re-printed the same mark fifteen times — log spam, not intel).
+--   * Jiggle-peek steps validate full clearance (standableReason), not just
+--     ground — peeking onto the 1-stud strip between a rail and the deck
+--     edge was the heaven/ledge PATH FAILED cluster.
+--   * APPROACH PEEKS READ MATCH MEMORY: a route into a zone the enemy keeps
+--     OWNING earns a corner check even without a fresh contact (batch C).
 --
--- v4.4 (playtest #16):
---   * THE FACING LOOP. AutoRotate is off — the legs no longer own the eyes.
---     The brain leaves a facePoint every tick (a visible enemy, a fresh
---     contact, the waypoint, the watch line, the threat direction) and a
---     dedicated loop turns toward it. Combat owns facing mid-burst (the
---     0.4s after a shot). A bot can now watch the flank while it crosses
---     the lane.
---   * SUPPRESSION RIDES THE RADIO: getting pinned by near-misses (Combat
---     stamps it) produces a callout like taking damage does.
---   * HONEST SPIKE MARKS (joined memory): the drop's FACT is public, its
---     LOCATION is per-side intel — attackers heard the carrier die (radio
---     mark from the round machine), defenders must put eyes on the drop.
---     Retrieval and spike-guard both walk to the side's MARK, never the
---     omniscient truth.
---   * Solo-defuser scoring threshold (BrainCore: closerToSite >= 1).
---
--- v4.3 carried: team-pressure confirmation gate, the round-4 retrieval fix,
--- spike guard, deliberate idle facing, anti-train peeks. v4.1/v4.2: barrier
--- phase, sampler rebuild, retake structure, post-plant web, swings, the
--- tuning rack, role affinity. Earlier history in the git log. Style rule:
+-- v4.4.1 (playtest #17): the facing loop is PHYSICS-SAFE — AimAlign turns
+-- the body, nobody writes a walking root's CFrame. v4.4: the facing loop
+-- itself, suppression on the radio, honest per-side spike marks. v4.3:
+-- team-pressure confirmation gate, retrieval fix, spike guard. Style rule:
 -- no inner quotes in log strings. Ever. (Brain:772, 2026-08-15.)
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -46,6 +33,7 @@ local Combat = require(script.Parent.Combat)
 local Telemetry = require(script.Parent.Telemetry)
 local Objective = require(script.Parent.Objective)
 local MatchState = require(script.Parent.MatchState)
+local MatchMemory = require(script.Parent.MatchMemory)
 local BrainCore = require(script.Parent.BrainCore)
 
 local Brain = {}
@@ -64,6 +52,7 @@ local CALLOUT_COOLDOWN = 4
 local APPROACH_PEEK_COOLDOWN = 6
 local APPROACH_PEEK_HOPS = 2
 local SAMPLE_DIAG_SECONDS = 10
+local HOT_ROUTE_HEAT = 3 -- MatchMemory heat that earns a habit peek
 
 local K = BrainCore.K -- shared constants (freshness windows, hop budgets, spacing)
 
@@ -139,14 +128,17 @@ local function holdAngle(
 			task.wait(0.25)
 		end
 
-		-- Jiggle or swing? Swings are rare and committed.
+		-- Jiggle or swing? Swings are rare and committed. Peek steps need REAL
+		-- room — ground alone wasn't enough (the rail-sliver PATH FAILEDs).
 		local swinging = rng:NextNumber() < SWING_CHANCE
 		local peekDistance = if swinging then SWING_STUDS elseif cover.kind == "partial" then 4 else 5
 		local peekPos = cover.pos + perp * peekDistance
-		if not BrainCore.hasGround(peekPos, model) then
+		local peekOk = BrainCore.standableReason(peekPos, model)
+		if not peekOk then
 			peekPos = cover.pos - perp * peekDistance
+			peekOk = BrainCore.standableReason(peekPos, model)
 		end
-		if not BrainCore.hasGround(peekPos, model) then
+		if not peekOk then
 			continue
 		end
 		if swinging and Scenario.VerboseBrain then
@@ -418,8 +410,8 @@ function Brain.start(bot: any, side: string, enemies: { any }, allies: { any }, 
 			end
 
 			-- EYES ON THE DROP: seeing the dropped spike marks it for your side.
-			-- (The spike part is CanQuery=false: LOS means nothing solid sits
-			-- between you and it.)
+			-- The callout prints only when the mark CHANGES — re-confirming the
+			-- same zone every 3 seconds was log spam, not intel (playtest #18).
 			if spikeDown and MatchState.spikePart and spikeFactZoneKey then
 				local toSpike = MatchState.spikePart.Position - ground
 				local dist = toSpike.Magnitude
@@ -432,15 +424,16 @@ function Brain.start(bot: any, side: string, enemies: { any }, allies: { any }, 
 					if not blocked then
 						local markField = if side == "Attack" then "spikeMarkAtk" else "spikeMarkDef"
 						local existing = MatchState[markField]
-						if existing == nil or existing.zoneKey ~= spikeFactZoneKey or now - existing.at > 3 then
+						local changed = existing == nil or existing.zoneKey ~= spikeFactZoneKey
+						if changed or now - existing.at > 3 then
 							MatchState[markField] = { pos = MatchState.spikePart.Position, zoneKey = spikeFactZoneKey, at = now }
-							if Scenario.VerboseBrain then
-								print(("[CLUTCH] %6.1fs  CALLOUT %s: spike marked — %s"):format(
-									now,
-									bot.name,
-									if Zones.byKey[spikeFactZoneKey] then Zones.byKey[spikeFactZoneKey].callout else spikeFactZoneKey
-								))
-							end
+						end
+						if changed and Scenario.VerboseBrain then
+							print(("[CLUTCH] %6.1fs  CALLOUT %s: spike marked — %s"):format(
+								now,
+								bot.name,
+								if Zones.byKey[spikeFactZoneKey] then Zones.byKey[spikeFactZoneKey].callout else spikeFactZoneKey
+							))
 						end
 					end
 				end
@@ -715,15 +708,18 @@ function Brain.start(bot: any, side: string, enemies: { any }, allies: { any }, 
 					end
 				else
 					-- THE INFO DOCTRINE, approach half: check the angle before you
-					-- cross it — but never when a living teammate is ALREADY in that
-					-- zone: the first bot checks the corner, the rest trade off it.
+					-- cross it — never when a living teammate is ALREADY in that
+					-- zone, and — batch C — when MATCH MEMORY says the enemy keeps
+					-- owning the route you're about to walk.
 					local contactClose = contact ~= nil
 						and now - contact.seenAt < SimConfig.MemoryDecaySeconds
 						and BrainCore.hopsSafe(currentKey, contact.zoneKey, side) <= APPROACH_PEEK_HOPS
 					local chokeAhead = routeKey ~= nil and Zones.hasTag(routeKey, "choke")
 					local allyAhead = routeKey ~= nil and table.find(allyZones, routeKey) ~= nil
+					local enemySide = if side == "Attack" then "Defense" else "Attack"
+					local routeHot = routeKey ~= nil and MatchMemory.zoneHeat(enemySide, routeKey) >= HOT_ROUTE_HEAT
 					if (intent == "Push" or intent == "Rotate" or intent == "Lurk")
-						and (contactClose or chokeAhead)
+						and (contactClose or chokeAhead or routeHot)
 						and not allyAhead
 						and now - lastApproachPeekAt > APPROACH_PEEK_COOLDOWN
 					then
