@@ -7,6 +7,11 @@
 -- stood. Bots reason about its position through zones; spectators see an
 -- actual object. No hidden state pretending to be a bomb.
 --
+-- THE COLORED AREA IS THE RULE (playtest #23): planting requires standing ON
+-- the glowing pad — planar distance to a plant pad, not anywhere inside the
+-- site region. Bots walk onto the pad first (the brain steps them there),
+-- then the channel runs.
+--
 -- Channels (plant 4s, defuse 7s) cancel on death, on taking damage, on
 -- SPOTTING AN ENEMY — and the channeler PLANTS ITS FEET (playtest #22): the
 -- root anchors for the duration. With per-bot collision back on, teammates
@@ -49,6 +54,7 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Shared = ReplicatedStorage:WaitForChild("Shared")
 
 local Zones = require(Shared.MapData.Zones)
+local Greybox = require(Shared.MapData.Greybox)
 local RoundConfig = require(Shared.Constants.RoundConfig)
 
 local MatchState = require(script.Parent.MatchState)
@@ -73,6 +79,22 @@ end
 
 local function rootOf(model: Model): BasePart?
 	return model:FindFirstChild("HumanoidRootPart") :: BasePart?
+end
+
+-- The glowing pad is the plantable ground (playtest #23). Returns the
+-- nearest pad spec and the planar distance to its center — the brain walks
+-- carriers onto the pad, and tryStartPlant enforces it.
+function Objective.nearestPad(pos: Vector3): (any?, number)
+	local best: any = nil
+	local bestDist = math.huge
+	for _, pad in Greybox.plantZones do
+		local d = planarDistance(pos, pad.pos)
+		if d < bestDist then
+			best = pad
+			bestDist = d
+		end
+	end
+	return best, bestDist
 end
 
 -- Never cancel the thread you are running on — explode() is called BY the
@@ -268,7 +290,7 @@ local function faceThreat(bot: any, threatPos: Vector3?)
 	bot.facePoint = threatPos
 end
 
--- Carrier standing on a plant zone commits to the full 4 seconds — unless an
+-- Carrier standing ON THE PAD commits to the full 4 seconds — unless an
 -- enemy becomes visible, it takes damage, or it moves.
 function Objective.tryStartPlant(bot: any, clock: () -> number, shouldAbort: (() -> boolean)?, threatPos: Vector3?): boolean
 	if MatchState.phase ~= "Live" or MatchState.planted then
@@ -278,10 +300,13 @@ function Objective.tryStartPlant(bot: any, clock: () -> number, shouldAbort: (()
 		return false
 	end
 	local ground = Zones.groundOf(bot.model)
-	local zoneKey = Zones.keyAt(ground)
-	if not Zones.hasTag(zoneKey, "plant") then
+	-- THE COLORED AREA IS THE RULE (playtest #23): on the glowing pad, not
+	-- vaguely near the site. The brain steps the carrier onto it first.
+	local pad, padDist = Objective.nearestPad(ground)
+	if not pad or padDist > pad.size.X / 2 + 1.5 then
 		return false
 	end
+	local zoneKey = Zones.keyAt(ground)
 
 	faceThreat(bot, threatPos)
 
