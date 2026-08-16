@@ -5,9 +5,7 @@
 -- session-local, which is fine: the sim lives and dies in one session.
 --
 -- This is batch D phase 1 (playtest #21's "walk animation not to be found").
--- The old procedural Motor6D.Transform loop is RETIRED — it was fighting the
--- rig's joint updates and never read. Now the Animator owns the joints, the
--- way real FPS rigs work:
+-- The old procedural Motor6D.Transform loop is RETIRED.
 --
 --   idle   (Movement, loop)  — a subtle breathe.
 --   walk   (Movement, loop)  — legs/arms swing; playback speed scales with
@@ -15,9 +13,14 @@
 --   crouch (Movement, hold)  — knees bent, torso forward; Combat toggles it
 --                              alongside the HipHeight drop.
 --   aim    (Action, hold)    — the gun arm held forward. ACTION priority rides
---                              OVER locomotion, so the arm never swings wild
---                              mid-stride. This is the trick that makes
---                              gun-carry readable on a moving rig.
+--                              OVER locomotion, so the arm never swings wild.
+--
+-- THE PHASE-1 BUG (playtest #22's "still gliding"): the aim clip's keyframe
+-- originally built the FULL pose tree — every joint at identity — and at
+-- Action priority that stomped walk/idle on EVERY joint. A permanent bind
+-- pose is exactly what "still gliding" looks like. The aim clip now carries
+-- a SPARSE pose chain (root → torso chain → right arm only); joints a clip
+-- doesn't pose are joints it doesn't own.
 --
 -- attach(model) per body — playing tracks don't survive a Clone, so the
 -- round machine re-attaches every round. The default Animate script is
@@ -55,19 +58,23 @@ local function deg(x: number, y: number?, z: number?): CFrame
 	return CFrame.Angles(math.rad(x), math.rad(y or 0), math.rad(z or 0))
 end
 
--- One keyframe = a full pose tree (identity where unset, so joints never
--- drift between keyframes).
+local function makePose(name: string, cf: CFrame?): Pose
+	local p = Instance.new("Pose")
+	p.Name = name
+	p.CFrame = cf or CFrame.new()
+	p.EasingStyle = Enum.PoseEasingStyle.Linear
+	p.EasingDirection = Enum.PoseEasingDirection.InOut
+	return p
+end
+
+-- FULL keyframe: every joint posed (identity where unset) — locomotion clips
+-- own the whole rig while they play.
 local function keyframe(time: number, joints: { [string]: CFrame }): Keyframe
 	local kf = Instance.new("Keyframe")
 	kf.Time = time
 	local poses: { [string]: Pose } = {}
 	for name in R15_TREE do
-		local p = Instance.new("Pose")
-		p.Name = name
-		p.CFrame = joints[name] or CFrame.new()
-		p.EasingStyle = Enum.PoseEasingStyle.Linear
-		p.EasingDirection = Enum.PoseEasingDirection.InOut
-		poses[name] = p
+		poses[name] = makePose(name, joints[name])
 	end
 	for name, parentName in R15_TREE do
 		if parentName then
@@ -79,11 +86,41 @@ local function keyframe(time: number, joints: { [string]: CFrame }): Keyframe
 	return kf
 end
 
+-- SPARSE keyframe (the phase-1 fix): pose ONLY the listed joints plus the
+-- ancestor chain needed to connect them to the root. A high-priority track
+-- built this way overrides the joints it poses and leaves everything else
+-- to whatever is playing underneath.
+local function keyframeSparse(time: number, joints: { [string]: CFrame }): Keyframe
+	local kf = Instance.new("Keyframe")
+	kf.Time = time
+	local include: { [string]: boolean } = {}
+	for name in joints do
+		local current: string? = name
+		while current and not include[current] do
+			include[current] = true
+			current = R15_TREE[current]
+		end
+	end
+	local poses: { [string]: Pose } = {}
+	for name in include do
+		poses[name] = makePose(name, joints[name])
+	end
+	for name in include do
+		local parentName = R15_TREE[name]
+		if parentName and poses[parentName] then
+			poses[name].Parent = poses[parentName]
+		else
+			poses[name].Parent = kf
+		end
+	end
+	return kf
+end
+
 local function buildClip(name: string, looped: boolean, frames: { Keyframe }): Animation?
 	local sequence = Instance.new("KeyframeSequence")
 	sequence.Name = name
 	sequence.Loop = looped
-	sequence.Priority = Enum.AnimationPriority.Movement -- track priority is set on the TRACK; this is a fallback
+	sequence.Priority = Enum.AnimationPriority.Movement -- fallback; the TRACK carries the real priority
 	for _, kf in frames do
 		kf.Parent = sequence
 	end
@@ -156,10 +193,11 @@ do
 		}),
 	})
 
-	-- The gun-carry pose at ACTION priority: rides over walk/idle/crouch on
-	-- the right arm chain only. The arm stays up no matter what the legs do.
+	-- The gun-carry pose at ACTION priority, SPARSE (phase-1 fix): only the
+	-- right-arm chain is posed, so it rides over walk/idle/crouch instead of
+	-- freezing the whole rig at bind pose.
 	clips.aim = buildClip("ClutchAim", true, {
-		keyframe(0, {
+		keyframeSparse(0, {
 			RightUpperArm = deg(78), -- shoulder: arm forward
 			RightLowerArm = deg(-12), -- slight elbow bend
 		}),
