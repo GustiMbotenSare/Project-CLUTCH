@@ -9,6 +9,9 @@
 --     on) perturbs the scalar fields between matches, scores each candidate
 --     against the objective metrics, and refits toward the elites.
 --
+-- v4.5 (playtest #18): Hold gains SpikeDownAttackPenalty — an attacker can't
+-- hold a site the spike isn't at (round 4: three of them parked on B for 70s
+-- while the spike lay in A Lobby).
 -- v4.4 (playtest #16): the defuse is a SOLO job — only the single closest
 -- living defender takes it (SupportWavePenalty at closerToSite >= 1); the
 -- rest guard the area.
@@ -29,6 +32,7 @@ return {
 		NoContactBonus = 0.10,
 		HighGroundBonus = 0.14, -- standing on a site/heaven worth holding
 		SpikeGuardBonus = 0.20, -- sitting on the dropped spike IS defending
+		SpikeDownAttackPenalty = -0.35, -- attackers can't hold a site the spike isn't at
 		Role = { Anchor = 0.30, Sniper = 0.23, Support = 0.10, IGL = 0.07, Lurker = 0.03, Entry = 0.00 },
 	},
 
