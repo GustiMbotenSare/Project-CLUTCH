@@ -18,6 +18,10 @@
 --
 -- v4.5 (playtest #18): Hold takes SpikeDownAttackPenalty for attackers while
 -- the spike is down — you can't hold a site the spike isn't at.
+-- v4.6 (playtest #19): ALL-CLEAR urgency (attackers wiped with the spike
+-- down: Defuse +0.5, no creeping); the rotate bait-gate trusts a lone
+-- contact when the OTHER site reads clear (area-clear marks at work);
+-- a bot with dry guns can't score Engage.
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Shared = ReplicatedStorage:WaitForChild("Shared")
@@ -304,7 +308,17 @@ local function scoreRotate(ctx: Context): number
 		if count >= 2 then
 			score += T.PressureBonus
 		elseif count <= 1 then
-			score += T.BaitPenalty
+			-- ...unless the OTHER site is proven clear — then one contact is the
+			-- hit, not a bait (the area-clear callout at work, playtest #19).
+			local cleared = false
+			if Zones.hasTag(ctx.contact.zoneKey, "site") then
+				local otherSiteKey = if ctx.contact.zoneKey == "A_SITE" then "B_SITE" else "A_SITE"
+				local marks = MatchState.clearMarks[ctx.side]
+				cleared = marks ~= nil and marks[otherSiteKey] ~= nil
+			end
+			if not cleared then
+				score += T.BaitPenalty
+			end
 		end
 	end
 	return score
@@ -343,6 +357,9 @@ local function scoreEngage(ctx: Context): number
 	if not ctx.assessment then
 		return -1
 	end
+	if ctx.bot.allDry then
+		return -1 -- out of everything: this is not a fight you take
+	end
 	return ctx.assessment.score
 end
 
@@ -370,7 +387,8 @@ local function scorePlant(ctx: Context): number
 end
 
 -- THE DEFUSE IS A SOLO JOB: only the single CLOSEST living defender takes
--- the channel; everyone else rotates in as the guard ring.
+-- the channel; everyone else rotates in as the guard ring. ALL-CLEAR:
+-- attackers wiped with the spike down means sprint the defuse, not creep.
 local function scoreDefuse(ctx: Context): number
 	if ctx.side ~= "Defense" or not MatchState.planted then
 		return -1
@@ -382,6 +400,9 @@ local function scoreDefuse(ctx: Context): number
 	end
 	if ctx.zoneKey == MatchState.plantedZoneKey then
 		score += T.OnSiteBonus
+	end
+	if (MatchState.atkAlive or 1) == 0 then
+		score += 0.5 -- nobody left to shoot you: GO
 	end
 	return score
 end
