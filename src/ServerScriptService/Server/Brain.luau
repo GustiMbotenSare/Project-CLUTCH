@@ -1,26 +1,18 @@
 --!strict
--- Bot brain v4.7: the RUNTIME half. BrainCore.luau owns the judgment
+-- Bot brain v4.8: the RUNTIME half. BrainCore.luau owns the judgment
 -- (scorers, routing, sampler, cover picks, team pressure, resolveTarget);
 -- this module owns what the bot DOES about it each tick: comms, facing,
 -- walks, holds, channels, diagnostics.
 --
--- v4.7 (playtest #20):
---   * HEADING-TRACKED FACING: v4.6 set facePoint to a spot 30 studs ahead
---     ONCE per walk — walk past it and the head flips 180° (the backwards-
---     rushing read). Now walking bots run faceMode "heading": the facing
---     loop derives the look target from the live position every 80ms.
---   * GLANCES, NOT CAMPS: holds check a corner for 0.7–1.8s (was 2.5–4s),
---     the peek COUNT scales with Game Sense, and a quiet hold earns a
---     relocate beat before re-picking an angle (BrainCore also skips the
---     crate you just glanced off). Approach peeks are a GS-scaled chance.
---   * SPIKE SNAP, WIDER + QUICKER: 40 studs (was 28), freshness gate 3s
---     (was 6s). Anyone near a known drop just goes and takes it.
---   * THE DEFUSE TAP IS LOUD: attackers within earshot of a defuse channel
---     get a sound contact at the spike — hunt the hands.
+-- v4.8 (playtest #22): THE GAZE PRIORITY LIST. A walking bot watches the
+-- highest-priority thing, not its feet: the ROTATE target first (you walk
+-- toward trouble eyes-up), then the corner or hot lane it's about to cross
+-- (choke tag or match-memory heat), and only then the raw heading. The
+-- random-looking wander stare is dead.
 --
--- v4.6 (playtest #19): facing discipline, spike snap, area-clear callouts,
--- all-clear urgency, knife discipline, ammo wiring. Style rule: no inner
--- quotes in log strings. Ever.
+-- v4.7 (playtest #20): heading-tracked facing, glances not camps, spike
+-- snap, the loud defuse tap. v4.6: knife discipline, all-clear, area-clear
+-- callouts. Style rule: no inner quotes in log strings. Ever.
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Shared = ReplicatedStorage:WaitForChild("Shared")
@@ -57,6 +49,7 @@ local APPROACH_PEEK_COOLDOWN = 6
 local APPROACH_PEEK_HOPS = 2
 local SAMPLE_DIAG_SECONDS = 10
 local HOT_ROUTE_HEAT = 3 -- MatchMemory heat that earns a habit peek
+local WATCH_ROUTE_HEAT = 2 -- heat that earns the EYES while walking (#22)
 local KNIFE_SPRINT_SPEED = 18.5 -- the oldest tac-shooter truth: knife = faster
 local SPIKE_SNAP_RADIUS = 40 -- a marked drop this close with nobody around: grab it
 local DEFUSE_HEAR_RADIUS = 55 -- the tap is audible across the site web
@@ -211,7 +204,7 @@ function Brain.start(bot: any, side: string, enemies: { any }, allies: { any }, 
 
 	-- THE FACING LOOP. The brain leaves either a facePoint (a spot worth
 	-- watching) or a faceMode "heading" + moveDir (a walking bot watches where
-	-- it's GOING — derived from the live position every tick, so it can never
+	-- it's GOING — derived from the live position every 80ms, so it can never
 	-- be passed and flipped). Combat owns facing mid-burst.
 	bot.facePoint = nil :: Vector3?
 	bot.moveDir = nil :: Vector3?
@@ -349,7 +342,8 @@ function Brain.start(bot: any, side: string, enemies: { any }, allies: { any }, 
 				break
 			end
 
-			-- The barrier phase: defenders live during Buy; attackers sleep frozen.
+			-- The barrier phase: BOTH sides run during Buy now (batch E); only
+			-- PostRound sleeps.
 			if not BrainCore.phaseIsLive(side) then
 				task.wait(0.5)
 				continue
@@ -919,14 +913,26 @@ function Brain.start(bot: any, side: string, enemies: { any }, allies: { any }, 
 						end
 
 						if spot then
-							-- HEADING facing: the facing loop derives the look target
-							-- from the live position every tick — never a fixed point
-							-- the bot walks past (the backwards-stare bug, #20).
+							-- THE GAZE PRIORITY LIST (playtest #22): a walking bot watches
+							-- the highest-priority thing, not its feet — the ROTATE
+							-- target first (eyes up toward trouble), then the corner or
+							-- hot lane it's about to cross, and only then the heading.
 							local moveVec = (spot - ground) * Vector3.new(1, 0, 1)
 							if moveVec.Magnitude > 1 then
 								bot.moveDir = moveVec.Unit
 								if not contactOwnsEyes then
-									bot.faceMode = "heading"
+									local watchPoint: Vector3? = nil
+									if intent == "Rotate" and contact then
+										watchPoint = contact.pos -- rotating to a call: eyes on it
+									elseif routeKey and (Zones.hasTag(routeKey, "choke") or MatchMemory.zoneHeat(enemySide, routeKey) >= WATCH_ROUTE_HEAT) then
+										watchPoint = Zones.center(routeKey) -- watch the corner you're crossing
+									end
+									if watchPoint then
+										bot.faceMode = "point"
+										bot.facePoint = watchPoint
+									else
+										bot.faceMode = "heading"
+									end
 								end
 							end
 							local result = Pathing.walkToWithResult(model, spot, shouldInterrupt)
