@@ -25,8 +25,7 @@
 --     sidearm, a distant one buys time for the magazine). Calm bots with a
 --     light mag reload proactively.
 --   * CROUCH-SPRAY: spray weapons (CrouchAffinity) sometimes drop a crouch at
---     burst start — crouched spread is tighter (×0.78). Bolt guns and pistols
---     barely bother; the visual pose lands with batch D.
+--     burst start — crouched spread is tighter (×0.78).
 --   * THE KNIFE GATES FIRING: knife out = no trigger; drawing back costs the
 --     ACTIVE weapon's EquipSeconds (per-weapon draw times, v2.1).
 --
@@ -34,6 +33,10 @@
 -- a higher proc chance, and a CROUCH log line so the feed shows it. The
 -- switch-to-sidearm boundary widened to 35 studs: inside that, the pistol's
 -- 0.5s draw beats any magazine change.
+--
+-- v2.2 (batch D, playtest #21): R15 part names for exposed-part aiming, and
+-- the crouch drives the ANIMATION pose alongside the HipHeight drop — the
+-- legs bend now, not just the hitbox.
 --
 -- GUNFIRE IS HEARD: every burst stamps MatchState.lastShot; Perception turns
 -- it into a SOUND contact for every enemy.
@@ -52,6 +55,7 @@ local Zones = require(Shared.MapData.Zones)
 local Perception = require(script.Parent.Perception)
 local MatchState = require(script.Parent.MatchState)
 local BrainCore = require(script.Parent.BrainCore)
+local Animations = require(script.Parent.Animations)
 
 local Combat = {}
 
@@ -91,7 +95,7 @@ local SUPPRESS_RADIUS = 3
 local SUPPRESS_MEMORY_SECONDS = 1.5
 
 -- Crouch: tighter cone while planted on your heels; the drop reads on the
--- rig (v2.1: deeper, so it shows before the animation pass lands).
+-- rig (v2.1: deeper, so it shows) AND the legs bend (batch D pose track).
 local CROUCH_SPREAD_MULTIPLIER = 0.78
 local CROUCH_DROP = 1.3
 
@@ -99,9 +103,10 @@ local CROUCH_DROP = 1.3
 -- sidearm (0.5s draw beats any reload); farther away buys time for the mag.
 local SWITCH_DISTANCE = 35
 
--- Exposed-part aiming, in value order. The head leads when hunting it.
-local PARTS_BODY_FIRST = { "Torso", "Head", "Left Arm", "Right Arm", "HumanoidRootPart", "Left Leg", "Right Leg" }
-local PARTS_HEAD_FIRST = { "Head", "Torso", "Left Arm", "Right Arm", "HumanoidRootPart", "Left Leg", "Right Leg" }
+-- Exposed-part aiming (R15 names, batch D), in value order. The head leads
+-- when hunting it.
+local PARTS_BODY_FIRST = { "UpperTorso", "Head", "LeftUpperArm", "RightUpperArm", "HumanoidRootPart", "LowerTorso", "LeftUpperLeg", "RightUpperLeg" }
+local PARTS_HEAD_FIRST = { "Head", "UpperTorso", "LeftUpperArm", "RightUpperArm", "HumanoidRootPart", "LowerTorso", "LeftUpperLeg", "RightUpperLeg" }
 
 export type Assessment = {
 	engage: boolean,
@@ -291,8 +296,8 @@ function Combat.pollHealth(bot: any, state: State, now: number)
 	state.lastHealth = humanoid.Health
 end
 
--- CROUCH. The spread model and the hitbox both change; the pose animation
--- is batch D's job.
+-- CROUCH. The spread model, the hitbox, AND the pose (batch D: the crouch
+-- animation track bends the legs while the HipHeight drop lowers the rig).
 function Combat.setCrouch(bot: any, state: State, crouched: boolean)
 	local humanoid = bot.model and bot.model:FindFirstChildOfClass("Humanoid")
 	if not humanoid then
@@ -302,9 +307,11 @@ function Combat.setCrouch(bot: any, state: State, crouched: boolean)
 		state.standHip = state.standHip or humanoid.HipHeight
 		humanoid.HipHeight = math.max(0.2, (state.standHip or 2) - CROUCH_DROP)
 		state.crouched = true
+		Animations.setCrouched(bot.model, true)
 	elseif not crouched and state.crouched then
 		humanoid.HipHeight = state.standHip or 2
 		state.crouched = false
+		Animations.setCrouched(bot.model, false)
 	end
 end
 
