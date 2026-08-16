@@ -6,7 +6,7 @@
 -- Bots never body-block EACH OTHER: they live in a collision group that
 -- doesn't self-collide (the playtest #11 B-door jam).
 --
--- THE VISUAL LAYER (playtest #16 + #17 + #19):
+-- THE VISUAL LAYER (playtest #16 + #17 + #19 + #20):
 --   * RIG_STYLE is the single source for every cosmetic choice — body tint
 --     per side, visor color, gun color/lengths, the knife. The reskin pass
 --     touches this table and the part names (Visor / Gun / Knife / NameTag),
@@ -17,7 +17,8 @@
 --     channel. Nobody writes a walking root's CFrame.
 --   * THE GUN rides the raised right hand; THE KNIFE (#19) shares that hand —
 --     a stub blade, hidden while the gun is out. styleHeld swaps which prop
---     reads, so the broadcast can SEE the sprint-for-knife trade.
+--     reads — and stamps the replicated Held attribute so the DASHBOARD can
+--     say "knife out" without watching the rig (playtest #20).
 --   * PROCEDURAL WALK: starts AFTER the model is parented and is PUBLIC:
 --     the round machine restarts it on every clone.
 --   * AUTOROTATE IS OFF: the legs no longer own the eyes.
@@ -225,7 +226,8 @@ function BotSpawner.styleGun(model: Model, weapon: any)
 end
 
 -- The held-item read: gun out, or knife out. The broadcast should be able to
--- SEE the sprint-for-knife trade before it reads a stat line.
+-- SEE the sprint-for-knife trade before it reads a stat line — and the
+-- replicated Held attribute lets the DASHBOARD say it too (playtest #20).
 function BotSpawner.styleHeld(model: Model, holding: string)
 	local gun = model:FindFirstChild("Gun") :: BasePart?
 	local knife = model:FindFirstChild("Knife") :: BasePart?
@@ -235,6 +237,7 @@ function BotSpawner.styleHeld(model: Model, holding: string)
 	if knife then
 		knife.Transparency = if holding == "Knife" then 0 else 1
 	end
+	model:SetAttribute("Held", holding)
 end
 
 -- PROCEDURAL WALK. PUBLIC: the round machine restarts this on every cloned
