@@ -274,10 +274,10 @@ local Greybox: MapSpec = {
 		{ name = "Mid_PillarDef", pos = Vector3.new(0, 1, -1), face = Vector3.new(0, 0, 1), kind = "full", zone = "MID" },
 		{ name = "MidLedgeRail", pos = Vector3.new(0, 5.5, -18), face = Vector3.new(0, 0, -1), kind = "partial", zone = "MID_LEDGE" },
 		-- The new chokes get their holds: long corner (defenders watch the
-		-- doors), the tunnel jog (defenders watch the tunnel mouth), and the
-		-- door box (attackers watch the crossing).
+		-- doors), outside-long staging watch (attackers eye the doors), the
+		-- tunnel jog (defenders watch the tunnel mouth).
 		{ name = "A_LongCorner", pos = Vector3.new(-88, 1, -2), face = Vector3.new(0, 0, 1), kind = "full", zone = "A_MAIN" },
-		{ name = "A_OutsideLong", pos = Vector3.new(-88, 1, 34), face = Vector3.new(0, 0, -1), kind = "partial", zone = "A_MAIN" },
+		{ name = "A_OutsideLong", pos = Vector3.new(-88, 1, 34), face = Vector3.new(0, 0, -1), kind = "partial", zone = "OUTSIDE_LONG" },
 		{ name = "B_TunJog", pos = Vector3.new(95, 1, 22), face = Vector3.new(0, 0, 1), kind = "full", zone = "B_MAIN" },
 		{ name = "B_TunMouth", pos = Vector3.new(88, 1, 40), face = Vector3.new(0, 0, -1), kind = "partial", zone = "B_MAIN" },
 		{ name = "A_ShortGap", pos = Vector3.new(-30, 1, -26), face = Vector3.new(-1, 0, -0.2), kind = "partial", zone = "A_SHORT" },
