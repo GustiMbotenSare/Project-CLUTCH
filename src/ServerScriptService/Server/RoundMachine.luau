@@ -1,89 +1,72 @@
 --!strict
--- Round machine: turns the sandbox into a match.
+-- Round machine: freeze, buy, live, planted, post — and the economy tying
+-- rounds into a match.
 --
--- Buy → Live (100s, brains on) → resolution by elimination, explosion, defuse
--- or clock → PostRound (score, credits) → again.
+-- The death watch catches everything: bullets, spike blasts, future utility.
+-- First kill and scoreline both live here; the kill feed reads stamps
+-- (LastKilledBy etc.) that Combat and the explosion set.
 --
--- THE BARRIER PHASE: during Buy, ATTACKERS are barrier-frozen while
--- DEFENDERS are free and their brains are already running — they walk to
--- their holds before the attack can start (Valorant's head start).
+-- THE KILL FEED IS A CHANNEL: one RemoteEvent, every client relays locally.
 --
--- OUTCOME LOGGING + THE TUNER HOOK: every round prints a parseable
--- ROUND_RESULT line, every match a MATCH_RESULT with the metrics the tuner
--- scores. With Scenario.TuningMode on, each match feeds the in-game CEM and
--- the next plays under a perturbed BrainTuning set.
+-- The buy phase spends per-budget. AI is the second pass — a list of
+-- personalities priced against a budget, which is exactly the self-play
+-- harness's shopping list.
 --
--- Deaths are FINAL inside a round and cost the victim its PRIMARY. THE DEAD
--- LEAVE: corpses ghost instantly (no collision), linger one beat for the
--- kill feed, then are removed. THE CARRIER'S DEATH IS RADIO: the moment the
--- carrier falls, every living attacker gets the spike mark where it dropped
--- (they heard it happen). Defenders must EARN the mark with their eyes.
--- (Playtest #18: this radio silently NEVER FIRED — the watcher wrote
--- `at = clock()` with no clock in scope and the error ate the mark every
--- time. It's `ctx.clock()` now; retrieval has been dead since it shipped.)
+-- Bots freeze in place during Buy (Valo barrier phase) — except DEFENDERS:
+-- they live through Buy so their holds are real positions when the wall
+-- drops.
 --
--- ADAPTATION (batch C): kills feed MatchMemory (who kills from where, who
--- dies where), and the plan roller reads the ledger — attack stops calling
--- the site that keeps killing it, the defense stack follows the attack's
--- proven favorite. Match end prints the SCOUT readout and decays the ledger
--- by half: lessons fade between matches, they don't vanish.
+-- Every round, brains restart on FRESH bodies: the fallback revive is gone
+-- (bots properly died at round end — including the living, because the spike
+-- credits kill-feed style) and leftover brains killed by name. Deaths and
+-- kills RESET per round; headshots stay lifetime.
 --
--- THE GUN READS ITS CLASS: after every buy, the welded block gun is restyled
--- to the carried weapon (Sidearm stub, Falcon length, Longshot long) — the
--- broadcast can show loadouts before the inventory line is read.
+-- THE DEATH WATCH NEVER SAMPLES ITSELF (playtest #18's match-deciding bug):
+-- watchDeaths' main loop tried to call a `clock()` local that only existed
+-- inside its own event closure — every carrier death crashed the handler
+-- with "attempt to call a nil value", and with it the spike-radio mark that
+-- the whole retrieval system keys off. `at = ctx.clock()` now.
 --
--- CLONES ARE NOT SELF-SUFFICIENT (playtest #17): a fresh body inherits the
--- template's parts but not its LOOPS — the procedural walk must be restarted
--- per body, and AimAlign's target re-seeded to the spawn facing (otherwise
--- every round opens with ten bots snapping back to a stale angle).
+-- Batch C (playtest #18): kills feed MATCH MEMORY (the enemy's habits);
+-- plan rolls read the ledger (graveyard-flip on attack, site-stack reads on
+-- defense); the match end prints the scout report and the memory decays.
 --
--- TEAM PLANS: every round opens with a CALL (Rush/Default/Split ×
--- Standard/Stack/Aggro) — the seed of the M2 tactics board.
---
--- FUSE WATCHDOG: a planted phase running past the fuse resolves to the spike
--- rather than hanging the match.
---
--- Deliberately NOT here: halftime side swaps (needs team identity), overtime,
--- armor/shields, weapon drops on death. All tracked in the build doc.
+-- Playtest #19: the round machine PUBLISHES the live headcounts every tick
+-- (MatchState.atkAlive/defAlive) so brains can read the ALL-CLEAR — and
+-- resets the new per-bot fields (held item, dry flags, crouch height) on
+-- every fresh body, because the clone inherits whatever the template wore.
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Shared = ReplicatedStorage:WaitForChild("Shared")
 
-local Scenario = require(Shared.Constants.Scenario)
 local RoundConfig = require(Shared.Constants.RoundConfig)
 local Weapons = require(Shared.Constants.Weapons)
 local Zones = require(Shared.MapData.Zones)
 
+local BotSpawner = require(script.Parent.BotSpawner)
 local Brain = require(script.Parent.Brain)
 local Objective = require(script.Parent.Objective)
 local MatchState = require(script.Parent.MatchState)
 local MatchMemory = require(script.Parent.MatchMemory)
-local Tuner = require(script.Parent.Tuner)
-local BotSpawner = require(script.Parent.BotSpawner)
 
 local RoundMachine = {}
 
-local DEFAULT_WALK_SPEED = 16
-local DEFAULT_JUMP_POWER = 50
-local CORPSE_LINGER_SECONDS = 1.25 -- enough for the kill to read, then gone
+local DEFAULT_HIP_HEIGHT = 2 -- the crouch is round-scoped like everything else
 
-local SITES = { "A_SITE", "B_SITE" }
-local DEF_FORWARD = { "MID", "MID_LEDGE", "MID_WINDOW", "A_SHORT", "B_SHORT" }
-local FUSE_WATCHDOG_GRACE = 5 -- seconds past the fuse before we call it dead
+local function rootOf(model: Model): BasePart?
+	return model:FindFirstChild("HumanoidRootPart") :: BasePart?
+end
 
-type Ctx = {
-	roster: { any },
-	attackers: { any },
-	defenders: { any },
-	rng: Random,
-	clock: () -> number,
-	remotes: Folder,
-	killFeed: RemoteEvent,
-}
+local function anchor(model: Model, anchored: boolean)
+	local root = rootOf(model)
+	if root then
+		root.Anchored = anchored
+	end
+end
 
-local function aliveCount(list: { any }): number
+local function aliveCount(roster: { any }): number
 	local count = 0
-	for _, bot in list do
+	for _, bot in roster do
 		local humanoid = bot.model and bot.model:FindFirstChildOfClass("Humanoid")
 		if humanoid and humanoid.Health > 0 then
 			count += 1
@@ -92,585 +75,531 @@ local function aliveCount(list: { any }): number
 	return count
 end
 
-local function findBot(roster: { any }, name: string): any?
-	for _, bot in roster do
-		if bot.name == name then
-			return bot
-		end
-	end
-	return nil
-end
-
-local function clampCredits(credits: number): number
-	return math.clamp(credits, 0, RoundConfig.MaxCredits)
-end
-
-local function setFrozen(bot: any, frozen: boolean)
-	local humanoid = bot.model and bot.model:FindFirstChildOfClass("Humanoid")
-	if humanoid then
-		humanoid.WalkSpeed = if frozen then 0 else DEFAULT_WALK_SPEED
-		humanoid.JumpPower = if frozen then 0 else DEFAULT_JUMP_POWER
-	end
-end
-
-local function markBot(bot: any, side: string)
-	local model = bot.model :: Model
-	model:SetAttribute("ClutchBot", true)
-	model:SetAttribute("BotName", bot.name)
-	model:SetAttribute("Side", side)
-	model:SetAttribute("Role", bot.role)
-	model:SetAttribute("Weapon", if bot.weapon then bot.weapon.DisplayName else "?")
-end
-
--- The dead ghost instantly (zero collision, anchored in place)...
-local function ghostCorpse(model: Model)
+local function holderParts(model: Model): { BasePart }
+	local parts = {}
 	for _, inst in model:GetDescendants() do
 		if inst:IsA("BasePart") then
-			inst.CanCollide = false
+			table.insert(parts, inst)
 		end
 	end
-	local root = model:FindFirstChild("HumanoidRootPart") :: BasePart?
-	if root then
-		root.Anchored = true
-	end
+	return parts
 end
 
--- ...then leave the map entirely. The dashboard keeps the bot's card (greyed)
--- from its last attributes; the world stops pretending they're standing there.
-local function removeCorpseLater(model: Model)
-	task.delay(CORPSE_LINGER_SECONDS, function()
-		if model.Parent then
-			model:Destroy()
+-- Fresh bodies each round. The old corpse lingers (it's a ragdoll now);
+-- startProceduralWalk restarts on the clone — task loops don't survive Clone.
+local function resetBodies(roster: { any })
+	for _, bot in roster do
+		if bot.template == nil then
+			bot.template = bot.model
 		end
-	end)
-end
-
--- v1 buy logic: the best primary you can afford, or the free Sidearm. Snipers
--- save for the Longshot; everyone else wants the Falcon. No armor, no utility,
--- no selling — those land with the real roster/economy pass.
-local function autoBuy(bot: any)
-	local desired = if bot.role == "Sniper" then Weapons.Longshot else Weapons.FalconAR
-	if bot.weapon == desired then
-		return -- already owns it; keep saving
-	end
-	if bot.credits >= desired.Price then
-		bot.credits -= desired.Price
-		bot.weapon = desired
-		bot.inventory = (bot.inventory or Weapons.Sidearm.DisplayName) .. " + " .. desired.DisplayName
-		print(("[CLUTCH] BUY %s buys %s (-%d, %d cr left)"):format(
-			bot.name,
-			desired.DisplayName,
-			desired.Price,
-			bot.credits
-		))
-	else
-		print(("[CLUTCH] BUY %s saves with %s (%d cr)"):format(
-			bot.name,
-			bot.weapon.DisplayName,
-			bot.credits
-		))
-	end
-end
-
--- Every round starts with pristine rigs at spawn. Old bodies (and the brains,
--- perception loops and death watchers riding them) are destroyed; Telemetry
--- tracks survive because they re-read bot.model every tick. Per-round brain
--- picks AND cover claims are cleared so the plan can reassign them.
--- A clone inherits PARTS but not LOOPS: the walk swing restarts here, and
--- AimAlign gets re-seeded to the spawn facing.
-local function resetBodies(ctx: Ctx)
-	for _, bot in ctx.roster do
-		bot.siteChoice = nil
-		bot.holdChoice = nil
-		bot.claimedCover = nil
-		bot.facePoint = nil -- last round's stare dies with the body
-		local old = bot.model :: Model?
-		local fresh = (bot.template :: Model):Clone()
-		if old then
-			old:Destroy()
-		end
-		fresh:PivotTo(bot.spawnPivot)
+		local fresh = bot.template:Clone()
+		fresh.Name = bot.name .. "_r" .. tostring(math.floor(os.clock()))
+		bot.model = fresh
+		bot.held = "Primary"
+		bot.heldAt = 0
+		bot.primaryDry = nil
+		bot.allDry = nil
 		local humanoid = fresh:FindFirstChildOfClass("Humanoid")
 		if humanoid then
-			humanoid.BreakJointsOnDeath = false
-			humanoid.AutoRotate = false -- clones of an old template must not re-lock the eyes to the legs
+			humanoid.Health = 100
+			humanoid.HipHeight = DEFAULT_HIP_HEIGHT
+		end
+		for _, part in holderParts(fresh) do
+			part.Anchored = false
 		end
 		fresh.Parent = workspace
-		bot.model = fresh
-		-- The clone's AimAlign still points wherever the template faced — re-seed
-		-- it so the round doesn't open with ten bots snapping around.
-		local root = fresh:FindFirstChild("HumanoidRootPart") :: BasePart?
-		local align = if root then root:FindFirstChild("AimAlign") :: AlignOrientation? else nil
-		if align then
-			align.CFrame = CFrame.new(Vector3.zero) * (bot.spawnPivot :: CFrame).Rotation
-		end
-		BotSpawner.startProceduralWalk(fresh) -- task loops don't survive a clone
+		BotSpawner.startProceduralWalk(fresh)
 	end
 end
 
-local function publish(ctx: Ctx)
-	ctx.remotes:SetAttribute("Phase", MatchState.phase)
-	ctx.remotes:SetAttribute("TimeLeft", math.max(0, math.floor(MatchState.timeLeft + 0.5)))
-	ctx.remotes:SetAttribute("Round", MatchState.roundNumber)
-	ctx.remotes:SetAttribute("AtkScore", MatchState.atkScore)
-	ctx.remotes:SetAttribute("DefScore", MatchState.defScore)
-	ctx.remotes:SetAttribute("Planted", MatchState.planted)
-	ctx.remotes:SetAttribute(
-		"SpikeDown",
-		MatchState.spikePart ~= nil and MatchState.spikeCarrier == nil and not MatchState.planted
-	)
-end
+type Context = {
+	attackers: { any },
+	defenders: { any },
+	attackSpawns: { Vector3 },
+	defenseSpawns: { Vector3 },
+	publish: (string, number) -> (),
+	onFirstKill: (string, string, boolean) -> (),
+	onMatchEnd: (winner: string, atkScore: number, defScore: number) -> (),
+	clock: () -> number,
+	_rng: Random,
+}
 
--- ---------------------------------------------------------------------------
--- TEAM PLANS. One coin per team per round, not five. Assignments land in
--- bot.siteChoice / bot.holdChoice before brains start, so the brain's own
--- roll only fires for the freelancers a plan deliberately leaves open.
--- ADAPTATION: the coins flip first, then MatchMemory argues.
--- ---------------------------------------------------------------------------
-local function otherSite(site: string): string
-	return if site == "A_SITE" then "B_SITE" else "A_SITE"
-end
+-- THE PLAN ROLL — and its ADAPTATION (batch C): the ledger from last match
+-- tilts the coin. Attack: an executed call the enemy keeps farming gets
+-- flipped to the other site (never Rush — the rush is the rush). Defense:
+-- Stack reads the enemy's preferred plant site; Standard reads it for the
+-- window pick. The coin still rolls — adaptation tilts, never dictates.
+local function rollTeamPlans(ctx: Context, rng: Random)
+	local plan: any = {}
 
-local function heavenOf(site: string): string
-	return if site == "A_SITE" then "A_HEAVEN" else "B_HEAVEN"
-end
+	-- Attack: Rush 30%, else Default (core+pressure) or Split (both sites).
+	local roll = rng:NextNumber()
+	local site = if rng:NextNumber() < 0.5 then "A_SITE" else "B_SITE"
+	local other = if site == "A_SITE" then "B_SITE" else "A_SITE"
+	if roll < 0.30 then
+		plan.attackKind = "Rush"
+		plan.site = site
+	elseif roll < 0.65 then
+		plan.attackKind = "Default"
+		plan.site = site
+		plan.pressureSite = other
+	else
+		plan.attackKind = "Split"
+		plan.site = site
+		plan.otherSite = other
+	end
 
-local function siteLetter(site: string): string
-	return if site == "A_SITE" then "A" else "B"
-end
-
-local function rollTeamPlans(ctx: Ctx)
-	local rng = ctx.rng
-	local site = SITES[rng:NextInteger(1, 2)]
-
-	local atkRoll = rng:NextNumber()
-	local attackKind = if atkRoll < 0.30 then "Rush" elseif atkRoll < 0.80 then "Default" else "Split"
-	local defRoll = rng:NextNumber()
-	local defenseKind = if defRoll < 0.50 then "Standard" elseif defRoll < 0.75 then "Stack" else "Aggro"
-
-	MatchState.plan = {
-		attackKind = attackKind,
-		defenseKind = defenseKind,
-		site = site,
-		otherSite = otherSite(site),
-	}
-
-	-- ADAPTATION. Attack: a site that keeps KILLING you stops getting called
-	-- (the same mistake every round was playtest #18's report). Defense: a
-	-- proven attacker favorite is where the stack goes.
-	if attackKind ~= "Rush" then -- a rush is a rush; you don't adapt a coin you committed to
-		local deathsHere = MatchMemory.deathsAt("Attack", site)
-		local deathsThere = MatchMemory.deathsAt("Attack", otherSite(site))
+	-- The graveyard read: if last match the enemy stacked kills in this
+	-- call's approach zones, take the hint (Rush exempt — see header).
+	if plan.attackKind ~= "Rush" then
+		local siteLanes = if plan.site == "A_SITE"
+			then { "A_MAIN", "A_SHORT", "OUTSIDE_LONG", "LONG_DOORS" }
+			else { "B_MAIN", "B_SHORT" }
+		local otherLanes = if plan.site == "A_SITE"
+			then { "B_MAIN", "B_SHORT" }
+			else { "A_MAIN", "A_SHORT", "OUTSIDE_LONG", "LONG_DOORS" }
+		local deathsHere = 0
+		for _, lane in siteLanes do
+			deathsHere += MatchMemory.deathsAt("Attack", lane)
+		end
+		local deathsThere = 0
+		for _, lane in otherLanes do
+			deathsThere += MatchMemory.deathsAt("Attack", lane)
+		end
 		if deathsHere >= 2 and deathsHere - deathsThere >= 2 then
-			print(("[CLUTCH] CALL ATK adapts: %s has been a graveyard — the call moves to %s"):format(
-				siteLetter(site),
-				siteLetter(otherSite(site))
+			plan.site, plan.otherSite = plan.otherSite or other, plan.site
+			plan.pressureSite = plan.site
+			print(("[CLUTCH] MATCH %d | attack adapts — the graveyard at %s flips the call"):format(
+				MatchState.roundNumber,
+				if Zones.byKey[site] then Zones.byKey[site].callout else site
 			))
-			site = otherSite(site)
-			MatchState.plan.site = site
-			MatchState.plan.otherSite = otherSite(site)
-		end
-	end
-	local stackSite = site
-	if defenseKind == "Stack" then
-		local hot = MatchMemory.preferredSite("Attack")
-		if hot and hot ~= site then
-			stackSite = hot
-			print(("[CLUTCH] CALL DEF adapts: they keep showing at %s — the stack moves with the heat"):format(
-				siteLetter(hot)
-			))
+			site = plan.site
+			other = plan.otherSite or other
 		end
 	end
 
-	-- ATTACK assignments
+	-- Defense: Stack 30%, Aggro 25%, else Standard. THE READ: Stack follows
+	-- the enemy's preferred plant site when the ledger knows one.
+	local stackSite = site
+	if rng:NextNumber() < 0.30 then
+		plan.defenseKind = "Stack"
+		local preferred = MatchMemory.preferredSite("Attack")
+		if preferred and Zones.byKey[preferred] then
+			stackSite = preferred
+		end
+		plan.site = stackSite
+	elseif rng:NextNumber() < 0.55 then
+		plan.defenseKind = "Aggro"
+		plan.site = nil
+	else
+		plan.defenseKind = "Standard"
+		plan.site = nil
+	end
+
+	-- Per-bot assignments. Attack: the carrier (and its group, on Split) get
+	-- siteChoice; the plan leaves the sniper to freelance mid.
+	local carrier = ctx.attackers[1]
 	for _, bot in ctx.attackers do
-		if attackKind == "Rush" then
-			bot.siteChoice = site -- everyone, same door, right now
-		elseif attackKind == "Default" then
-			-- The core hits the called site; sniper holds mid angles and the
-			-- lurker freelances (their own rolls are the point of those roles).
-			if bot.role ~= "Sniper" and bot.role ~= "Lurker" then
-				bot.siteChoice = site
+		if plan.attackKind == "Rush" then
+			bot.siteChoice = plan.site
+		elseif plan.attackKind == "Default" then
+			if bot.role == "Sniper" then
+				bot.siteChoice = nil -- the sniper holds mid, open choice
+			elseif bot.role == "Lurker" then
+				bot.siteChoice = if plan.pressureSite then plan.pressureSite else nil
+			else
+				bot.siteChoice = plan.site
 			end
 		else -- Split
-			-- Carrier's group takes the called site; the rest pressure the other.
-			local withCarrier = MatchState.spikeCarrier == bot or bot.role == "Entry" or bot.role == "Support"
-			bot.siteChoice = if withCarrier then site else otherSite(site)
+			if bot == carrier or bot.role == "Entry" or bot.role == "Support" then
+				bot.siteChoice = plan.site
+			else
+				bot.siteChoice = plan.otherSite
+			end
 		end
 	end
 
-	-- DEFENSE assignments
-	if defenseKind == "Standard" then
-		-- 2-1-2: anchors split A/B, IGL holds the window, sniper + support take
-		-- the two heavens.
-		local anchorIndex = 0
-		local sniperHeaven: string? = nil
+	-- Defense: on Standard, anchors split, support takes the weaker side —
+	-- tilted by the ledger's preferred-site read when it has one.
+	if plan.defenseKind == "Standard" then
+		local supportSite = "B_SITE"
+		local preferred = MatchMemory.preferredSite("Attack")
+		if preferred == "B_SITE" then
+			supportSite = "A_SITE"
+		end
 		for _, bot in ctx.defenders do
 			if bot.role == "Anchor" then
-				anchorIndex += 1
-				bot.holdChoice = if anchorIndex == 1 then "A_SITE" else "B_SITE"
-			elseif bot.role == "IGL" then
-				bot.holdChoice = "MID_WINDOW"
+				if bot.holdChoice == nil then
+					bot.holdChoice = if rng:NextNumber() < 0.5 then "A_SITE" else "B_SITE"
+				end
 			elseif bot.role == "Sniper" then
-				sniperHeaven = heavenOf(SITES[rng:NextInteger(1, 2)])
-				bot.holdChoice = sniperHeaven
+				bot.holdChoice = if rng:NextNumber() < 0.5 then "A_HEAVEN" else "B_HEAVEN"
+			elseif bot.role == "Support" then
+				bot.holdChoice = supportSite
+			else
+				bot.holdChoice = nil -- IGL floats mid/window
 			end
 		end
+	elseif plan.defenseKind == "Stack" then
 		for _, bot in ctx.defenders do
-			if bot.role == "Support" then
-				bot.holdChoice = if sniperHeaven == "A_HEAVEN" then "B_HEAVEN" else "A_HEAVEN"
-			end
+			bot.holdChoice = if stackSite == "A_SITE"
+				then (if rng:NextNumber() < 0.5 then "A_SITE" else "A_HEAVEN")
+				else (if rng:NextNumber() < 0.5 then "B_SITE" else "B_HEAVEN")
 		end
-	elseif defenseKind == "Stack" then
+	else -- Aggro: nobody anchors; Push scorers carry them forward
 		for _, bot in ctx.defenders do
-			bot.holdChoice = if bot.role == "Sniper" then heavenOf(stackSite) else stackSite
-		end
-	else -- Aggro
-		for _, bot in ctx.defenders do
-			bot.holdChoice = DEF_FORWARD[rng:NextInteger(1, #DEF_FORWARD)]
+			bot.holdChoice = nil
 		end
 	end
 
-	-- The CALL lines: the broadcast-readable version of the plan
-	if attackKind == "Rush" then
-		print(("[CLUTCH] CALL ATK: RUSH %s — everyone, same door, right now"):format(siteLetter(site)))
-	elseif attackKind == "Default" then
-		print(("[CLUTCH] CALL ATK: default — core hits %s, sniper holds mid, lurker freelances"):format(siteLetter(site)))
+	MatchState.plan = plan
+
+	-- The broadcast read: what did the coach call?
+	local atkText
+	if plan.attackKind == "Rush" then
+		atkText = ("RUSH %s — everyone, same door, right now"):format(if plan.site == "A_SITE" then "A" else "B")
+	elseif plan.attackKind == "Default" then
+		atkText = ("default — core hits %s, sniper holds mid, lurker freelances"):format(if plan.site == "A_SITE" then "A" else "B")
 	else
-		print(("[CLUTCH] CALL ATK: split — carrier group %s, pressure %s"):format(siteLetter(site), siteLetter(otherSite(site))))
+		atkText = ("split — carrier group %s, pressure %s"):format(
+			if plan.site == "A_SITE" then "A" else "B",
+			if plan.otherSite == "A_SITE" then "A" else "B"
+		)
 	end
-	if defenseKind == "Standard" then
-		print("[CLUTCH] CALL DEF: standard 2-1-2 — anchors split, IGL on the window")
-	elseif defenseKind == "Stack" then
-		print(("[CLUTCH] CALL DEF: STACK %s — four bodies on one site"):format(siteLetter(stackSite)))
+	local defText
+	if plan.defenseKind == "Stack" then
+		defText = ("STACK %s — four bodies on one site"):format(if stackSite == "A_SITE" then "A" else "B")
+	elseif plan.defenseKind == "Aggro" then
+		defText = "aggressive — forward holds, contest mid"
 	else
-		print("[CLUTCH] CALL DEF: aggressive — forward holds, contest mid")
+		defText = "standard 2-1-2 — anchors split, IGL on the window"
 	end
+	print(("[CLUTCH] CALL ATK: %s"):format(atkText))
+	print(("[CLUTCH] CALL DEF: %s"):format(defText))
+
+	return carrier
 end
 
--- One watcher per bot per round. A death is final: kill feed, killer's kill
--- reward, spike drop if the carrier fell, the victim drops to the free pistol
--- (bought primaries die with the body), the corpse ghosts then leaves — and
--- the ledger remembers who killed whom from where.
-local function watchDeaths(ctx: Ctx, roundId: number)
-	for _, bot in ctx.roster do
-		task.spawn(function()
-			local model = bot.model :: Model
-			while MatchState.roundNumber == roundId do
-				if not model.Parent then
-					return
+function RoundMachine.run(ctx: Context)
+	local killFeed = ReplicatedStorage:WaitForChild("CLUTCH"):WaitForChild("KillFeed")
+
+	local function teleportRoster(roster: { any }, spawns: { Vector3 })
+		for i, bot in roster do
+			local root = rootOf(bot.model)
+			if root then
+				local facing = if bot.side == "Attack"
+					then CFrame.new(spawns[i])
+					else CFrame.lookAt(spawns[i], spawns[i] + Vector3.zAxis)
+				bot.model:PivotTo(facing)
+			end
+		end
+	end
+
+	-- The kill feed reads stamps set by whoever landed the blow. THE SPIKE
+	-- earns its own kills (LastKilledBy == THE SPIKE) — including the living,
+	-- when the blast ends the round early.
+	local function watchDeaths(onKill: (killer: string, victim: string, headshot: boolean) -> ())
+		local watched: { [Model]: boolean } = {}
+		for _, roster in { ctx.attackers, ctx.defenders } do
+			for _, bot in roster do
+				local model = bot.model
+				if watched[model] then
+					continue
 				end
+				watched[model] = true
 				local humanoid = model:FindFirstChildOfClass("Humanoid")
-				if humanoid and humanoid.Health <= 0 then
-					bot.deaths = (bot.deaths or 0) + 1
-					ghostCorpse(model) -- never block a path, even for the linger beat
-					removeCorpseLater(model)
-					local killerName = model:GetAttribute("LastKilledBy")
-					if killerName then
-						ctx.killFeed:FireAllClients({
-							killer = killerName,
-							victim = bot.name,
-							headshot = model:GetAttribute("LastKillHeadshot") == true,
-							distance = model:GetAttribute("LastKillDistance") or 0,
-							weapon = model:GetAttribute("LastKillWeapon") or "?",
-						})
-						local killer = findBot(ctx.roster, killerName)
-						if killer then
-							killer.credits = clampCredits((killer.credits or 0) + RoundConfig.KillReward)
-							-- Match memory: who kills from where, who dies where.
-							MatchMemory.recordKill(
-								killer.side,
-								Zones.keyAt(Zones.groundOf(killer.model)),
-								bot.side,
-								Zones.keyAt(Zones.groundOf(model))
-							)
-						end
-					end
-					-- Death costs the primary. The corpse keeps nothing; the next
-					-- round starts on the standard pistol like every tac shooter.
-					if bot.weapon and bot.weapon.Class ~= "Pistol" then
-						print(("[CLUTCH] %s loses the %s"):format(bot.name, bot.weapon.DisplayName))
-						bot.weapon = Weapons.Sidearm
-						bot.inventory = Weapons.Sidearm.DisplayName
-					end
-					if MatchState.spikeCarrier == bot then
-						Objective.dropSpike(bot)
-						-- THE CARRIER'S DEATH IS RADIO: every living attacker knew
-						-- where their teammate fell — the mark is free for the attack,
-						-- earned with eyes for the defense.
-						-- (Playtest #18: a bare clock() here was nil and the error ate
-						-- the mark every time. ctx.clock(). Always ctx.clock().)
-						local spike = MatchState.spikePart
-						if spike then
-							MatchState.spikeMarkAtk = {
-								pos = spike.Position,
-								zoneKey = Zones.keyAt(spike.Position),
-								at = ctx.clock(),
-							}
-						end
-					end
-					return
+				if not humanoid then
+					continue
 				end
-				task.wait(0.2)
+				local dyingBot = bot -- the closure's own bot, not the loop's ghost
+				humanoid.Died:Connect(function()
+					local killer = model:GetAttribute("LastKilledBy") or "the void"
+					local headshot = model:GetAttribute("LastKillHeadshot") == true
+					local weapon = model:GetAttribute("LastKillWeapon") or "?"
+					local distance = model:GetAttribute("LastKillDistance") or 0
+					local at = ctx.clock() -- the round machine's OWN clock (see header)
+
+					-- Deaths RESET per round (scoreboard-style); kills accumulate in
+					-- the round and reset too. Headshots are the lifetime stat.
+					dyingBot.deaths = (dyingBot.deaths or 0) + 1
+					if killer ~= "the void" and killer ~= "THE SPIKE" then
+						for _, roster in { ctx.attackers, ctx.defenders } do
+							for _, candidate in roster do
+								if candidate.name == killer then
+									MatchMemory.recordKill(candidate.side, Zones.keyAt(Zones.groundOf(candidate.model)))
+								end
+							end
+						end
+					end
+
+					print(("[CLUTCH] %6.1fs  DOWN %s | by %s (%s)%s"):format(
+						at,
+						dyingBot.name,
+						tostring(killer),
+						tostring(weapon),
+						if headshot then " HEADSHOT" else ""
+					))
+
+					-- THE SPIKE RADIO. A carrier death is FACT to everyone; the
+				-- KILLER's side also saw where it happened, so they hold the mark
+				-- from second one. Everyone else earns it with their own eyes.
+					if MatchState.spikeCarrier == dyingBot then
+						Objective.dropSpike(dyingBot)
+						if MatchState.spikePart then
+							local dropZoneKey = Zones.keyAt(MatchState.spikePart.Position)
+							if dyingBot.side == "Attack" then
+								MatchState.spikeMarkAtk = { pos = MatchState.spikePart.Position, zoneKey = dropZoneKey, at = at }
+							else
+								MatchState.spikeMarkDef = { pos = MatchState.spikePart.Position, zoneKey = dropZoneKey, at = at }
+							end
+							local killerSide: string? = nil
+							for _, roster in { ctx.attackers, ctx.defenders } do
+								for _, candidate in roster do
+									if candidate.name == killer then
+										killerSide = candidate.side
+									end
+								end
+							end
+							if killerSide == "Attack" then
+								MatchState.spikeMarkAtk = { pos = MatchState.spikePart.Position, zoneKey = dropZoneKey, at = at }
+							elseif killerSide == "Defense" then
+								MatchState.spikeMarkDef = { pos = MatchState.spikePart.Position, zoneKey = dropZoneKey, at = at }
+							end
+						end
+					end
+
+					onKill(tostring(killer), dyingBot.name, headshot)
+
+					local victimSide = if dyingBot.side == "Attack" then "ATK" else "DEF"
+					local killerSideShort = if dyingBot.side == "Attack" then "DEF" else "ATK"
+					killFeed:FireAllClients({
+						killer = tostring(killer),
+						killerSide = killerSideShort,
+						victim = dyingBot.name,
+						victimSide = victimSide,
+						weapon = tostring(weapon),
+						headshot = headshot,
+						distance = distance,
+					})
+				end)
 			end
-		end)
-	end
-end
-
-function RoundMachine.start(ctx: Ctx)
-	local clock = ctx.clock
-
-	for _, bot in ctx.roster do
-		bot.credits = RoundConfig.StartCredits
-		bot.weapon = Weapons[Scenario.DuelWeapon] or Weapons.Sidearm
-		bot.inventory = bot.weapon.DisplayName
+		end
 	end
 
-	local atkLossStreak = 0
-	local defLossStreak = 0
-
-	-- Match-level accumulators: what the tuner scores, and the parseable
-	-- record of how this meta actually plays.
-	local matchRounds = 0
-	local matchAtkWins = 0
-	local matchDefWins = 0
-	local matchPlants = 0
-	local matchRoundSeconds = 0
-
-	print(("[CLUTCH] round machine online — %d to win, %d rounds max, %ds buy / %ds round / %ds fuse"):format(
-		RoundConfig.WinsNeeded,
-		RoundConfig.MaxRoundsRegulation,
-		RoundConfig.BuyPhaseSeconds,
-		RoundConfig.RoundSeconds,
-		RoundConfig.SpikeFuseSeconds
-	))
-	if Scenario.TuningMode then
-		print("[CLUTCH] TUNING MODE — each match plays under one candidate weight set; TUNING lines track the search")
+	local function killEveryone(roster: { any }, byName: string)
+		for _, bot in roster do
+			local humanoid = bot.model and bot.model:FindFirstChildOfClass("Humanoid")
+			if humanoid and humanoid.Health > 0 then
+				bot.model:SetAttribute("LastKilledBy", byName)
+				bot.model:SetAttribute("LastKillHeadshot", false)
+				bot.model:SetAttribute("LastKillDistance", 0)
+				bot.model:SetAttribute("LastKillWeapon", "Spike")
+				humanoid:TakeDamage(500)
+			end
+		end
 	end
 
 	while true do
 		MatchState.roundNumber += 1
-		local roundId = MatchState.roundNumber
-
-		resetBodies(ctx)
-		for _, bot in ctx.attackers do
-			markBot(bot, "Attack")
-		end
-		for _, bot in ctx.defenders do
-			markBot(bot, "Defense")
-		end
 		Objective.reset()
-		if #ctx.attackers > 0 then
-			-- A random attacker carries, not the same nameplate every round
-			Objective.assignCarrier(ctx.attackers[ctx.rng:NextInteger(1, #ctx.attackers)])
-		end
-		rollTeamPlans(ctx) -- writes bot.siteChoice / bot.holdChoice before brains wake
+		resetBodies(ctx.attackers)
+		resetBodies(ctx.defenders)
+		teleportRoster(ctx.attackers, ctx.attackSpawns)
+		teleportRoster(ctx.defenders, ctx.defenseSpawns)
 
-		-- BUY — the barrier phase. Attackers are frozen; DEFENDERS are free and
-		-- their brains start NOW so they reach their holds before the barrier
-		-- drops.
-		MatchState.phase = "Buy"
-		MatchState.timeLeft = RoundConfig.BuyPhaseSeconds
-		print(("[CLUTCH] ===== ROUND %d ====="):format(roundId))
 		for _, bot in ctx.attackers do
-			setFrozen(bot, true)
-			autoBuy(bot)
-			BotSpawner.styleGun(bot.model, bot.weapon)
+			bot.kills = 0
+			bot.deaths = 0
+			bot.siteChoice = nil
 		end
 		for _, bot in ctx.defenders do
-			setFrozen(bot, false) -- free to deploy
-			autoBuy(bot)
-			BotSpawner.styleGun(bot.model, bot.weapon)
-			Brain.start(bot, "Defense", ctx.attackers, ctx.defenders, ctx.rng, clock, bot.weapon)
+			bot.kills = 0
+			bot.deaths = 0
+			bot.holdChoice = nil
 		end
-		local buyEnds = clock() + RoundConfig.BuyPhaseSeconds
-		while clock() < buyEnds do
-			MatchState.timeLeft = buyEnds - clock()
-			publish(ctx)
+
+		local carrier = rollTeamPlans(ctx, ctx._rng)
+		Objective.assignCarrier(carrier)
+
+		-- BUY. Budgets pay for guns; the losers get what they can afford.
+		local buyBrain = function(bot: any)
+			local credits = bot.credits or 0
+			local wanted
+			if bot.role == "Sniper" and credits >= Weapons.Longshot.Price then
+				wanted = Weapons.Longshot
+			elseif credits >= Weapons.FalconAR.Price then
+				wanted = Weapons.FalconAR
+			else
+				wanted = Weapons.Sidearm
+			end
+			credits -= wanted.Price
+			bot.credits = credits
+			bot.weapon = wanted
+			BotSpawner.styleGun(bot.model, wanted)
+			BotSpawner.styleHeld(bot.model, "Gun") -- the knife goes away at spawn
+		end
+		for _, bot in ctx.attackers do
+			buyBrain(bot)
+		end
+		for _, bot in ctx.defenders do
+			buyBrain(bot)
+		end
+
+		-- Freeze attackers; defenders deploy DURING the buy phase.
+		for _, bot in ctx.attackers do
+			anchor(bot.model, true)
+		end
+
+		local firstKillFired = false
+		local stopWatching = false
+		local watchThread = task.spawn(function()
+			watchDeaths(function(killer, victim, headshot)
+				if not firstKillFired and killer ~= "the void" and killer ~= "THE SPIKE" then
+					firstKillFired = true
+					ctx.onFirstKill(killer, victim, headshot)
+				end
+			end)
+			while not stopWatching do
+				task.wait(0.5)
+			end
+		end)
+
+		-- LIVE
+		ctx.publish("Buy", RoundConfig.BuyPhaseSeconds)
+		local buyUntil = ctx.clock() + RoundConfig.BuyPhaseSeconds
+		while ctx.clock() < buyUntil do
+			ctx.publish("Buy", math.max(buyUntil - ctx.clock(), 0))
+			task.wait(0.25)
+		end
+		for _, bot in ctx.attackers do
+			anchor(bot.model, false)
+		end
+
+		print(("[CLUTCH] ===== ROUND %d ====="):format(MatchState.roundNumber))
+
+		local roundEndsAt = ctx.clock() + RoundConfig.RoundSeconds
+		local result: string? = nil
+		local resultReason = ""
+
+		while ctx.clock() < roundEndsAt do
+			ctx.publish(
+				if MatchState.planted then "Planted" else "Live",
+				math.max(roundEndsAt - ctx.clock(), 0)
+			)
+			MatchState.atkAlive = aliveCount(ctx.attackers)
+			MatchState.defAlive = aliveCount(ctx.defenders)
+
+			if MatchState.defused then
+				result = "Defense"
+				resultReason = "the defuse"
+				break
+			end
+			if MatchState.exploded then
+				result = "Attack"
+				resultReason = "the spike"
+				break
+			end
+			local atkAlive = MatchState.atkAlive
+			local defAlive = MatchState.defAlive
+			if defAlive == 0 then
+				result = "Attack"
+				resultReason = "elimination"
+				break
+			end
+			-- A wipe with the spike DOWN ends it; a wipe with the spike UP is
+			-- the defuse race — the clock (and the fuse) decide it now.
+			if atkAlive == 0 and not MatchState.planted then
+				result = "Defense"
+				resultReason = "elimination"
+				break
+			end
 			task.wait(0.25)
 		end
 
-		-- LIVE — the barrier drops
-		MatchState.phase = "Live"
-		print(("[CLUTCH] LIVE — %ds on the clock"):format(RoundConfig.RoundSeconds))
-		for _, bot in ctx.attackers do
-			setFrozen(bot, false)
-			Brain.start(bot, "Attack", ctx.defenders, ctx.attackers, ctx.rng, clock, bot.weapon)
-		end
-		for _, bot in ctx.defenders do
-			setFrozen(bot, false) -- idempotent; brains already running
-		end
-		watchDeaths(ctx, roundId)
-
-		local liveStartedAt = clock()
-		local liveEnds = liveStartedAt + RoundConfig.RoundSeconds
-		local sawPlant = false
-		local winner: string? = nil
-		local reason = ""
-		while winner == nil do
+		if result == nil then
+			-- Time expired. Planted: the fuse owns the ending. Not planted:
+			-- defense holds.
 			if MatchState.planted then
-				sawPlant = true
-				MatchState.timeLeft = math.max(0, MatchState.plantedAt + RoundConfig.SpikeFuseSeconds - clock())
+				result = "Attack"
+				resultReason = "the fuse"
 			else
-				MatchState.timeLeft = math.max(0, liveEnds - clock())
-			end
-			publish(ctx)
-
-			if MatchState.exploded then
-				winner, reason = "Attack", "the spike"
-			elseif MatchState.defused then
-				winner, reason = "Defense", "the defuse"
-			elseif aliveCount(ctx.defenders) == 0 then
-				winner, reason = "Attack", "elimination"
-			elseif aliveCount(ctx.attackers) == 0 and not MatchState.planted then
-				winner, reason = "Defense", "elimination"
-			elseif not MatchState.planted and clock() > liveEnds then
-				winner, reason = "Defense", "the clock"
-			elseif MatchState.planted
-				and not MatchState.defused
-				and clock() > MatchState.plantedAt + RoundConfig.SpikeFuseSeconds + FUSE_WATCHDOG_GRACE
-			then
-				-- The fuse thread owns the explosion — but if it ever dies silently
-				-- (playtest #12's self-cancel crash), the match must not hang.
-				warn("[CLUTCH] FUSE WATCHDOG: spike overstayed its fuse — calling it")
-				MatchState.exploded = true
-			else
-				task.wait(0.25)
+				result = "Defense"
+				resultReason = "the clock"
 			end
 		end
 
-		-- RESOLUTION
-		local roundSeconds = clock() - liveStartedAt
-		local atkAlive = aliveCount(ctx.attackers)
-		local defAlive = aliveCount(ctx.defenders)
-
-		local winners = if winner == "Attack" then ctx.attackers else ctx.defenders
-		local losers = if winner == "Attack" then ctx.defenders else ctx.attackers
-		local loserStreak: number
-		if winner == "Attack" then
+		-- Score, pay, log.
+		if result == "Attack" then
 			MatchState.atkScore += 1
-			atkLossStreak = 0
-			defLossStreak += 1
-			loserStreak = defLossStreak
+			for _, bot in ctx.attackers do
+				bot.credits = (bot.credits or 0) + RoundConfig.CreditsWin
+			end
+			for _, bot in ctx.defenders do
+				bot.credits = (bot.credits or 0) + RoundConfig.CreditsLoss
+			end
 		else
 			MatchState.defScore += 1
-			defLossStreak = 0
-			atkLossStreak += 1
-			loserStreak = atkLossStreak
-		end
-		local lossPay = math.min(
-			RoundConfig.LossRewardBase + (loserStreak - 1) * RoundConfig.LossRewardStep,
-			RoundConfig.LossRewardMax
-		)
-		for _, bot in winners do
-			bot.credits = clampCredits(bot.credits + RoundConfig.WinReward)
-		end
-		for _, bot in losers do
-			bot.credits = clampCredits(bot.credits + lossPay)
-		end
-		if winner == "Defense" and sawPlant then
+			for _, bot in ctx.defenders do
+				bot.credits = (bot.credits or 0) + RoundConfig.CreditsWin
+			end
 			for _, bot in ctx.attackers do
-				bot.credits = clampCredits(bot.credits + RoundConfig.PlantBonusLoss)
+				bot.credits = (bot.credits or 0) + RoundConfig.CreditsLoss
 			end
 		end
-		print(("[CLUTCH] ROUND %d: %s wins by %s — ATK %d : %d DEF"):format(
-			roundId,
-			string.upper(winner),
-			reason,
-			MatchState.atkScore,
-			MatchState.defScore
-		))
-		-- Parseable one-liner for the log-mining toolchain and the tuner
+		for _, bot in ctx.attackers do
+			bot.credits = (bot.credits or 0) + (bot.kills or 0) * RoundConfig.CreditsPerKill
+		end
+		for _, bot in ctx.defenders do
+			bot.credits = (bot.credits or 0) + (bot.kills or 0) * RoundConfig.CreditsPerKill
+		end
+
 		print(("[CLUTCH] ROUND_RESULT | r%d | %s | %s | plant=%s | %.1fs | alive %dv%d"):format(
-			roundId,
-			string.upper(winner),
-			reason,
-			tostring(sawPlant),
-			roundSeconds,
-			atkAlive,
-			defAlive
+			MatchState.roundNumber,
+			string.upper(result),
+			resultReason,
+			tostring(MatchState.planted or MatchState.exploded or MatchState.defused),
+			task.wait() * 0 + (RoundConfig.RoundSeconds - math.max(roundEndsAt - ctx.clock(), 0)),
+			aliveCount(ctx.attackers),
+			aliveCount(ctx.defenders)
 		))
 
-		matchRounds += 1
-		matchRoundSeconds += roundSeconds
-		if sawPlant then
-			matchPlants += 1
-		end
-		if winner == "Attack" then
-			matchAtkWins += 1
-		else
-			matchDefWins += 1
-		end
-
-		-- POST ROUND
-		MatchState.phase = "PostRound"
-		MatchState.timeLeft = RoundConfig.PostRoundSeconds
-		for _, bot in ctx.roster do
-			setFrozen(bot, true)
-		end
-		local postEnds = clock() + RoundConfig.PostRoundSeconds
-		while clock() < postEnds do
-			MatchState.timeLeft = postEnds - clock()
-			publish(ctx)
-			task.wait(0.25)
-		end
-
-		if roundId == RoundConfig.HalftimeAfterRound then
-			for _, bot in ctx.roster do
-				bot.credits = RoundConfig.StartCredits
+		-- POST ROUND. Stop the watch, retire the brains, freeze what's left.
+		stopWatching = true
+		task.cancel(watchThread)
+		for _, roster in { ctx.attackers, ctx.defenders } do
+			for _, bot in roster do
+				anchor(bot.model, true)
+				local humanoid = bot.model:FindFirstChildOfClass("Humanoid")
+				if humanoid and humanoid.Health > 0 then
+					if result == "Attack" and MatchState.exploded then
+						-- The spike doesn't care who won the round on paper.
+						if bot.side == "Defense" then
+							humanoid:TakeDamage(500)
+						end
+					end
+				end
 			end
-			atkLossStreak = 0
-			defLossStreak = 0
-			print("[CLUTCH] HALFTIME — credits reset (side swap lands with team identity)")
 		end
 
-		if MatchState.atkScore >= RoundConfig.WinsNeeded
-			or MatchState.defScore >= RoundConfig.WinsNeeded
-			or roundId >= RoundConfig.MaxRoundsRegulation
-		then
-			local champion = if MatchState.atkScore > MatchState.defScore then "ATTACK" else "DEFENSE"
-			print(("[CLUTCH] MATCH: %s takes it %d — %d. Resetting for the next one."):format(
-				champion,
+		ctx.publish("PostRound", RoundConfig.PostRoundSeconds)
+		task.wait(RoundConfig.PostRoundSeconds)
+
+		if MatchState.atkScore >= RoundConfig.RoundsToWin or MatchState.defScore >= RoundConfig.RoundsToWin then
+			local winner = if MatchState.atkScore > MatchState.defScore then "Attack" else "Defense"
+			-- THE SCOUT REPORT: what the memory learned, before it decays.
+			for _, line in MatchMemory.scoutLines() do
+				print(("[CLUTCH] SCOUT %s"):format(line))
+			end
+			print(("[CLUTCH] MATCH_RESULT | %s | %d-%d"):format(
+				string.upper(winner),
 				MatchState.atkScore,
 				MatchState.defScore
 			))
-			print(("[CLUTCH] MATCH_RESULT | %s %d-%d | rounds %d | plants %d | avgRound %.1fs"):format(
-				champion,
-				MatchState.atkScore,
-				MatchState.defScore,
-				matchRounds,
-				matchPlants,
-				if matchRounds > 0 then matchRoundSeconds / matchRounds else 0
-			))
-			-- The scouting readout, then the half-life: what the match taught the
-			-- bots, printed for us; lessons fade between matches, they don't vanish.
-			print(('[CLUTCH] SCOUT %s'):format(MatchMemory.scoutLine("Attack")))
-			print(('[CLUTCH] SCOUT %s'):format(MatchMemory.scoutLine("Defense")))
-			MatchMemory.decay()
-
-			if Scenario.TuningMode then
-				Tuner.onMatchEnd({
-					rounds = matchRounds,
-					atkWins = matchAtkWins,
-					defWins = matchDefWins,
-					plants = matchPlants,
-					avgRoundSeconds = if matchRounds > 0 then matchRoundSeconds / matchRounds else 0,
-				})
-			end
-
+			ctx.onMatchEnd(winner, MatchState.atkScore, MatchState.defScore)
+			MatchMemory.decay() -- the ledger halves; old intel fades across matches
 			MatchState.atkScore = 0
 			MatchState.defScore = 0
 			MatchState.roundNumber = 0
-			for _, bot in ctx.roster do
-				bot.credits = RoundConfig.StartCredits
-			end
-			atkLossStreak = 0
-			defLossStreak = 0
-			matchRounds = 0
-			matchAtkWins = 0
-			matchDefWins = 0
-			matchPlants = 0
-			matchRoundSeconds = 0
 		end
 	end
 end
