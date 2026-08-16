@@ -18,6 +18,15 @@
 -- kill feed, then are removed. THE CARRIER'S DEATH IS RADIO: the moment the
 -- carrier falls, every living attacker gets the spike mark where it dropped
 -- (they heard it happen). Defenders must EARN the mark with their eyes.
+-- (Playtest #18: this radio silently NEVER FIRED — the watcher wrote
+-- `at = clock()` with no clock in scope and the error ate the mark every
+-- time. It's `ctx.clock()` now; retrieval has been dead since it shipped.)
+--
+-- ADAPTATION (batch C): kills feed MatchMemory (who kills from where, who
+-- dies where), and the plan roller reads the ledger — attack stops calling
+-- the site that keeps killing it, the defense stack follows the attack's
+-- proven favorite. Match end prints the SCOUT readout and decays the ledger
+-- by half: lessons fade between matches, they don't vanish.
 --
 -- THE GUN READS ITS CLASS: after every buy, the welded block gun is restyled
 -- to the carried weapon (Sidearm stub, Falcon length, Longshot long) — the
@@ -48,6 +57,7 @@ local Zones = require(Shared.MapData.Zones)
 local Brain = require(script.Parent.Brain)
 local Objective = require(script.Parent.Objective)
 local MatchState = require(script.Parent.MatchState)
+local MatchMemory = require(script.Parent.MatchMemory)
 local Tuner = require(script.Parent.Tuner)
 local BotSpawner = require(script.Parent.BotSpawner)
 
@@ -215,6 +225,7 @@ end
 -- TEAM PLANS. One coin per team per round, not five. Assignments land in
 -- bot.siteChoice / bot.holdChoice before brains start, so the brain's own
 -- roll only fires for the freelancers a plan deliberately leaves open.
+-- ADAPTATION: the coins flip first, then MatchMemory argues.
 -- ---------------------------------------------------------------------------
 local function otherSite(site: string): string
 	return if site == "A_SITE" then "B_SITE" else "A_SITE"
@@ -243,6 +254,33 @@ local function rollTeamPlans(ctx: Ctx)
 		site = site,
 		otherSite = otherSite(site),
 	}
+
+	-- ADAPTATION. Attack: a site that keeps KILLING you stops getting called
+	-- (the same mistake every round was playtest #18's report). Defense: a
+	-- proven attacker favorite is where the stack goes.
+	if attackKind ~= "Rush" then -- a rush is a rush; you don't adapt a coin you committed to
+		local deathsHere = MatchMemory.deathsAt("Attack", site)
+		local deathsThere = MatchMemory.deathsAt("Attack", otherSite(site))
+		if deathsHere >= 2 and deathsHere - deathsThere >= 2 then
+			print(("[CLUTCH] CALL ATK adapts: %s has been a graveyard — the call moves to %s"):format(
+				siteLetter(site),
+				siteLetter(otherSite(site))
+			))
+			site = otherSite(site)
+			MatchState.plan.site = site
+			MatchState.plan.otherSite = otherSite(site)
+		end
+	end
+	local stackSite = site
+	if defenseKind == "Stack" then
+		local hot = MatchMemory.preferredSite("Attack")
+		if hot and hot ~= site then
+			stackSite = hot
+			print(("[CLUTCH] CALL DEF adapts: they keep showing at %s — the stack moves with the heat"):format(
+				siteLetter(hot)
+			))
+		end
+	end
 
 	-- ATTACK assignments
 	for _, bot in ctx.attackers do
@@ -285,7 +323,7 @@ local function rollTeamPlans(ctx: Ctx)
 		end
 	elseif defenseKind == "Stack" then
 		for _, bot in ctx.defenders do
-			bot.holdChoice = if bot.role == "Sniper" then heavenOf(site) else site
+			bot.holdChoice = if bot.role == "Sniper" then heavenOf(stackSite) else stackSite
 		end
 	else -- Aggro
 		for _, bot in ctx.defenders do
@@ -304,7 +342,7 @@ local function rollTeamPlans(ctx: Ctx)
 	if defenseKind == "Standard" then
 		print("[CLUTCH] CALL DEF: standard 2-1-2 — anchors split, IGL on the window")
 	elseif defenseKind == "Stack" then
-		print(("[CLUTCH] CALL DEF: STACK %s — four bodies on one site"):format(siteLetter(site)))
+		print(("[CLUTCH] CALL DEF: STACK %s — four bodies on one site"):format(siteLetter(stackSite)))
 	else
 		print("[CLUTCH] CALL DEF: aggressive — forward holds, contest mid")
 	end
@@ -312,7 +350,8 @@ end
 
 -- One watcher per bot per round. A death is final: kill feed, killer's kill
 -- reward, spike drop if the carrier fell, the victim drops to the free pistol
--- (bought primaries die with the body), the corpse ghosts then leaves.
+-- (bought primaries die with the body), the corpse ghosts then leaves — and
+-- the ledger remembers who killed whom from where.
 local function watchDeaths(ctx: Ctx, roundId: number)
 	for _, bot in ctx.roster do
 		task.spawn(function()
@@ -338,6 +377,13 @@ local function watchDeaths(ctx: Ctx, roundId: number)
 						local killer = findBot(ctx.roster, killerName)
 						if killer then
 							killer.credits = clampCredits((killer.credits or 0) + RoundConfig.KillReward)
+							-- Match memory: who kills from where, who dies where.
+							MatchMemory.recordKill(
+								killer.side,
+								Zones.keyAt(Zones.groundOf(killer.model)),
+								bot.side,
+								Zones.keyAt(Zones.groundOf(model))
+							)
 						end
 					end
 					-- Death costs the primary. The corpse keeps nothing; the next
@@ -352,12 +398,14 @@ local function watchDeaths(ctx: Ctx, roundId: number)
 						-- THE CARRIER'S DEATH IS RADIO: every living attacker knew
 						-- where their teammate fell — the mark is free for the attack,
 						-- earned with eyes for the defense.
+						-- (Playtest #18: a bare clock() here was nil and the error ate
+						-- the mark every time. ctx.clock(). Always ctx.clock().)
 						local spike = MatchState.spikePart
 						if spike then
 							MatchState.spikeMarkAtk = {
 								pos = spike.Position,
 								zoneKey = Zones.keyAt(spike.Position),
-								at = clock(),
+								at = ctx.clock(),
 							}
 						end
 					end
@@ -594,6 +642,11 @@ function RoundMachine.start(ctx: Ctx)
 				matchPlants,
 				if matchRounds > 0 then matchRoundSeconds / matchRounds else 0
 			))
+			-- The scouting readout, then the half-life: what the match taught the
+			-- bots, printed for us; lessons fade between matches, they don't vanish.
+			print(('[CLUTCH] SCOUT %s'):format(MatchMemory.scoutLine("Attack")))
+			print(('[CLUTCH] SCOUT %s'):format(MatchMemory.scoutLine("Defense")))
+			MatchMemory.decay()
 
 			if Scenario.TuningMode then
 				Tuner.onMatchEnd({
