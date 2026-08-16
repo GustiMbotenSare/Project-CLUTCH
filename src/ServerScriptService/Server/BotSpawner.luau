@@ -1,19 +1,20 @@
 --!strict
 -- Spawns bot players as real humanoid rigs — now R15 (batch D, playtest
 -- #21). CreateHumanoidModelFromDescription gives us a clean dummy per bot;
--- the Animator drives locomotion via runtime-built clips (Animations.luau),
--- so the retired procedural Transform loop is gone for good.
+-- the Animator drives locomotion via runtime-built clips (Animations.luau).
 --
 -- COLLISION (playtest #21): bots now BODY-BLOCK each other — the collision
--- group self-collides again. The #11 B-door jam that made us disable it is
--- covered by the brain's own spacing (personal-space destinations + cover
--- claims), and corpses still ghost on death. Solid bodies = solid hitboxes.
+-- group self-collides. The #11 jam fix's reversal is safe because the brain
+-- owns spacing (personal space + cover claims); corpses still ghost.
 --
--- THE VISUAL LAYER (playtest #16 + #17 + #19 + #20):
+-- THE VISUAL LAYER (playtest #16 + #17 + #19 + #20 + #23):
 --   * RIG_STYLE is the single source for every cosmetic choice — body tint
 --     per side, visor color, gun color/lengths, the knife. The reskin pass
 --     touches this table and the part names (Visor / Gun / Knife / NameTag),
 --     nothing else.
+--   * GUN SILHOUETTES BY CLASS (playtest #23's arsenal): pistol stub, SMG
+--     compact, shotgun wide, rifle standard, heavy long, sniper longest —
+--     the broadcast reads the loadout off the barrel before the card loads.
 --   * Team body tints: attackers warm, defenders cool.
 --   * AIM ALIGN (playtest #17's catastrophe): every rig carries an
 --     AlignOrientation ("AimAlign") on the root — the physics-safe facing
@@ -51,7 +52,9 @@ local RIG_STYLE = {
 	},
 	Visor = Color3.fromRGB(255, 230, 120),
 	Gun = Color3.fromRGB(35, 35, 40),
-	GunLength = { Pistol = 0.8, Rifle = 1.4, Sniper = 1.9 },
+	-- Barrel length IS the read (playtest #23's arsenal): the silhouette tells
+	-- the weapon class before the card does.
+	GunLength = { Pistol = 0.8, SMG = 1.1, Shotgun = 1.3, Rifle = 1.4, Heavy = 1.7, Sniper = 1.9 },
 	Knife = Color3.fromRGB(200, 200, 215),
 	KnifeLength = 0.6,
 }
