@@ -6,25 +6,20 @@
 -- Bots never body-block EACH OTHER: they live in a collision group that
 -- doesn't self-collide (the playtest #11 B-door jam).
 --
--- THE VISUAL LAYER (playtest #16 + #17):
+-- THE VISUAL LAYER (playtest #16 + #17 + #19):
 --   * RIG_STYLE is the single source for every cosmetic choice — body tint
---     per side, visor color, gun color/lengths. The reskin pass touches this
---     table and the part names (Visor / Gun / NameTag), nothing else.
+--     per side, visor color, gun color/lengths, the knife. The reskin pass
+--     touches this table and the part names (Visor / Gun / Knife / NameTag),
+--     nothing else.
 --   * Team body tints: attackers warm, defenders cool.
 --   * AIM ALIGN (playtest #17's catastrophe): every rig carries an
---     AlignOrientation ("AimAlign") on the root. Turning a WALKING bot by
---     writing its CFrame stomps the humanoid mover (every walk went BLOCKED
---     in #17); the constraint turns the body with torque at a capped angular
---     velocity — the physics-safe facing channel. The brain's facing loop
---     and Combat point it; nobody writes the root's CFrame anymore.
---   * THE GUN rides the raised right hand: welded to the Right Arm, and the
---     procedural loop holds the right shoulder up (a bot carries its gun
---     like it means it) while the left arm and legs swing with ground speed.
---     Gun is named/attributed (WeaponName) for the dropped-gun phase and
---     CanQuery=false (zero hitbox).
---   * PROCEDURAL WALK: starts AFTER the model is parented (starting it
---     before parenting exited the loop instantly — the "they still slide"
---     bug) and is PUBLIC: the round machine restarts it on every clone.
+--     AlignOrientation ("AimAlign") on the root — the physics-safe facing
+--     channel. Nobody writes a walking root's CFrame.
+--   * THE GUN rides the raised right hand; THE KNIFE (#19) shares that hand —
+--     a stub blade, hidden while the gun is out. styleHeld swaps which prop
+--     reads, so the broadcast can SEE the sprint-for-knife trade.
+--   * PROCEDURAL WALK: starts AFTER the model is parented and is PUBLIC:
+--     the round machine restarts it on every clone.
 --   * AUTOROTATE IS OFF: the legs no longer own the eyes.
 
 local Players = game:GetService("Players")
@@ -41,7 +36,7 @@ end)
 PhysicsService:CollisionGroupSetCollidable(BOT_COLLISION_GROUP, BOT_COLLISION_GROUP, false)
 
 -- THE RESKIN CONTRACT. Every cosmetic choice lives here; every cosmetic part
--- is named (Visor, Gun, NameTag). Polish phase = edit this table.
+-- is named (Visor, Gun, Knife, NameTag). Polish phase = edit this table.
 local RIG_STYLE = {
 	Body = {
 		Attack = Color3.fromRGB(140, 95, 65), -- warm
@@ -50,6 +45,8 @@ local RIG_STYLE = {
 	Visor = Color3.fromRGB(255, 230, 120),
 	Gun = Color3.fromRGB(35, 35, 40),
 	GunLength = { Pistol = 0.8, Rifle = 1.4, Sniper = 1.9 },
+	Knife = Color3.fromRGB(200, 200, 215),
+	KnifeLength = 0.6,
 }
 
 -- The raised gun-arm pose: the right shoulder held forward (~80°), with the
@@ -152,8 +149,7 @@ end
 
 -- AIM ALIGN: the physics-safe facing channel. One attachment on the root,
 -- one AlignOrientation — turnToward points it, torque turns the body, the
--- humanoid mover is never touched. (Direct CFrame writes on a walking root
--- were playtest #17's universal BLOCKED.)
+-- humanoid mover is never touched.
 local function addAimAlign(model: Model)
 	local root = model:WaitForChild("HumanoidRootPart", 5) :: BasePart?
 	if not root then
@@ -177,36 +173,44 @@ local function addAimAlign(model: Model)
 	align.Parent = root
 end
 
--- THE GUN: a block riding the raised right hand — long axis down the arm,
--- so when the shoulder holds the arm forward, the muzzle leads. Named and
--- attributed for the dropped-gun phase; CanQuery=false (zero hitbox).
-local function addGun(model: Model)
+-- A hand prop welded to the raised right hand, long axis down the arm.
+local function addHandProp(model: Model, name: string, length: number, color: Color3, visible: boolean): BasePart?
 	local arm = model:WaitForChild("Right Arm", 5) :: BasePart?
 	if not arm then
-		return
+		return nil
 	end
-	local gun = Instance.new("Part")
-	gun.Name = "Gun"
-	gun.Size = Vector3.new(0.25, 0.25, RIG_STYLE.GunLength.Pistol)
-	gun.Color = RIG_STYLE.Gun
-	gun.Material = Enum.Material.SmoothPlastic
-	gun.CanCollide = false
-	gun.CanQuery = false -- zero hitbox, like the visor
-	gun.CanTouch = false
-	gun.CastShadow = false
-	gun.Massless = true
-	gun.CollisionGroup = BOT_COLLISION_GROUP
-	gun:SetAttribute("WeaponName", "Sidearm")
-	-- Muzzle along the arm, just past the hand. At ease it reads as lowered;
-	-- with the shoulder raised it leads the way.
-	gun.CFrame = arm.CFrame * CFrame.new(0, -1.15, 0) * CFrame.Angles(math.rad(90), 0, 0)
+	local prop = Instance.new("Part")
+	prop.Name = name
+	prop.Size = Vector3.new(0.25, 0.25, length)
+	prop.Color = color
+	prop.Material = Enum.Material.SmoothPlastic
+	prop.CanCollide = false
+	prop.CanQuery = false -- zero hitbox, like the visor
+	prop.CanTouch = false
+	prop.CastShadow = false
+	prop.Massless = true
+	prop.Transparency = if visible then 0 else 1
+	prop.CollisionGroup = BOT_COLLISION_GROUP
+	prop.CFrame = arm.CFrame * CFrame.new(0, -1.15, 0) * CFrame.Angles(math.rad(90), 0, 0)
 
 	local weld = Instance.new("WeldConstraint")
 	weld.Part0 = arm
-	weld.Part1 = gun
-	weld.Parent = gun
+	weld.Part1 = prop
+	weld.Parent = prop
 
-	gun.Parent = model
+	prop.Parent = model
+	return prop
+end
+
+local function addGun(model: Model)
+	local gun = addHandProp(model, "Gun", RIG_STYLE.GunLength.Pistol, RIG_STYLE.Gun, true)
+	if gun then
+		gun:SetAttribute("WeaponName", "Sidearm")
+	end
+end
+
+local function addKnife(model: Model)
+	addHandProp(model, "Knife", RIG_STYLE.KnifeLength, RIG_STYLE.Knife, false)
 end
 
 -- Re-style the carried gun after a buy (the round machine clones fresh rigs
@@ -218,6 +222,19 @@ function BotSpawner.styleGun(model: Model, weapon: any)
 	end
 	gun.Size = Vector3.new(0.25, 0.25, RIG_STYLE.GunLength[weapon.Class] or 0.8)
 	gun:SetAttribute("WeaponName", weapon.DisplayName)
+end
+
+-- The held-item read: gun out, or knife out. The broadcast should be able to
+-- SEE the sprint-for-knife trade before it reads a stat line.
+function BotSpawner.styleHeld(model: Model, holding: string)
+	local gun = model:FindFirstChild("Gun") :: BasePart?
+	local knife = model:FindFirstChild("Knife") :: BasePart?
+	if gun then
+		gun.Transparency = if holding == "Knife" then 1 else 0
+	end
+	if knife then
+		knife.Transparency = if holding == "Knife" then 0 else 1
+	end
 end
 
 -- PROCEDURAL WALK. PUBLIC: the round machine restarts this on every cloned
@@ -315,6 +332,7 @@ function BotSpawner.spawnBot(
 	addNameTag(model, name, tagColor)
 	addVisor(model)
 	addGun(model)
+	addKnife(model)
 	addAimAlign(model)
 
 	model.Parent = workspace
