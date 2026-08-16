@@ -4,6 +4,12 @@
 -- Buy → Live (100s, brains on) → resolution by elimination, explosion, defuse
 -- or clock → PostRound (score, credits) → again.
 --
+-- THE ARSENAL SHOP (playtest #23): autoBuy is role-flavored with honest eco
+-- fallbacks. Snipers save for the Longshot ritual; rich anchors buy the
+-- Havoc belt; the lurker rides the cheap Bandit; everyone else wants the
+-- Falcon — and a broke Entry/Support flips a coin between the Bandit and
+-- the Judge. Nobody downgrades a real primary.
+--
 -- THE BARRIER PHASE (batch E, playtest #21): during Buy the barrier line is
 -- UP and BOTH sides' brains run — Valorant's rule, replacing the old
 -- attacker freeze. Defenders deploy to their holds; attackers stage behind
@@ -32,8 +38,9 @@
 -- by half: lessons fade between matches, they don't vanish.
 --
 -- THE GUN READS ITS CLASS: after every buy, the welded block gun is restyled
--- to the carried weapon (Sidearm stub, Falcon length, Longshot long) — the
--- broadcast can show loadouts before the inventory line is read.
+-- to the carried weapon (pistol stub, SMG compact, shotgun wide, heavy
+-- long, Longshot longest) — the broadcast can show loadouts before the
+-- inventory line is read.
 --
 -- CLONES ARE NOT SELF-SUFFICIENT (playtest #17): a fresh body inherits the
 -- template's parts but not its LOOPS — the ANIMATOR re-attaches per body
@@ -158,11 +165,21 @@ local function removeCorpseLater(model: Model)
 	end)
 end
 
--- v1 buy logic: the best primary you can afford, or the free Sidearm. Snipers
--- save for the Longshot; everyone else wants the Falcon. No armor, no utility,
--- no selling — those land with the real roster/economy pass.
-local function autoBuy(bot: any)
-	local desired = if bot.role == "Sniper" then Weapons.Longshot else Weapons.FalconAR
+-- THE ARSENAL SHOP (playtest #23): role-flavored wants with honest eco
+-- fallbacks. Snipers save for the Longshot ritual; rich anchors buy the
+-- Havoc belt; the lurker rides the cheap Bandit; everyone else wants the
+-- Falcon — and a broke Entry/Support flips a coin between the Bandit and
+-- the Judge. Nobody downgrades a real primary.
+local function autoBuy(bot: any, rng: Random)
+	local desired = Weapons.FalconAR
+	if bot.role == "Sniper" then
+		desired = Weapons.Longshot
+	elseif bot.role == "Anchor" and bot.credits >= Weapons.HavocLMG.Price + 800 then
+		desired = Weapons.HavocLMG -- rich anchors buy the belt
+	elseif bot.role == "Lurker" and bot.credits < Weapons.FalconAR.Price then
+		desired = Weapons.BanditSMG -- the cheap flanker
+	end
+
 	if bot.weapon == desired then
 		return -- already owns it; keep saving
 	end
@@ -176,12 +193,31 @@ local function autoBuy(bot: any)
 			desired.Price,
 			bot.credits
 		))
-	else
-		print(("[CLUTCH] BUY %s saves with %s (%d cr)"):format(
+		return
+	end
+
+	-- Can't afford the want. Snipers keep saving for the ritual; anyone
+	-- holding a real primary keeps IT; the pistol-only can buy down.
+	if bot.role == "Sniper" or bot.weapon.Class ~= "Pistol" then
+		print(("[CLUTCH] BUY %s saves with %s (%d cr)"):format(bot.name, bot.weapon.DisplayName, bot.credits))
+		return
+	end
+	local eco = Weapons.BanditSMG
+	if (bot.role == "Entry" or bot.role == "Support") and rng:NextNumber() < 0.4 then
+		eco = Weapons.JudgeSG -- forty percent of eco rounds, someone brings the boom
+	end
+	if bot.credits >= eco.Price then
+		bot.credits -= eco.Price
+		bot.weapon = eco
+		bot.inventory = (bot.inventory or Weapons.Sidearm.DisplayName) .. " + " .. eco.DisplayName
+		print(("[CLUTCH] BUY %s eco-buys %s (-%d, %d cr left)"):format(
 			bot.name,
-			bot.weapon.DisplayName,
+			eco.DisplayName,
+			eco.Price,
 			bot.credits
 		))
+	else
+		print(("[CLUTCH] BUY %s saves with %s (%d cr)"):format(bot.name, bot.weapon.DisplayName, bot.credits))
 	end
 end
 
@@ -501,14 +537,14 @@ function RoundMachine.start(ctx: Ctx)
 		print(("[CLUTCH] ===== ROUND %d ====="):format(roundId))
 		for _, bot in ctx.attackers do
 			setFrozen(bot, false)
-			autoBuy(bot)
+			autoBuy(bot, ctx.rng)
 			BotSpawner.styleGun(bot.model, bot.weapon)
 			BotSpawner.styleHeld(bot.model, "Gun") -- the knife goes away at spawn
 			Brain.start(bot, "Attack", ctx.defenders, ctx.attackers, ctx.rng, clock, bot.weapon)
 		end
 		for _, bot in ctx.defenders do
 			setFrozen(bot, false) -- free to deploy
-			autoBuy(bot)
+			autoBuy(bot, ctx.rng)
 			BotSpawner.styleGun(bot.model, bot.weapon)
 			BotSpawner.styleHeld(bot.model, "Gun")
 			Brain.start(bot, "Defense", ctx.attackers, ctx.defenders, ctx.rng, clock, bot.weapon)
