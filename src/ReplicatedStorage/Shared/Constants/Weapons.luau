@@ -17,12 +17,12 @@
 --   * AMMO IS REAL: Magazine already existed; ReserveMags joins it, and the
 --     brain now owns reload-vs-switch decisions.
 --   * CROUCH AFFINITY: how much a weapon wants to be sprayed from a crouch.
---     Spray weapons (the Falcon) crouch to control the pattern; semi-autos
---     and the bolt gun don't bother — crouching costs you the escape.
---   * THE KNIFE: equipping it is the sprint modifier (a tac-shooter's oldest
---     truth: you run faster with the knife out). No melee combat yet — the
---     knife is a movement tool, and pulling it at the wrong time is a real
---     risk because drawing the gun again costs EquipSeconds.
+--   * THE KNIFE: equipping it is the sprint modifier. No melee combat yet.
+--
+-- v2.1 (playtest #20): DRAW TIMES PER WEAPON, the way tac shooters price
+-- them — the knife snaps out (0.2s), the pistol is quick (0.5s), the rifle
+-- is a commitment (1.0s), the sniper is a ritual (1.25s). The price of a
+-- switch is what makes switch-vs-reload a real decision instead of a reflex.
 
 export type WeaponClass = "Pistol" | "Rifle" | "Sniper" | "Melee"
 
@@ -37,7 +37,7 @@ export type WeaponDef = {
 	Magazine: number,
 	ReserveMags: number, -- how many magazines beyond the loaded one
 	ReloadSeconds: number,
-	EquipSeconds: number,
+	EquipSeconds: number, -- the DRAW time when switching TO this weapon
 	FirstBulletSpreadDeg: number, -- standing, unscoped where applicable
 	SprayErrorGrowthDeg: number, -- added spread per consecutive shot
 	MaxSprayErrorDeg: number,
@@ -65,7 +65,7 @@ local Weapons: { [string]: WeaponDef } = {
 		Magazine = 12,
 		ReserveMags = 4,
 		ReloadSeconds = 1.8,
-		EquipSeconds = 0.6,
+		EquipSeconds = 0.5, -- quick draw: the panic switch is its whole job
 		FirstBulletSpreadDeg = 0.4,
 		SprayErrorGrowthDeg = 0.6,
 		MaxSprayErrorDeg = 5.0,
@@ -89,7 +89,7 @@ local Weapons: { [string]: WeaponDef } = {
 		Magazine = 25,
 		ReserveMags = 3,
 		ReloadSeconds = 2.5,
-		EquipSeconds = 1.0,
+		EquipSeconds = 1.0, -- a full second: switching TO the rifle is a commitment
 		FirstBulletSpreadDeg = 0.2,
 		SprayErrorGrowthDeg = 0.25,
 		MaxSprayErrorDeg = 4.0,
@@ -113,12 +113,12 @@ local Weapons: { [string]: WeaponDef } = {
 		Magazine = 5,
 		ReserveMags = 4,
 		ReloadSeconds = 3.7,
-		EquipSeconds = 1.25,
+		EquipSeconds = 1.25, -- the ritual
 		FirstBulletSpreadDeg = 0.02, -- scoped; hipfire is intentionally terrible
 		SprayErrorGrowthDeg = 0.0, -- bolt-action: no spray pattern
 		MaxSprayErrorDeg = 0.0,
 		BurstShots = 1,
-		CrouchAffinity = 0.0, -- bolt-action: nothing to spray; crouching is aim-down-sights theater
+		CrouchAffinity = 0.0, -- bolt-action: nothing to spray
 		OptimalRangeStuds = 200, -- no realistic falloff on this map
 		MaxEffectiveRangeStuds = 320,
 		MinDamageMultiplier = 1.0,
@@ -126,7 +126,8 @@ local Weapons: { [string]: WeaponDef } = {
 	},
 
 	-- THE KNIFE. Not a weapon yet — a movement tool. Equipping it is the
-	-- sprint modifier; drawing a real gun back out costs EquipSeconds.
+	-- sprint modifier; drawing a real gun back out costs THAT gun's
+	-- EquipSeconds (Combat gates on the active weapon's draw time).
 	Knife = {
 		Id = "Knife",
 		DisplayName = "Knife",
@@ -138,7 +139,7 @@ local Weapons: { [string]: WeaponDef } = {
 		Magazine = 0,
 		ReserveMags = 0,
 		ReloadSeconds = 0,
-		EquipSeconds = 0.4, -- fast hands; the gun coming BACK is the slow part
+		EquipSeconds = 0.2, -- the knife snaps out — that's why you run with it
 		FirstBulletSpreadDeg = 0.0,
 		SprayErrorGrowthDeg = 0.0,
 		MaxSprayErrorDeg = 0.0,
