@@ -7,27 +7,28 @@
 --
 -- RANGE DISCIPLINE: every weapon has an optimal band; Game Sense decides
 -- whether a bot respects it. Four situations override discipline entirely:
--- the enemy has eyes on it, it is contesting a site, it is taking damage —
--- or it is SUPPRESSED (playtest #16: a bullet cracking three studs past your
--- skull is information even when it doesn't hit).
+-- the enemy has eyes on it (WITHIN REACTION RANGE — v2.3), it is contesting
+-- a site, it is taking damage — or it is SUPPRESSED (playtest #16: a bullet
+-- cracking three studs past your skull is information even when it doesn't
+-- hit).
+--
+-- v2.3 (playtest #22): the "has eyes on me" force is capped at 85 studs.
+-- Past that, a spotter is a REASON, not a command — bots were standing at
+-- their own spawn trading 100-stud pokes instead of playing the round.
+-- Band discipline decides long-range shots; the feet keep their job.
 --
 -- SMOOTH AIM, PHYSICS-SAFE (playtest #17): AimAlign carries the rotation at
 -- a capped angular velocity; nobody writes a root CFrame anymore. The shooter
 -- pays for the turn: the measured remaining error widens the cone.
 --
--- v2 (playtest #19) — the PRECISION GUNPLAY layer:
---   * EXPOSED-PART AIMING: a shot aims at the first body part with clear LOS
---     (head when hunting, torso, arms, legs, root last). Nothing exposed and
---     the shot doesn't happen — the wall-eating mag-dump is dead. FORCED
---     fights may still spray the cover — suppression is honest.
---   * AMMO IS REAL: magazines decrement, reserves drain, reloads channel.
---     Dry mid-fight = switch-or-reload by distance (close threat draws the
---     sidearm, a distant one buys time for the magazine). Calm bots with a
---     light mag reload proactively.
---   * CROUCH-SPRAY: spray weapons (CrouchAffinity) sometimes drop a crouch at
---     burst start — crouched spread is tighter (×0.78).
---   * THE KNIFE GATES FIRING: knife out = no trigger; drawing back costs the
---     ACTIVE weapon's EquipSeconds (per-weapon draw times, v2.1).
+-- v2 (playtest #19) — the PRECISION GUNPLAY layer: EXPOSED-PART AIMING
+-- (first clear body part wins; nothing exposed = no trigger pull; FORCED
+-- fights may still spray cover as honest suppression), REAL AMMO (mags
+-- decrement, reserves drain, reloads channel; dry mid-fight = switch-or-
+-- reload by distance; calm bots top off), CROUCH-SPRAY (CrouchAffinity
+-- weapons drop a crouch at burst start; ×0.78 spread), THE KNIFE GATES
+-- FIRING (knife out = no trigger; drawing back costs the ACTIVE weapon's
+-- EquipSeconds — per-weapon draw times, v2.1).
 --
 -- v2.1 (playtest #20): the crouch reads louder — a deeper drop (1.3 studs),
 -- a higher proc chance, and a CROUCH log line so the feed shows it. The
@@ -35,8 +36,7 @@
 -- 0.5s draw beats any magazine change.
 --
 -- v2.2 (batch D, playtest #21): R15 part names for exposed-part aiming, and
--- the crouch drives the ANIMATION pose alongside the HipHeight drop — the
--- legs bend now, not just the hitbox.
+-- the crouch drives the ANIMATION pose alongside the HipHeight drop.
 --
 -- GUNFIRE IS HEARD: every burst stamps MatchState.lastShot; Perception turns
 -- it into a SOUND contact for every enemy.
@@ -102,6 +102,10 @@ local CROUCH_DROP = 1.3
 -- Switch-vs-reload: a dry magazine with a threat THIS close draws the
 -- sidearm (0.5s draw beats any reload); farther away buys time for the mag.
 local SWITCH_DISTANCE = 35
+
+-- v2.3: being SEEN only forces the fight inside reaction range. Past it,
+-- the spot is information the walk can carry instead of a stand-still duel.
+local EYES_ON_ME_RANGE = 85
 
 -- Exposed-part aiming (R15 names, batch D), in value order. The head leads
 -- when hunting it.
@@ -256,7 +260,7 @@ function Combat.assess(
 
 	local forced = false
 	local enemyModel = findEnemyModel(enemies, contact.name)
-	if enemyModel and Perception.hasEyesOn(enemyModel, bot.model) then
+	if enemyModel and Perception.hasEyesOn(enemyModel, bot.model) and distance <= EYES_ON_ME_RANGE then
 		forced = true
 		reason = ("%s has eyes on me"):format(contact.name)
 	elseif Zones.hasTag(myZoneKey, "plant") then
