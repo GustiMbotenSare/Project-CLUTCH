@@ -1,23 +1,31 @@
 --!strict
--- Bot brain v4.5: the RUNTIME half. BrainCore.luau owns the judgment
+-- Bot brain v4.6: the RUNTIME half. BrainCore.luau owns the judgment
 -- (scorers, routing, sampler, cover picks, team pressure, resolveTarget);
 -- this module owns what the bot DOES about it each tick: comms, facing,
 -- walks, holds, channels, diagnostics.
 --
--- v4.5 (playtest #18):
---   * Spike-mark callouts print only when the mark CHANGES (the 3s refresh
---     throttle re-printed the same mark fifteen times — log spam, not intel).
---   * Jiggle-peek steps validate full clearance (standableReason), not just
---     ground — peeking onto the 1-stud strip between a rail and the deck
---     edge was the heaven/ledge PATH FAILED cluster.
---   * APPROACH PEEKS READ MATCH MEMORY: a route into a zone the enemy keeps
---     OWNING earns a corner check even without a fresh contact (batch C).
+-- v4.6 (playtest #19):
+--   * FACING DISCIPLINE: a walking bot watches its HEADING, not a spot it
+--     is passing — and a contact only owns the eyes while it's CLOSE or in
+--     front. (Staring backwards while sprinting away from stale news read
+--     as insane, because it was.)
+--   * SPIKE SNAP: the drop within arm's reach and nobody around — grab it
+--     NOW, whatever the plan said.
+--   * AREA CLEAR CALLOUTS: standing a zone down with no contact marks it
+--     clear and radios it; teammates sprint through proven-safe ground and
+--     the rotate bait-gate trusts a lone contact when the other site reads
+--     clear (BrainCore).
+--   * ALL-CLEAR: attackers wiped with the spike ticking — defenders sprint
+--     the defuse, no peeks, no caution theater.
+--   * KNIFE DISCIPLINE: knife out on safe sprints (faster), gun out the
+--     moment anything is real — and the draw costs EquipSeconds before it
+--     can fire, so greed is priced.
+--   * Ammo wiring: calm bots top off light magazines (Combat.maybeReload);
+--     the ACTIVE weapon (not the bought one) drives assess/fireBurst.
 --
--- v4.4.1 (playtest #17): the facing loop is PHYSICS-SAFE — AimAlign turns
--- the body, nobody writes a walking root's CFrame. v4.4: the facing loop
--- itself, suppression on the radio, honest per-side spike marks. v4.3:
--- team-pressure confirmation gate, retrieval fix, spike guard. Style rule:
--- no inner quotes in log strings. Ever. (Brain:772, 2026-08-15.)
+-- v4.5: quiet marks, honest peek steps, memory-driven caution. v4.4.1:
+-- physics-safe facing (AimAlign). v4.4: the facing loop, suppression radio,
+-- honest spike marks. Style rule: no inner quotes in log strings. Ever.
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Shared = ReplicatedStorage:WaitForChild("Shared")
@@ -34,6 +42,7 @@ local Telemetry = require(script.Parent.Telemetry)
 local Objective = require(script.Parent.Objective)
 local MatchState = require(script.Parent.MatchState)
 local MatchMemory = require(script.Parent.MatchMemory)
+local BotSpawner = require(script.Parent.BotSpawner)
 local BrainCore = require(script.Parent.BrainCore)
 
 local Brain = {}
@@ -53,13 +62,16 @@ local APPROACH_PEEK_COOLDOWN = 6
 local APPROACH_PEEK_HOPS = 2
 local SAMPLE_DIAG_SECONDS = 10
 local HOT_ROUTE_HEAT = 3 -- MatchMemory heat that earns a habit peek
+local KNIFE_SPRINT_SPEED = 18.5 -- the oldest tac-shooter truth: knife = faster
+local SPIKE_SNAP_RADIUS = 28 -- a drop this close with nobody around: grab it
 
 local K = BrainCore.K -- shared constants (freshness windows, hop budgets, spacing)
 
 -- Zones defenders consider "forward" positions (for the at-objective read).
 local DEF_FORWARD = { "MID", "MID_LEDGE", "MID_WINDOW", "A_SHORT", "B_SHORT" }
 
--- WALK OR SPRINT — the info doctrine's speed half:
+-- WALK OR SPRINT — the info doctrine's speed half, now with clear marks:
+-- a zone your side has proven safe is a zone you RUN through.
 local function wantsWalk(intent: string, side: string, currentKey: string, routeKey: string?, contact: any, now: number): boolean
 	if intent == "Engage" or intent == "Plant" or intent == "Defuse" then
 		return true
@@ -67,16 +79,21 @@ local function wantsWalk(intent: string, side: string, currentKey: string, route
 	if intent == "Lurk" or intent == "FallBack" then
 		return true
 	end
+	-- ALL-CLEAR: attackers wiped, spike ticking — there is nothing to sneak on.
+	if side == "Defense" and MatchState.planted and (MatchState.atkAlive or 1) == 0 then
+		return false
+	end
 	if contact and now - contact.seenAt < K.FRESH_CONTACT_SECONDS then
 		return true -- fresh info: go quiet
 	end
 	if side == "Attack" and MatchState.planted then
 		return true
 	end
-	if Zones.hasTag(currentKey, "choke") then
+	local cleared = MatchState.clearMarks[side]
+	if Zones.hasTag(currentKey, "choke") and not (cleared and cleared[currentKey]) then
 		return true
 	end
-	if routeKey and Zones.hasTag(routeKey, "choke") then
+	if routeKey and Zones.hasTag(routeKey, "choke") and not (cleared and cleared[routeKey]) then
 		return true
 	end
 	return false -- no info, no threat: run
@@ -198,6 +215,7 @@ function Brain.start(bot: any, side: string, enemies: { any }, allies: { any }, 
 	-- a walking root (playtest #17: those writes stomped the mover and every
 	-- walk in the match went BLOCKED). Combat owns facing mid-burst.
 	bot.facePoint = nil :: Vector3?
+	bot.moveDir = nil :: Vector3?
 	task.spawn(function()
 		while model.Parent do
 			local humanoidNow = model:FindFirstChildOfClass("Humanoid")
@@ -290,9 +308,14 @@ function Brain.start(bot: any, side: string, enemies: { any }, allies: { any }, 
 			local here = Zones.keyAt(Zones.groundOf(model))
 			local visible = Perception.visibleContact(perception)
 			if visible then
-				local assessment = Combat.assess(bot, weapon, visible, enemies, here, combatState, now)
-				interruptAnswer = assessment.engage
-					and (assessment.forced or assessment.distance <= INTERRUPT_COMBAT_RANGE)
+				local heldWeapon = Combat.activeWeapon(bot)
+				if heldWeapon == nil then
+					interruptAnswer = true -- caught with the knife out: react NOW
+				else
+					local assessment = Combat.assess(bot, heldWeapon, visible, enemies, here, combatState, now)
+					interruptAnswer = assessment.engage
+						and (assessment.forced or assessment.distance <= INTERRUPT_COMBAT_RANGE)
+				end
 			end
 			if not interruptAnswer then
 				if MatchState.planted and side == "Defense" and intent ~= "Defuse" then
@@ -345,11 +368,37 @@ function Brain.start(bot: any, side: string, enemies: { any }, allies: { any }, 
 				zoneSince = now
 			end
 
+			-- AREA CLEAR: standing a zone down with no fresh contact earns the
+			-- mark and the callout; teammates hasten through proven-safe ground.
+			do
+				local contactForClear = Perception.bestContact(perception, now)
+				if intent ~= "Engage"
+					and (contactForClear == nil or now - contactForClear.seenAt > K.FRESH_CONTACT_SECONDS)
+					and now - zoneSince >= 4
+				then
+					local marks = MatchState.clearMarks[side]
+					if marks and marks[currentKey] == nil then
+						marks[currentKey] = now
+						if Scenario.VerboseBrain then
+							print(("[CLUTCH] %6.1fs  CALLOUT %s: area clear — %s"):format(
+								now,
+								bot.name,
+								if Zones.byKey[currentKey] then Zones.byKey[currentKey].callout else currentKey
+							))
+						end
+					end
+				end
+			end
+
 			local visible = Perception.visibleContact(perception)
 			local contact = Perception.bestContact(perception, now)
 			if not visible then
 				Combat.disengage(combatState)
 			end
+
+			-- The ACTIVE weapon drives everything combat-shaped this tick — the
+			-- buy is not the held item (knife, sidearm-after-dry included).
+			local activeWeapon = Combat.activeWeapon(bot)
 
 			-- CALLOUTS. A fresh sighting goes out on the radio; so does taking
 			-- fire from a known suspect — and so does getting PINNED by fire
@@ -370,6 +419,10 @@ function Brain.start(bot: any, side: string, enemies: { any }, allies: { any }, 
 					if contact then
 						shareContact(contact, ("Pinned by %s"):format(contact.name), now)
 					end
+				end
+				-- Calm hands top off a light magazine between contacts.
+				if intent ~= "Engage" then
+					Combat.maybeReload(bot, combatState, now)
 				end
 			end
 
@@ -443,16 +496,28 @@ function Brain.start(bot: any, side: string, enemies: { any }, allies: { any }, 
 			local mySpikeMark = if side == "Attack" then MatchState.spikeMarkAtk else MatchState.spikeMarkDef
 			local mySpikeZoneKey: string? = if spikeDown and mySpikeMark then mySpikeMark.zoneKey else nil
 
-			-- Deliberate facing: look at what matters, not where the legs point.
+			-- FACING DISCIPLINE (playtest #19): a contact owns the eyes only while
+			-- it's CLOSE or in front of the walk direction — a bot sprinting away
+			-- from distant stale news watches where it's GOING, not backwards.
+			local contactOwnsEyes = false
 			if visible then
 				bot.facePoint = visible.pos
+				contactOwnsEyes = true
 			elseif contact and now - contact.seenAt < K.FRESH_CONTACT_SECONDS then
-				bot.facePoint = contact.pos
+				local toContact = (contact.pos - ground) * Vector3.new(1, 0, 1)
+				local behind = bot.moveDir ~= nil
+					and toContact.Magnitude > 0.5
+					and toContact.Unit:Dot(bot.moveDir) < -0.5
+				local far = toContact.Magnitude > 25
+				if not (behind and far) then
+					bot.facePoint = contact.pos
+					contactOwnsEyes = true
+				end
 			end
 
 			local assessment = nil
-			if visible then
-				assessment = Combat.assess(bot, weapon, visible, enemies, currentKey, combatState, now)
+			if visible and activeWeapon then
+				assessment = Combat.assess(bot, activeWeapon, visible, enemies, currentKey, combatState, now)
 			end
 
 			-- Team intel pool: distinct fresh enemies per zone, across the whole
@@ -511,6 +576,10 @@ function Brain.start(bot: any, side: string, enemies: { any }, allies: { any }, 
 
 			local reference = math.max(lastProgressAt, perception.lastContactAt)
 			local decisiveness = math.clamp((now - reference) / Scenario.StallRampSeconds, 0, 1)
+
+			-- ALL-CLEAR: attackers wiped with the spike ticking — the defuse is a
+			-- sprint, not a creep. Read by wantsWalk, the peek gate, and scoring.
+			local allClear = side == "Defense" and MatchState.planted and (MatchState.atkAlive or 1) == 0
 
 			local atObjective = if side == "Attack"
 				then Zones.hasTag(currentKey, "site")
@@ -611,8 +680,26 @@ function Brain.start(bot: any, side: string, enemies: { any }, allies: { any }, 
 			local targetKey = BrainCore.resolveTarget(intent, ctx, allyZones, rng)
 
 			local walking = wantsWalk(intent, side, currentKey, routeKey, contact, now)
-			bot.speedMode = if walking then "walk" else "sprint"
-			alive.WalkSpeed = if walking then SimConfig.WalkSpeed else SimConfig.SprintSpeed
+
+			-- KNIFE DISCIPLINE: knife out on safe sprints, gun out the moment
+			-- anything is real. The draw costs EquipSeconds before it can fire —
+			-- greed is priced, so the condition is honest about danger.
+			local danger = visible ~= nil
+				or (contact ~= nil and now - contact.seenAt < K.FRESH_CONTACT_SECONDS
+					and BrainCore.hopsSafe(currentKey, contact.zoneKey, side) <= K.ENEMY_NEAR_HOPS)
+			local objectiveDuty = intent == "Plant" or intent == "Defuse" or intent == "Engage"
+				or (side == "Defense" and MatchState.planted)
+				or (side == "Attack" and MatchState.spikeCarrier == bot and contact ~= nil)
+			local wantKnife = not walking and not danger and not objectiveDuty
+				and (intent == "Push" or intent == "Rotate" or intent == "FallBack" or intent == "Lurk")
+			local heldWanted = if wantKnife then "Knife" elseif bot.primaryDry then "Sidearm" else "Primary"
+			if heldWanted ~= bot.held then
+				bot.held = heldWanted
+				bot.heldAt = now
+				BotSpawner.styleHeld(model, if heldWanted == "Knife" then "Knife" else "Gun")
+			end
+			bot.speedMode = if bot.held == "Knife" then "knife" elseif walking then "walk" else "sprint"
+			alive.WalkSpeed = if bot.held == "Knife" then KNIFE_SPRINT_SPEED elseif walking then SimConfig.WalkSpeed else SimConfig.SprintSpeed
 
 			if Scenario.VerboseBrain and (switched or now - lastThinkLogAt >= Scenario.BrainHeartbeatSeconds) then
 				lastThinkLogAt = now
@@ -631,7 +718,7 @@ function Brain.start(bot: any, side: string, enemies: { any }, allies: { any }, 
 				))
 			end
 
-			if intent == "Engage" and visible and assessment then
+			if intent == "Engage" and visible and assessment and activeWeapon then
 				if Scenario.LogCombat and switched then
 					print(("[CLUTCH] %6.1fs  ENGAGE %s -> %s | %.0f studs %s | dmg x%.2f | %s%s"):format(
 						now,
@@ -658,7 +745,7 @@ function Brain.start(bot: any, side: string, enemies: { any }, allies: { any }, 
 					if root and alive then
 						alive:MoveTo(root.Position)
 					end
-					Combat.fireBurst(bot, weapon, targetModel, combatState, rng, clock)
+					Combat.fireBurst(bot, activeWeapon, targetModel, combatState, rng, clock)
 					lastProgressAt = clock()
 				end
 			elseif visible and assessment and not assessment.engage and Scenario.LogCombat and switched then
@@ -682,10 +769,30 @@ function Brain.start(bot: any, side: string, enemies: { any }, allies: { any }, 
 				end
 				lastProgressAt = clock()
 			elseif intent ~= "Engage" then
-				if targetKey == nil or targetKey == currentKey then
+				-- SPIKE SNAP: the drop within arm's reach and nobody around — grab
+				-- it NOW, whatever the plan said (playtest #19's reaction ask).
+				local snapped = false
+				if side == "Attack" and spikeDown and mySpikeMark then
+					local toMark = mySpikeMark.pos - ground
+					if toMark.Magnitude <= SPIKE_SNAP_RADIUS
+						and (contact == nil or now - contact.seenAt > K.FRESH_CONTACT_SECONDS)
+					then
+						local snapSpot = Vector3.new(mySpikeMark.pos.X, 1, mySpikeMark.pos.Z)
+						if BrainCore.standableReason(snapSpot, model) then
+							Pathing.walkToWithResult(model, snapSpot, shouldInterrupt)
+							Objective.tryPickup(bot)
+							snapped = true
+						end
+					end
+				end
+
+				if snapped then
+					-- grabbed (or walking to grab): nothing else this tick
+				elseif targetKey == nil or targetKey == currentKey then
 					-- Settle the zone. Claim the angle first — two bots on one crate
 					-- was the doorway traffic jam.
 					routeKey = nil
+					bot.moveDir = nil -- standing: no heading to protect
 					local cover, faceDir = BrainCore.pickCoverPoint(ctx, allies)
 					if cover and faceDir then
 						bot.claimedCover = cover.name
@@ -709,8 +816,8 @@ function Brain.start(bot: any, side: string, enemies: { any }, allies: { any }, 
 				else
 					-- THE INFO DOCTRINE, approach half: check the angle before you
 					-- cross it — never when a living teammate is ALREADY in that
-					-- zone, and — batch C — when MATCH MEMORY says the enemy keeps
-					-- owning the route you're about to walk.
+					-- zone, never on an all-clear, and — batch C — when MATCH MEMORY
+					-- says the enemy keeps owning the route you're about to walk.
 					local contactClose = contact ~= nil
 						and now - contact.seenAt < SimConfig.MemoryDecaySeconds
 						and BrainCore.hopsSafe(currentKey, contact.zoneKey, side) <= APPROACH_PEEK_HOPS
@@ -721,6 +828,7 @@ function Brain.start(bot: any, side: string, enemies: { any }, allies: { any }, 
 					if (intent == "Push" or intent == "Rotate" or intent == "Lurk")
 						and (contactClose or chokeAhead or routeHot)
 						and not allyAhead
+						and not allClear
 						and now - lastApproachPeekAt > APPROACH_PEEK_COOLDOWN
 					then
 						local cover, faceDir = BrainCore.pickCoverPoint(ctx, allies)
@@ -763,8 +871,15 @@ function Brain.start(bot: any, side: string, enemies: { any }, allies: { any }, 
 						end
 
 						if spot then
-							if not (visible or (contact and now - contact.seenAt < K.FRESH_CONTACT_SECONDS)) then
-								bot.facePoint = spot -- watch where you're walking
+							-- Watch the HEADING, not the waypoint you're passing: a
+							-- fixed near point makes the head swing as you walk past it
+							-- (the playtest #19 locked-onto-a-spot read).
+							local moveVec = (spot - ground) * Vector3.new(1, 0, 1)
+							if moveVec.Magnitude > 1 then
+								bot.moveDir = moveVec.Unit
+								if not contactOwnsEyes then
+									bot.facePoint = ground + bot.moveDir * 30
+								end
 							end
 							local result = Pathing.walkToWithResult(model, spot, shouldInterrupt)
 							if result == "failed" then
