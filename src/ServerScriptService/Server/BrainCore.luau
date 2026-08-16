@@ -22,6 +22,9 @@
 -- down: Defuse +0.5, no creeping); the rotate bait-gate trusts a lone
 -- contact when the OTHER site reads clear (area-clear marks at work);
 -- a bot with dry guns can't score Engage.
+-- v4.7 (playtest #20): ANTI-GLUE — a bot that just glanced off a cover
+-- point and saw nothing doesn't re-pick the same crate for a few seconds.
+-- Corners are checked, not camped.
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Shared = ReplicatedStorage:WaitForChild("Shared")
@@ -84,6 +87,10 @@ local ROLE_ZONE_AFFINITY = {
 	IGL = { mid = 0.20, choke = 0.10 },
 }
 
+-- ANTI-GLUE (playtest #20): a cover point the bot glanced off this recently
+-- is skipped on the next pick — corners are checked, not camped.
+local REHOLD_COOLDOWN_SECONDS = 5
+
 export type Pressure = { [string]: { [string]: boolean } }
 
 export type Context = {
@@ -134,7 +141,7 @@ function BrainCore.teamPressure(allies: { any }, perceptions: { [string]: any },
 			continue
 		end
 		for enemyName, memoryContact in allyPerception.memory do
-			if enemyName ~= "the spike" and now - memoryContact.seenAt <= BrainCore.K.PRESSURE_FRESH_SECONDS then
+			if enemyName ~= "the spike" and enemyName ~= "the defuse" and now - memoryContact.seenAt <= BrainCore.K.PRESSURE_FRESH_SECONDS then
 				local atZone = pressure[memoryContact.zoneKey]
 				if not atZone then
 					atZone = {}
@@ -568,8 +575,8 @@ end
 
 -- COVER. Pick the declared cover point whose watch direction best matches the
 -- threat, across the bot's cover zone set, skipping points claimed by a
--- living teammate — with a role affinity bump (the plan says WHERE, the role
--- says how it stands there).
+-- living teammate AND the point the bot just glanced off (anti-glue) — with
+-- a role affinity bump (the plan says WHERE, the role says how it stands there).
 function BrainCore.pickCoverPoint(ctx: Context, allies: { any }): (any?, Vector3?)
 	local zones = ctx.coverZoneSet or { ctx.zoneKey }
 	local affinity = ROLE_ZONE_AFFINITY[ctx.role]
@@ -578,6 +585,13 @@ function BrainCore.pickCoverPoint(ctx: Context, allies: { any }): (any?, Vector3
 	local bestScore = -0.2
 	for _, point in Greybox.coverPoints do
 		if not table.find(zones, point.zone) then
+			continue
+		end
+		-- Anti-glue: a point this bot glanced off moments ago is done for now —
+		-- the corner was checked, the answer was no, look somewhere else.
+		if point.name == ctx.bot.lastHeldCover
+			and os.clock() - (ctx.bot.lastHeldAt or -99) < REHOLD_COOLDOWN_SECONDS
+		then
 			continue
 		end
 		local taken = false
