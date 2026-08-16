@@ -18,9 +18,8 @@
 -- v2 (playtest #19) — the PRECISION GUNPLAY layer:
 --   * EXPOSED-PART AIMING: a shot aims at the first body part with clear LOS
 --     (head when hunting, torso, arms, legs, root last). Nothing exposed and
---     the shot doesn't happen — the wall-eating mag-dump is dead (235 misses
---     against 34 kills in the last log was the receipt). FORCED fights may
---     still spray the cover — suppression is honest.
+--     the shot doesn't happen — the wall-eating mag-dump is dead. FORCED
+--     fights may still spray the cover — suppression is honest.
 --   * AMMO IS REAL: magazines decrement, reserves drain, reloads channel.
 --     Dry mid-fight = switch-or-reload by distance (close threat draws the
 --     sidearm, a distant one buys time for the magazine). Calm bots with a
@@ -28,8 +27,13 @@
 --   * CROUCH-SPRAY: spray weapons (CrouchAffinity) sometimes drop a crouch at
 --     burst start — crouched spread is tighter (×0.78). Bolt guns and pistols
 --     barely bother; the visual pose lands with batch D.
---   * THE KNIFE GATES FIRING: knife out = no trigger; drawing back costs
---     EquipSeconds.
+--   * THE KNIFE GATES FIRING: knife out = no trigger; drawing back costs the
+--     ACTIVE weapon's EquipSeconds (per-weapon draw times, v2.1).
+--
+-- v2.1 (playtest #20): the crouch reads louder — a deeper drop (1.3 studs),
+-- a higher proc chance, and a CROUCH log line so the feed shows it. The
+-- switch-to-sidearm boundary widened to 35 studs: inside that, the pistol's
+-- 0.5s draw beats any magazine change.
 --
 -- GUNFIRE IS HEARD: every burst stamps MatchState.lastShot; Perception turns
 -- it into a SOUND contact for every enemy.
@@ -86,13 +90,14 @@ local TURN_INACCURACY_PER_45DEG = 1.0
 local SUPPRESS_RADIUS = 3
 local SUPPRESS_MEMORY_SECONDS = 1.5
 
--- Crouch: tighter cone while planted on your heels; the drop is ~1 stud.
+-- Crouch: tighter cone while planted on your heels; the drop reads on the
+-- rig (v2.1: deeper, so it shows before the animation pass lands).
 local CROUCH_SPREAD_MULTIPLIER = 0.78
-local CROUCH_DROP = 1.0
+local CROUCH_DROP = 1.3
 
 -- Switch-vs-reload: a dry magazine with a threat THIS close draws the
--- sidearm; farther away buys time for the magazine change.
-local SWITCH_DISTANCE = 30
+-- sidearm (0.5s draw beats any reload); farther away buys time for the mag.
+local SWITCH_DISTANCE = 35
 
 -- Exposed-part aiming, in value order. The head leads when hunting it.
 local PARTS_BODY_FIRST = { "Torso", "Head", "Left Arm", "Right Arm", "HumanoidRootPart", "Left Leg", "Right Leg" }
@@ -434,7 +439,8 @@ function Combat.fireBurst(
 	local attributes = bot.attributes
 	local now = clock()
 
-	-- Drawing the gun takes EquipSeconds — the knife's hidden tax.
+	-- Drawing the gun takes THIS gun's EquipSeconds — the knife's hidden tax
+	-- is priced per weapon (knife 0.2 / pistol 0.5 / rifle 1.0 / sniper 1.25).
 	if now - (bot.heldAt or -math.huge) < weapon.EquipSeconds then
 		return false
 	end
@@ -478,12 +484,15 @@ function Combat.fireBurst(
 	-- Gunfire is a sound event: every enemy in the match hears this burst
 	MatchState.lastShot = { by = bot.name, pos = selfRoot.Position, at = now }
 
-	-- CROUCH-SPRAY: spray weapons sometimes drop a crouch at burst start to
-	-- hold the pattern. Bolt guns and pistols barely bother.
+	-- CROUCH-SPRAY: spray weapons often drop a crouch at burst start to hold
+	-- the pattern. Bolt guns and pistols barely bother.
 	if weapon.CrouchAffinity > 0 and not state.crouched then
-		local chance = weapon.CrouchAffinity * (0.4 + attributes.Aim / 250)
+		local chance = weapon.CrouchAffinity * (0.5 + attributes.Aim / 200)
 		if rng:NextNumber() < chance then
 			Combat.setCrouch(bot, state, true)
+			if Scenario.LogCombat then
+				print(("[CLUTCH] %6.1fs  CROUCH %s drops to control the spray"):format(now, bot.name))
+			end
 		end
 	end
 
