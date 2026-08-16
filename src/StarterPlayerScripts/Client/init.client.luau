@@ -1,4 +1,4 @@
--- Project CLUTCH — spectator dashboard v0.7
+-- Project CLUTCH — spectator dashboard v0.8
 --
 -- The first piece of the M1 broadcast package: what a real esports observer
 -- sees, reduced to what the sim can honestly report right now.
@@ -9,10 +9,11 @@
 --                   (orange, dropped on the ground, recoverable). The two
 --                   used to share one banner.
 --   * Player cards — name, role, INVENTORY, live HP bar, zone callout with
---                    walk/sprint mode, CURRENT INTENT badge (incl. FallBack),
---                    K / D / HS and credits. Click a card to spectate it.
---                    The dead grey out; their models leave the world a beat
---                    after the kill feed fires.
+--                    walk/sprint mode AND the held item (KNIFE OUT, #20),
+--                    CURRENT INTENT badge (incl. FallBack), K / D / HS and
+--                    credits. Click a card to spectate it. The dead grey
+--                    out; their models leave the world a beat after the
+--                    kill feed fires.
 --   * Kill feed   — killer, victim, headshot flag, distance, weapon.
 --
 -- Controls: click a card to spectate it · C releases the camera ·
@@ -20,7 +21,8 @@
 --
 -- Data path: Telemetry stamps every bot model with replicated attributes at
 -- 4Hz (Zone, Intent, Alive, Kills, Deaths, Headshots, Credits, Inventory,
--- Speed), RoundMachine mirrors match state as attributes on the CLUTCH folder
+-- Speed), BotSpawner.styleHeld stamps Held on every weapon swap,
+-- RoundMachine mirrors match state as attributes on the CLUTCH folder
 -- (Phase, TimeLeft, Round, AtkScore, DefScore, Planted, SpikeDown), and
 -- KillFeed fires per death. The client polls plain attributes — no per-frame
 -- remote traffic, no desync.
@@ -36,7 +38,7 @@ local camera = workspace.CurrentCamera
 local remotes = ReplicatedStorage:WaitForChild("CLUTCH")
 local killFeed = remotes:WaitForChild("KillFeed")
 
-print("[CLUTCH] client online — spectator dashboard v0.7")
+print("[CLUTCH] client online — spectator dashboard v0.8")
 
 local ATK_COLOR = Color3.fromRGB(255, 150, 60)
 local DEF_COLOR = Color3.fromRGB(80, 200, 255)
@@ -355,6 +357,10 @@ local function refresh()
 		local zoneText = tostring(model:GetAttribute("Zone") or "")
 		if speed ~= "" then
 			zoneText ..= ("  ·  %s"):format(if speed == "walk" then "walking" else "SPRINTING")
+		end
+		local held = tostring(model:GetAttribute("Held") or "")
+		if held == "Knife" then
+			zoneText ..= "  ·  KNIFE OUT" -- the sprint-for-knife trade, on the card
 		end
 		card.zone.Text = zoneText
 		card.kd.Text = ("K %d  D %d  HS %d   ·   %d cr"):format(
