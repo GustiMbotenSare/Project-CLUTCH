@@ -7,15 +7,20 @@
 --
 -- RANGE DISCIPLINE: every weapon has an optimal band; Game Sense decides
 -- whether a bot respects it. Four situations override discipline entirely:
--- the enemy has eyes on it (WITHIN REACTION RANGE — v2.3), it is contesting
--- a site, it is taking damage — or it is SUPPRESSED (playtest #16: a bullet
--- cracking three studs past your skull is information even when it doesn't
--- hit).
+-- the enemy has eyes on it (WITHIN REACTION RANGE), it is contesting a site,
+-- it is taking damage — or it is SUPPRESSED (playtest #16: a bullet cracking
+-- three studs past your skull is information even when it doesn't hit).
 --
--- v2.3 (playtest #22): the "has eyes on me" force is capped at 85 studs.
--- Past that, a spotter is a REASON, not a command — bots were standing at
--- their own spawn trading 100-stud pokes instead of playing the round.
--- Band discipline decides long-range shots; the feet keep their job.
+-- v2.3 → v3 (playtest #22/#23):
+--   * REACTION RANGE TIGHTENED to 55 studs. The 85 cap failed its first test
+--     by one stud: Drift and Onyx locked eyes at 84 and mag-dumped for
+--     25 SECONDS — four reloads, then dry, never once pushing. Past 55,
+--     a spotter is information, not a command; the plan keeps walking.
+--     (Being SHOT stays an unconditional force — that's incoming fire.)
+--   * PELLETS: a trigger pull is now a FAN of rays (weapon.Pellets, one for
+--     a rifle, eight for the Judge). Each pellet raycasts, falls off, and
+--     headshots on its own — shotguns are the first weapon whose identity
+--     is geometry, not a number.
 --
 -- SMOOTH AIM, PHYSICS-SAFE (playtest #17): AimAlign carries the rotation at
 -- a capped angular velocity; nobody writes a root CFrame anymore. The shooter
@@ -103,9 +108,10 @@ local CROUCH_DROP = 1.3
 -- sidearm (0.5s draw beats any reload); farther away buys time for the mag.
 local SWITCH_DISTANCE = 35
 
--- v2.3: being SEEN only forces the fight inside reaction range. Past it,
--- the spot is information the walk can carry instead of a stand-still duel.
-local EYES_ON_ME_RANGE = 85
+-- Being SEEN only forces the fight inside honest reaction range. v2.3's 85
+-- was one stud short of useless (the 84-stud Drift/Onyx mag-dump); 55 is
+-- where a rifle duel is actually winnable. Taking FIRE stays unconditional.
+local EYES_ON_ME_RANGE = 55
 
 -- Exposed-part aiming (R15 names, batch D), in value order. The head leads
 -- when hunting it.
@@ -451,7 +457,7 @@ function Combat.fireBurst(
 	local now = clock()
 
 	-- Drawing the gun takes THIS gun's EquipSeconds — the knife's hidden tax
-	-- is priced per weapon (knife 0.2 / pistol 0.5 / rifle 1.0 / sniper 1.25).
+	-- is priced per weapon (knife 0.2 / pistol 0.5 / rifle 1.0 / heavy 1.4).
 	if now - (bot.heldAt or -math.huge) < weapon.EquipSeconds then
 		return false
 	end
@@ -496,7 +502,8 @@ function Combat.fireBurst(
 	MatchState.lastShot = { by = bot.name, pos = selfRoot.Position, at = now }
 
 	-- CROUCH-SPRAY: spray weapons often drop a crouch at burst start to hold
-	-- the pattern. Bolt guns and pistols barely bother.
+	-- the pattern. The Judge never squats (CrouchAffinity 0 — the house rule:
+	-- no spray, no crouch).
 	if weapon.CrouchAffinity > 0 and not state.crouched then
 		local chance = weapon.CrouchAffinity * (0.5 + attributes.Aim / 200)
 		if rng:NextNumber() < chance then
@@ -564,7 +571,10 @@ function Combat.fireBurst(
 			aimPart = targetRoot -- forced: spray the cover, loudly
 		end
 
-		state.magAmmo -= 1 -- a shot consumes a round
+		state.magAmmo -= 1 -- a trigger pull consumes one round/shell
+		state.shotsFired += 1
+		state.shotsSinceReset += 1
+		state.lastShotAt = clock()
 
 		local origin = selfHead.Position
 		local toTarget = aimPart.Position - origin
@@ -581,44 +591,69 @@ function Combat.fireBurst(
 		end
 		perpA = perpA.Unit
 		local perpB = direction:Cross(perpA).Unit
-		local angle = rng:NextNumber(0, math.pi * 2)
-		local radius = math.tan(math.rad(spreadDeg)) * math.sqrt(rng:NextNumber())
-		local aimDir = (direction + perpA * math.cos(angle) * radius + perpB * math.sin(angle) * radius).Unit
 
 		local params = RaycastParams.new()
 		params.FilterType = Enum.RaycastFilterType.Exclude
 		params.FilterDescendantsInstances = { selfModel }
 		local reach = math.max(weapon.MaxEffectiveRangeStuds * 1.5, distance + 20)
-		local result = workspace:Raycast(origin, aimDir * reach, params)
 
-		state.shotsFired += 1
-		state.shotsSinceReset += 1
-		state.lastShotAt = clock()
+		-- PELLETS (v3): one ray for a rifle, eight for the Judge — each pellet
+		-- is its own raycast, its own falloff, its own headshot check.
+		local pelletCount = weapon.Pellets or 1
+		local pelletsHit = 0
+		local totalDamage = 0
+		local anyHeadshot = false
+		local lastHitPos: Vector3? = nil
+		local nearestMiss = math.huge
+		local reference = if targetHead then targetHead else targetRoot
 
-		local endPoint = if result then result.Position else origin + aimDir * reach
-		tracer(origin, endPoint)
+		for _ = 1, pelletCount do
+			local angle = rng:NextNumber(0, math.pi * 2)
+			local radius = math.tan(math.rad(spreadDeg)) * math.sqrt(rng:NextNumber())
+			local aimDir = (direction + perpA * math.cos(angle) * radius + perpB * math.sin(angle) * radius).Unit
+			local result = workspace:Raycast(origin, aimDir * reach, params)
+			local endPoint = if result then result.Position else origin + aimDir * reach
+			tracer(origin, endPoint)
 
-		if result and result.Instance:IsDescendantOf(targetModel) then
-			local isHead = result.Instance.Name == "Head"
-			local multiplier = Combat.damageMultiplier(weapon, distance)
-			local damage = weapon.DamageBody * multiplier
-			if isHead then
-				damage *= weapon.HeadshotMultiplier
+			if result and result.Instance:IsDescendantOf(targetModel) then
+				pelletsHit += 1
+				local isHead = result.Instance.Name == "Head"
+				local mult = Combat.damageMultiplier(weapon, distance)
+				if isHead then
+					mult *= weapon.HeadshotMultiplier
+					anyHeadshot = true
+				end
+				totalDamage += weapon.DamageBody * mult
+				lastHitPos = result.Position
+			else
+				local toRef = reference.Position - origin
+				local along = math.clamp(toRef:Dot(aimDir), 0, reach)
+				local closest = origin + aimDir * along
+				nearestMiss = math.min(nearestMiss, (closest - reference.Position).Magnitude)
+			end
+		end
+
+		if pelletsHit > 0 then
+			if anyHeadshot then
 				state.headshots += 1
 				bot.headshots = (bot.headshots or 0) + 1 -- lifetime stat, dashboard-bound
 			end
-			state.hits += 1
-			hitSpark(result.Position)
-			targetHumanoid:TakeDamage(damage)
+			state.hits += pelletsHit
+			if lastHitPos then
+				hitSpark(lastHitPos)
+			end
+			targetHumanoid:TakeDamage(totalDamage)
 
 			if Scenario.LogCombat then
-				print(("[CLUTCH] %6.1fs  SHOT %s -> %s | %s %.0f dmg (x%.2f at %.0f studs) | %s HP %.0f"):format(
+				local detail = if pelletCount > 1
+					then ("%d/%d pellets, %.0f dmg"):format(pelletsHit, pelletCount, totalDamage)
+					else ("%s %.0f dmg"):format(if anyHeadshot then "HEADSHOT" else "body", totalDamage)
+				print(("[CLUTCH] %6.1fs  SHOT %s -> %s | %s (x%.2f at %.0f studs) | %s HP %.0f"):format(
 					clock(),
 					bot.name,
 					targetModel.Name,
-					if isHead then "HEADSHOT" else "body",
-					damage,
-					multiplier,
+					detail,
+					Combat.damageMultiplier(weapon, distance),
 					distance,
 					targetModel.Name,
 					math.max(targetHumanoid.Health, 0)
@@ -628,7 +663,7 @@ function Combat.fireBurst(
 			if targetHumanoid.Health <= 0 then
 				bot.kills = (bot.kills or 0) + 1
 				targetModel:SetAttribute("LastKilledBy", bot.name)
-				targetModel:SetAttribute("LastKillHeadshot", isHead)
+				targetModel:SetAttribute("LastKillHeadshot", anyHeadshot)
 				targetModel:SetAttribute("LastKillDistance", math.floor(distance))
 				targetModel:SetAttribute("LastKillWeapon", weapon.DisplayName)
 				print(("[CLUTCH] %6.1fs  DOWN %s killed by %s | %d/%d shots hit, %d headshots"):format(
@@ -643,13 +678,9 @@ function Combat.fireBurst(
 				return true
 			end
 		else
-			-- SUPPRESSION: the miss was information. A bullet cracking past the
+			-- SUPPRESSION: the miss was information. A pellet cracking past the
 			-- target's ears marks them as shot AT — they react even unhurt.
-			local reference = if targetHead then targetHead else targetRoot
-			local toRef = reference.Position - origin
-			local along = math.clamp(toRef:Dot(aimDir), 0, reach)
-			local closest = origin + aimDir * along
-			if (closest - reference.Position).Magnitude <= SUPPRESS_RADIUS then
+			if nearestMiss <= SUPPRESS_RADIUS then
 				local targetState = Combat.states[targetModel.Name]
 				if targetState then
 					targetState.lastSuppressedAt = clock()
