@@ -11,16 +11,18 @@
 --     region occupancy is the unit we can calibrate our sim against later.
 --
 -- Zones are semantic labels over space, NOT collision volumes. They overlap
--- freely; the SMALLEST containing zone wins, so "A Door" beats "A Site".
+-- freely; the SMALLEST containing zone wins, so "Long Doors" beats "A Long".
 -- Floor zones occupy y 0..5.5 and decks y 4.2..9 (bands overlap so ramp tops
 -- never fall between them), resolved against a bot's GROUND position.
 --
--- v4: re-derived for the de-labyrinthed greybox. Same 25 keys survive.
---   * Shorts open straight into MID (the divider gaps moved to z -30..-22);
---     MID_BACK is now a pure pass-through (window <-> defender lobby).
---   * Heavens are long overlook decks on the sites' north edges.
---   * Lanes lost their inner walls: A_MAIN/A_LOBBY is a zone line, not a
---     wall line — the boulevard the playtest #13 review asked for.
+-- v5 (batch B — the reference rebuild, 28 zones):
+--   * The west lane splits at the doors wall: OUTSIDE_LONG (staging strip)
+--     -> LONG_DOORS (the choke) -> A_MAIN, now callouted "A Long".
+--   * B_MAIN is callouted "B Tunnels" — the east lane is an enclosed run
+--     with a jog block now.
+--   * MID_DOORS gates MID_COURT from MID — the direct seam between them is
+--     gone; mid control is a gate, not a plain.
+--   * Attacker spawn-to-site stretches to ~8 hops; defenders keep 2.
 
 export type ZoneKey = string
 export type Control = "Attack" | "Defense" | "Neutral"
@@ -51,7 +53,7 @@ type ZoneDef = {
 local FLOOR_MIN, FLOOR_MAX = 0, 5.5 -- overlaps the deck band; ramps span both
 local DECK_MIN, DECK_MAX = 4.2, 9
 
--- Bounds derived from Greybox v4 geometry. Attackers south (+z), defenders
+-- Bounds derived from Greybox v5 geometry. Attackers south (+z), defenders
 -- north (-z), Site A west (-x), Site B east (+x).
 local defs: { ZoneDef } = {
 	{
@@ -64,15 +66,28 @@ local defs: { ZoneDef } = {
 		key = "ATK_LOBBY", callout = "Attacker Lobby",
 		x = { -115, 115 }, z = { 32, 58 },
 		control = "Attack", tags = { "lobby" },
-		adjacent = { "ATK_SPAWN", "A_MAIN", "B_MAIN", "MID_COURT", "A_LOBBY", "B_LOBBY" },
+		adjacent = { "ATK_SPAWN", "OUTSIDE_LONG", "B_MAIN", "MID_COURT", "A_LOBBY", "B_LOBBY" },
 	},
 
-	-- A side: open boulevard (no inner wall) + lobby + site pocket
+	-- A side: the LONG corridor. Outside Long (staging) -> Long Doors (the
+	-- choke) -> A Long -> the corner -> lobby -> site.
 	{
-		key = "A_MAIN", callout = "A Main",
-		x = { -105, -70 }, z = { -2, 55 },
+		key = "OUTSIDE_LONG", callout = "Outside Long",
+		x = { -105, -70 }, z = { 14, 55 },
 		control = "Neutral", tags = { "lane", "flank" },
-		adjacent = { "A_ELBOW" },
+		adjacent = { "ATK_LOBBY", "LONG_DOORS" },
+	},
+	{
+		key = "LONG_DOORS", callout = "Long Doors",
+		x = { -95, -81 }, z = { 10, 18 }, -- straddles the door wall at z=14
+		control = "Neutral", tags = { "lane", "choke", "flank" },
+		adjacent = { "OUTSIDE_LONG", "A_MAIN" },
+	},
+	{
+		key = "A_MAIN", callout = "A Long",
+		x = { -105, -70 }, z = { -2, 14 },
+		control = "Neutral", tags = { "lane", "flank" },
+		adjacent = { "A_ELBOW" }, -- LONG_DOORS via mirror
 	},
 	{
 		key = "A_ELBOW", callout = "A Elbow",
@@ -117,18 +132,25 @@ local defs: { ZoneDef } = {
 		adjacent = { "MID" }, -- clean mid connector; site/lobby via mirrors
 	},
 
-	-- Mid
+	-- Mid. MID DOORS is the gate: MID_COURT (attacker staging) no longer
+	-- touches MID directly — everyone crosses the doors.
 	{
 		key = "MID_COURT", callout = "Mid Courtyard",
 		x = { -26, 26 }, z = { 12, 32 },
 		control = "Attack", tags = { "mid" },
-		adjacent = { "MID" },
+		adjacent = { "MID_DOORS" },
+	},
+	{
+		key = "MID_DOORS", callout = "Mid Doors",
+		x = { -16, 16 }, z = { 6, 12 }, -- straddles the door wall at z=9
+		control = "Neutral", tags = { "mid", "choke" },
+		adjacent = { "MID_COURT", "MID" },
 	},
 	{
 		key = "MID", callout = "Mid",
 		x = { -26, 26 }, z = { -32, 12 },
 		control = "Neutral", tags = { "mid" },
-		adjacent = { "MID_LEDGE", "MID_WINDOW" },
+		adjacent = { "MID_LEDGE", "MID_WINDOW" }, -- MID_DOORS via mirror
 	},
 	{
 		key = "MID_LEDGE", callout = "Mid Ledge",
@@ -149,7 +171,7 @@ local defs: { ZoneDef } = {
 		adjacent = { "DEF_LOBBY" },
 	},
 
-	-- B side (mirror)
+	-- B side (mirror): the tunnel run.
 	{
 		key = "B_SHORT", callout = "B Short",
 		x = { 26, 45 }, z = { -52, -20 },
@@ -193,7 +215,7 @@ local defs: { ZoneDef } = {
 		adjacent = { "B_MAIN" },
 	},
 	{
-		key = "B_MAIN", callout = "B Main",
+		key = "B_MAIN", callout = "B Tunnels",
 		x = { 70, 105 }, z = { -2, 55 },
 		control = "Neutral", tags = { "lane", "flank" },
 		adjacent = {}, -- mirrors: B_ELBOW, ATK_LOBBY
@@ -366,7 +388,7 @@ function Zones.withTag(tag: string): { ZoneKey }
 end
 
 -- Breadth-first hop counts over the adjacency graph. Memoised per source —
--- the graph is 25 nodes, so this is effectively free after first use.
+-- the graph is 28 nodes, so this is effectively free after first use.
 local hopCache: { [ZoneKey]: { [ZoneKey]: number } } = {}
 
 local function hopsFrom(source: ZoneKey): { [ZoneKey]: number }
