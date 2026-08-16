@@ -7,9 +7,12 @@
 -- stood. Bots reason about its position through zones; spectators see an
 -- actual object. No hidden state pretending to be a bomb.
 --
--- Channels (plant 4s, defuse 7s) cancel on death, on moving off the spot, on
--- taking damage, and on SPOTTING AN ENEMY. Planting while someone is visibly
--- swinging you is how bots die doing nothing.
+-- Channels (plant 4s, defuse 7s) cancel on death, on taking damage, on
+-- SPOTTING AN ENEMY — and the channeler PLANTS ITS FEET (playtest #22): the
+-- root anchors for the duration. With per-bot collision back on, teammates
+-- brushing past were shoving the planter past the move tolerance and
+-- breaking the channel (Volt's four cancelled plants in one round). The
+-- anchor is the plant crouch you can't be shoved out of.
 --
 -- THE DEFUSE IS A SOLO JOB (playtest #16): one channel, ever. The brain's
 -- scoring already names the single closest defender as the defuser and turns
@@ -174,37 +177,48 @@ function Objective.tryPickup(bot: any): boolean
 	return true
 end
 
--- The honest channel: standing still, alive, unhurt, and — when the caller
--- passes shouldAbort — not currently looking at an enemy. Anything else
--- cancels.
+-- The honest channel: alive, unhurt, not visibly engaged — and ANCHORED
+-- (playtest #22): with per-bot collision on, a teammate brushing the
+-- channeler was shoving it past the move tolerance and breaking plants.
+-- The root anchors for the duration; the living get it back, the dead stay
+-- put (the corpse ghost owns them).
 local function channel(bot: any, seconds: number, label: string, clock: () -> number, shouldAbort: (() -> boolean)?): boolean
 	local humanoid = bot.model:FindFirstChildOfClass("Humanoid")
 	local root = rootOf(bot.model)
 	if not humanoid or not root then
 		return false
 	end
+	root.Anchored = true
 	local startPos = root.Position
 	local startHealth = humanoid.Health
 	local startedAt = clock()
-	while clock() - startedAt < seconds do
+	local ok = false
+	while true do
+		if clock() - startedAt >= seconds then
+			ok = true
+			break
+		end
 		if humanoid.Health <= 0 or not bot.model.Parent then
-			return false
+			break
 		end
 		if humanoid.Health < startHealth - 0.01 then
 			print(("[CLUTCH] %s %s cancelled — took damage"):format(bot.name, label))
-			return false
+			break
 		end
 		if (root.Position - startPos).Magnitude > CHANNEL_MOVE_TOLERANCE then
 			print(("[CLUTCH] %s %s cancelled — moved off the spot"):format(bot.name, label))
-			return false
+			break
 		end
 		if shouldAbort and shouldAbort() then
 			print(("[CLUTCH] %s %s cancelled — enemy in sight, fight first"):format(bot.name, label))
-			return false
+			break
 		end
 		task.wait(0.1)
 	end
-	return true
+	if humanoid.Health > 0 and root.Parent then
+		root.Anchored = false
+	end
+	return ok
 end
 
 local function explode(clock: () -> number)
