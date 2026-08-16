@@ -1,5 +1,12 @@
 --!strict
--- Greybox v4.1 — the de-labyrinthed 5v5 map + spawn sight seals.
+-- Greybox v4.2 — the de-labyrinthed 5v5 map + spawn sight seals + both-ways
+-- ledge access.
+--
+-- v4.1 → v4.2 (playtest #18):
+--   * MID LEDGE NORTH RAMP. The ledge's only ramp faced the attacker side,
+--     so defenders with mid affinity spent the match churning PATH FAILEDs
+--     toward a deck they could never climb. It now rises from the window
+--     side too.
 --
 -- v4 → v4.1 (playtest #14):
 --   * DEFENDER SPAWN SCREENS (z=-58). The site→lobby back route left a clean
@@ -162,7 +169,9 @@ local parts: { PartSpec } = {
 	{ name = "MidWinL", pos = Vector3.new(-16, 7, -32), size = Vector3.new(16, 12, 2), color = WALL },
 	{ name = "MidWinR", pos = Vector3.new(16, 7, -32), size = Vector3.new(16, 12, 2), color = WALL },
 
-	-- MID LEDGE: plinth + ramp from the attacker side + rail to head-glitch
+	-- MID LEDGE: plinth + ramp from the attacker side + rail to head-glitch.
+	-- v4.2: a NORTH ramp too — the ledge was attacker-only climbable, and
+	-- defenders churned PATH FAILEDs at it all match (playtest #18).
 	{ name = "MidLedgePlinth", pos = Vector3.new(0, 3, -17), size = Vector3.new(12, 4, 8), color = DECK },
 	{
 		name = "MidLedgeRamp",
@@ -170,6 +179,13 @@ local parts: { PartSpec } = {
 		size = Vector3.new(6, 1.5, 14),
 		color = RAMP,
 		rot = Vector3.new(RAMP_ANGLE, 0, 0),
+	},
+	{
+		name = "MidLedgeRampN",
+		pos = Vector3.new(0, RAMP_Y, -28),
+		size = Vector3.new(6, 1.5, 14),
+		color = RAMP,
+		rot = Vector3.new(-RAMP_ANGLE, 0, 0),
 	},
 	{ name = "MidLedgeRail", pos = Vector3.new(0, 6, -20.5), size = Vector3.new(12, 2, 1), color = DECK },
 
