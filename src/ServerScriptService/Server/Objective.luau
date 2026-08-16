@@ -17,8 +17,12 @@
 -- the tie-break case. Plants never needed it — there's only ever one
 -- carrier.
 --
--- Pickup radius is a generous 7 studs: recovery should not require
--- centimeter routing.
+-- THE DEFUSE IS LOUD (playtest #20): starting the channel stamps
+-- MatchState.defusing — attackers within earshot get a sound contact at the
+-- spike, exactly like the tap in the original game.
+--
+-- Pickup is a WALK-OVER (playtest #20): 5 studs, instant, like any real FPS
+-- — no reach-around ritual.
 --
 -- THE FUSE CANNOT CANCEL ITSELF. explode() runs ON the fuse thread; a naive
 -- cancelFuse() inside it throws "cannot cancel thread" and — because that was
@@ -49,7 +53,7 @@ local MatchMemory = require(script.Parent.MatchMemory)
 
 local Objective = {}
 
-local PICKUP_RADIUS = 7
+local PICKUP_RADIUS = 5 -- walk-over: step on it, it's yours (playtest #20)
 local DEFUSE_RADIUS = 7
 local CHANNEL_MOVE_TOLERANCE = 2.5
 local EXPLOSION_RADIUS = 30
@@ -78,7 +82,7 @@ local function cancelFuse()
 end
 
 -- Round reset: no spike, no fuse, no planted state, no marks, no channel,
--- and no area-clear intel — last round's "clear" means nothing now.
+-- no defuse noise, and no area-clear intel — last round's "clear" means nothing now.
 function Objective.reset()
 	cancelFuse()
 	if MatchState.spikePart then
@@ -94,6 +98,7 @@ function Objective.reset()
 	MatchState.spikeMarkAtk = nil
 	MatchState.spikeMarkDef = nil
 	MatchState.clearMarks = { Attack = {}, Defense = {} }
+	MatchState.defusing = nil
 	defusingBot = nil
 end
 
@@ -147,7 +152,8 @@ function Objective.dropSpike(bot: any)
 	))
 end
 
--- An attacker walking near a dropped spike picks it up.
+-- An attacker walking over a dropped spike picks it up. Instant — no button,
+-- no channel, like every FPS with a dropped objective.
 function Objective.tryPickup(bot: any): boolean
 	local spike = MatchState.spikePart
 	if not spike or MatchState.spikeCarrier ~= nil or MatchState.planted then
@@ -309,6 +315,8 @@ end
 
 -- Defender next to a planted spike commits to the full 7 seconds. SOLO JOB:
 -- if a teammate is already on the channel, you are the guard ring instead.
+-- THE TAP IS LOUD: the channel stamps MatchState.defusing for its duration —
+-- attackers within earshot hear it (the brain turns it into a sound contact).
 function Objective.tryStartDefuse(bot: any, clock: () -> number, shouldAbort: (() -> boolean)?): boolean
 	if not MatchState.planted then
 		return false
@@ -326,8 +334,10 @@ function Objective.tryStartDefuse(bot: any, clock: () -> number, shouldAbort: ((
 	print(("[CLUTCH] %6.1fs  DEFUSE %s is defusing…"):format(clock(), bot.name))
 
 	defusingBot = bot
+	MatchState.defusing = { pos = spike.Position, at = clock() }
 	local ok = channel(bot, RoundConfig.DefuseSeconds, "defuse", clock, shouldAbort)
 	defusingBot = nil
+	MatchState.defusing = nil
 	if not ok then
 		return false
 	end
