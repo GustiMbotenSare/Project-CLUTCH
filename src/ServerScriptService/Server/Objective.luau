@@ -30,6 +30,9 @@
 -- root's CFrame directly — the same physics-stomp that put every walk in the
 -- match into BLOCKED. Now it hands the brain's facing loop a facePoint and
 -- the planter turns THROUGH the channel via AimAlign.
+--
+-- PLANTS AND DEFUSES FEED MATCH MEMORY (batch C): the ledger learns which
+-- site the attack actually wants, and the plan roller reads it next round.
 
 local Debris = game:GetService("Debris")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -39,6 +42,7 @@ local Zones = require(Shared.MapData.Zones)
 local RoundConfig = require(Shared.Constants.RoundConfig)
 
 local MatchState = require(script.Parent.MatchState)
+local MatchMemory = require(script.Parent.MatchMemory)
 
 local Objective = {}
 
@@ -282,6 +286,7 @@ function Objective.tryStartPlant(bot: any, clock: () -> number, shouldAbort: (()
 	MatchState.plantedZoneKey = zoneKey
 	MatchState.plantedAt = clock()
 	MatchState.phase = "Planted"
+	MatchMemory.recordPlant(zoneKey) -- the ledger learns where they want to plant
 	print(("[CLUTCH] %6.1fs  PLANTED at %s — %ds fuse"):format(
 		clock(),
 		if zone then zone.callout else zoneKey,
@@ -311,6 +316,7 @@ function Objective.tryStartDefuse(bot: any, clock: () -> number, shouldAbort: ((
 	if not spike or not root or planarDistance(root.Position, spike.Position) > DEFUSE_RADIUS then
 		return false
 	end
+	local plantedZone = MatchState.plantedZoneKey -- captured before the state flips
 
 	print(("[CLUTCH] %6.1fs  DEFUSE %s is defusing…"):format(clock(), bot.name))
 
@@ -327,6 +333,9 @@ function Objective.tryStartDefuse(bot: any, clock: () -> number, shouldAbort: ((
 	cancelFuse()
 	MatchState.planted = false
 	MatchState.defused = true
+	if plantedZone then
+		MatchMemory.recordDefuse(plantedZone)
+	end
 	print(("[CLUTCH] %6.1fs  DEFUSED — %s saves the site"):format(clock(), bot.name))
 	return true
 end
