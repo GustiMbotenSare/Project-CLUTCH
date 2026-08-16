@@ -15,6 +15,9 @@
 -- 12.5Hz mid-walk and every walk in the match went BLOCKED. Rigs now carry
 -- an AlignOrientation ("AimAlign"); turnToward points its target and caps
 -- its angular velocity. Torque turns the body; the feet keep walking.
+--
+-- v4.5 (playtest #18): Hold takes SpikeDownAttackPenalty for attackers while
+-- the spike is down — you can't hold a site the spike isn't at.
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Shared = ReplicatedStorage:WaitForChild("Shared")
@@ -237,6 +240,11 @@ local function scoreHold(ctx: Context): number
 	-- Guarding the dropped spike IS defending it.
 	if ctx.spikeDown and ctx.spikeZoneKey and ctx.zoneKey == ctx.spikeZoneKey then
 		score += T.SpikeGuardBonus
+	end
+	-- An attacker can't hold a site the spike isn't at (playtest #18 round 4:
+	-- three of them parked on B for 70s while the spike lay in A Lobby).
+	if ctx.side == "Attack" and ctx.spikeDown then
+		score += T.SpikeDownAttackPenalty
 	end
 	return score
 end
