@@ -1,21 +1,19 @@
 --!strict
--- Bot brain v4.9: the RUNTIME half. BrainCore.luau owns the judgment
+-- Bot brain v4.10: the RUNTIME half. BrainCore.luau owns the judgment
 -- (scorers, routing, sampler, cover picks, team pressure, resolveTarget);
 -- this module owns what the bot DOES about it each tick: comms, facing,
 -- walks, holds, channels, diagnostics.
 --
--- v4.9 (playtest #23):
---   * BUY-PHASE STAGING — the barrier phase is prep time, not a crumple:
---     attackers form up at the barrier mouth their PLAN exits through
---     (site mouths, mid for the sniper, corridor mouths for freelancers),
---     with deterministic jitter so same-mouth bots don't stack.
---   * THE PAD STEP — planting walks onto the glowing pad first (Objective
---     enforces the pad; the brain steps there before asking for the channel).
+-- v4.10 (playtest #24): THE PAD STEP IS A COURTESY, NOT A VETO. The pads'
+-- centers sat inside their default crates (fixed in Greybox v5.2), so the
+-- step PATH FAILED forever while the carrier hovered Plant 1.00 at the
+-- pad's edge. Now: step only when farther than 8 studs, and a failed step
+-- never blocks a plant that's already legal.
 --
--- v4.8 (playtest #22): the gaze priority list (rotate target > the corner
--- you're crossing > heading). v4.7: heading-tracked facing, glances not
--- camps, spike snap, the loud defuse tap. v4.6: knife discipline, all-clear,
--- area-clear callouts. Style rule: no inner quotes in log strings. Ever.
+-- v4.9 (playtest #23): buy-phase staging (form at the plan's barrier mouth),
+-- the pad step. v4.8: the gaze priority list. v4.7: heading-tracked facing,
+-- glances not camps, spike snap, the loud defuse tap. Style rule: no inner
+-- quotes in log strings. Ever.
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Shared = ReplicatedStorage:WaitForChild("Shared")
@@ -817,11 +815,16 @@ function Brain.start(bot: any, side: string, enemies: { any }, allies: { any }, 
 
 			if intent == "Plant" and Zones.hasTag(currentKey, "plant") then
 				bot.faceMode = "point" -- the planter watches the threat, not its feet
-				-- THE COLORED AREA IS THE RULE (playtest #23): step onto the glowing
-				-- pad first; the channel only opens there.
+				-- THE PAD STEP IS A COURTESY, NOT A VETO (playtest #24): the pads'
+				-- centers once sat inside the default crates, so the step PATH
+				-- FAILED forever. Step only when actually far — and a failed step
+				-- never blocks a plant that's already legal.
 				local pad, padDist = Objective.nearestPad(ground)
-				if pad and padDist > 4 then
-					Pathing.walkToWithResult(model, Vector3.new(pad.pos.X, 1, pad.pos.Z), shouldInterrupt)
+				if pad and padDist > 8 then
+					local stepped = Pathing.walkToWithResult(model, Vector3.new(pad.pos.X, 1, pad.pos.Z), shouldInterrupt)
+					if stepped ~= "arrived" and padDist <= pad.size.X / 2 + 1.5 then
+						Objective.tryStartPlant(bot, clock, channelAbort, if contact then contact.pos else nil)
+					end
 				else
 					Objective.tryStartPlant(bot, clock, channelAbort, if contact then contact.pos else nil)
 				end
