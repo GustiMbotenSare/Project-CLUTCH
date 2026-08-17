@@ -17,6 +17,12 @@
 -- sees or touches the attacker spawn before the whistle; at LIVE the line
 -- drops. Round 5's 3.2-second spawn-camp wipe is the bug this buries.
 --
+-- AGGRO HOLDS SKIP THE LEDGE (playtest #24): Mid Ledge deck samples PATH
+-- FAILED from spawn (the ramp climb isn't on the navmesh — tracked for
+-- batch B phase 2), and an Aggro pair assigned it idled 45 seconds in spawn
+-- while the attack walked in. The ledge still gets held via cover points
+-- when a rotation passes through it — just never as a spawn-side assignment.
+--
 -- OUTCOME LOGGING + THE TUNER HOOK: every round prints a parseable
 -- ROUND_RESULT line, every match a MATCH_RESULT with the metrics the tuner
 -- scores. With Scenario.TuningMode on, each match feeds the in-game CEM and
@@ -88,7 +94,11 @@ local DEFAULT_JUMP_POWER = 50
 local CORPSE_LINGER_SECONDS = 1.25 -- enough for the kill to read, then gone
 
 local SITES = { "A_SITE", "B_SITE" }
-local DEF_FORWARD = { "MID", "MID_LEDGE", "MID_WINDOW", "A_SHORT", "B_SHORT" }
+-- MID_LEDGE left the Aggro pool (playtest #24): its deck samples PATH FAILED
+-- from spawn (the ramp climb isn't on the navmesh — tracked for batch B
+-- phase 2), and an Aggro pair assigned it idled 45s in spawn. The ledge
+-- still gets held via cover points when a rotation passes through it.
+local DEF_FORWARD = { "MID", "MID_WINDOW", "A_SHORT", "B_SHORT" }
 local FUSE_WATCHDOG_GRACE = 5 -- seconds past the fuse before we call it dead
 
 type Ctx = {
@@ -286,7 +296,7 @@ end
 -- ---------------------------------------------------------------------------
 -- TEAM PLANS. One coin per team per round, not five. Assignments land in
 -- bot.siteChoice / bot.holdChoice before brains start, so the brain's own
--- roll only fires for the freelancers a plan deliberately leaves open.
+-- roll only fires for freelancers a plan deliberately leaves open.
 -- ADAPTATION: the coins flip first, then MatchMemory argues.
 -- ---------------------------------------------------------------------------
 local function otherSite(site: string): string
