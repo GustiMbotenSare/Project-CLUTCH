@@ -24,6 +24,12 @@
 -- their own half freely, but nobody sees or touches the attacker spawn
 -- before the whistle). Round machine drops them at LIVE.
 --
+-- v5.2 (playtest #24): THE PADS MOVE OFF THE CRATES. Both plant pads sat
+-- centered 2 studs from their default crate — the pad-step target was INSIDE
+-- a solid box, PathfindingService said PATH FAILED forever, and nobody could
+-- plant (Volt, Plant intent 1.00, 30 seconds at the pad's edge). Pads shift
+-- 4 studs south; cover and crates stay exactly where they are.
+--
 -- v4 lineage: de-labyrinth boulevards (v4), spawn sight seals (v4.1),
 -- both-ways ledge (v4.2). Coordinates: y up. Attackers south (+z),
 -- defenders north (-z). Site A west (-x), Site B east (+x). Floor top y = 1.
@@ -246,9 +252,12 @@ local Greybox: MapSpec = {
 		Vector3.new(-24, 3, -64),
 	},
 
+	-- v5.2: pads shifted 4 studs SOUTH off the default crates. Their old
+	-- centers sat 2 studs inside a solid crate — the pad-step PATH FAILED
+	-- forever and nobody could plant (playtest #24).
 	plantZones = {
-		{ name = "SiteA", pos = Vector3.new(-68, 1.15, -36), size = Vector3.new(18, 0.3, 18), color = SITE_A },
-		{ name = "SiteB", pos = Vector3.new(68, 1.15, -36), size = Vector3.new(18, 0.3, 18), color = SITE_B },
+		{ name = "SiteA", pos = Vector3.new(-68, 1.15, -30), size = Vector3.new(18, 0.3, 18), color = SITE_A },
+		{ name = "SiteB", pos = Vector3.new(68, 1.15, -30), size = Vector3.new(18, 0.3, 18), color = SITE_B },
 	},
 
 	pois = {
